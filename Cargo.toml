@@ -17,7 +17,7 @@ axum = "0.8"
 base64 = "0.22"
 hmac = "0.12"
 jev-sdk = "=0.1.0"
-match-authority = { git = "https://github.com/bobishh/match.git", rev = "9bc4da76fcaf3c5319dc46a57d1c78a6c625c7ac" }
+match-authority = { git = "https://github.com/bobishh/tincanban.git", rev = "9bc4da76fcaf3c5319dc46a57d1c78a6c625c7ac" }
 meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "cc4403f69b0f40d0f331c2c6ab63e090e56b8229" }
 meta-mesh-native = { git = "https://github.com/bobishh/meta-mesh.git", rev = "cc4403f69b0f40d0f331c2c6ab63e090e56b8229" }
 automerge = "0.12"

@@ -2171,7 +2171,7 @@ dependencies = [
 [[package]]
 name = "match-authority"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/match.git?rev=9bc4da76fcaf3c5319dc46a57d1c78a6c625c7ac#9bc4da76fcaf3c5319dc46a57d1c78a6c625c7ac"
+source = "git+https://github.com/bobishh/tincanban.git?rev=9bc4da76fcaf3c5319dc46a57d1c78a6c625c7ac#9bc4da76fcaf3c5319dc46a57d1c78a6c625c7ac"
 dependencies = [
  "automerge",
  "meta-mesh-core",
