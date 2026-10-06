@@ -3,7 +3,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # Import the complete pinned tincanban design system; native authority dependencies stay independent.
-ARG MATCH_UI_REV=cf6e1f096972feb82b3ba150b6b50ef80612e65a
+ARG MATCH_UI_REV=7f546526bfcc7610f25f771a2288df3784e2abc6
 RUN git init /match \
     && git -C /match remote add origin https://github.com/bobishh/tincanban.git \
     && git -C /match fetch --depth=1 origin "$MATCH_UI_REV" \
