@@ -16,14 +16,15 @@ for (const rejected of [false, true]) {
       restarting = true
       return route.fulfill({ status: 202, json: { resetting: true } })
     })
-    await page.goto("/admin/")
+    await page.goto("/admin/settings")
     await page.getByRole("button", { name: "Reset keeper", exact: true }).click()
     expect(attempts).toBe(0)
     await page.getByLabel("Reset operator token", { exact: true }).fill(rejected ? "wrong-token" : "operator-token")
     await page.getByRole("button", { name: "Delete all keeper data", exact: true }).click()
     if (rejected) {
       await expect(page.getByRole("alert")).toContainText("Invalid operator token")
-      await expect(page.getByText("Old board", { exact: true })).toBeVisible()
+      await expect(page.getByRole("dialog", { name: "Reset keeper" })).toBeVisible()
+      expect(attempts).toBe(1)
       await page.getByLabel("Reset operator token", { exact: true }).fill("operator-token")
       await page.getByRole("button", { name: "Delete all keeper data", exact: true }).click()
     }
@@ -47,7 +48,7 @@ test("Given broken overview, when operator signs in, then reset is still availab
   await page.route("**/admin/api/pairings", route => route.fulfill({ json: { pairings: [] } }))
   await page.route("**/admin/api/settings/cors", route => route.fulfill({ json: { requiredOrigin: "https://match.example", origins: [] } }))
   await page.route("**/admin/api/overview", route => route.fulfill({ status: 503, json: { message: "Overview unavailable" } }))
-  await page.goto("/admin/")
+  await page.goto("/admin/settings")
   await expect(page.getByRole("status")).toContainText("Overview unavailable")
   await expect(page.getByRole("button", { name: "Reset keeper", exact: true })).toBeVisible()
 })

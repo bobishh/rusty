@@ -23,7 +23,7 @@ test("Given an operator, when allowed origins are saved, then Match stays requir
     expect(route.request().postDataJSON()).toEqual({ origins: [matchOrigin, "https://meta-uber-engineer.dev"] })
     return route.fulfill({ json: { requiredOrigin: matchOrigin, origins: [matchOrigin, "https://meta-uber-engineer.dev"] } })
   })
-  await page.goto("/admin/")
+  await page.goto("/admin/settings")
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible()
   await expect(page.getByText(`Match: ${matchOrigin}`)).toBeVisible()
   await page.getByRole("textbox", { name: "Additional origins" }).fill("https://meta-uber-engineer.dev")
@@ -36,7 +36,7 @@ test("Given a save failure, when operator retries later, then draft remains and 
   await page.route("**/admin/api/settings/cors", route => route.request().method() === "GET"
     ? route.fulfill({ json: { requiredOrigin: matchOrigin, origins: [matchOrigin] } })
     : route.fulfill({ status: 503, json: { message: "Settings unavailable" } }))
-  await page.goto("/admin/")
+  await page.goto("/admin/settings")
   const origins = page.getByRole("textbox", { name: "Additional origins" })
   await origins.fill("https://meta-uber-engineer.dev")
   await page.getByRole("button", { name: "Save origins" }).click()

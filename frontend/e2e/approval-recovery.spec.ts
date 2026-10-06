@@ -9,7 +9,7 @@ test("Given approved board setup, when its live status becomes active, then it l
   await page.route("**/admin/api/overview", route => route.fulfill({ json: { keeper: { displayName: "Keeper", personId: "keeper", deviceId: "device", boards: [{ workspaceId: "jobs", title: "Job search", isPrimary: true, heads: [], peerCount: 1, replication: { state: "connected", activePeers: 1 } }] }, triggers: [], replication: { state: "connected", activePeers: 1 } } }))
   await page.route("**/admin/api/settings/cors", route => route.fulfill({ json: { requiredOrigin: "https://match.example", origins: ["https://match.example"] } }))
   await page.route("**/admin/api/pairings", route => fail ? route.fulfill({ status: 503, json: { message: "Status temporarily unavailable" } }) : route.fulfill({ json: { pairings: [pairing()] } }))
-  await page.goto("/admin/")
+  await page.goto("/admin/approvals")
   await expect(page.getByRole("heading", { name: "Approvals (1)", exact: true })).toBeVisible()
   await expect(page.getByText("Board setup: provisioning", { exact: true })).toBeVisible()
   fail = true
@@ -22,6 +22,7 @@ test("Given approved board setup, when its live status becomes active, then it l
   await expect(page.getByRole("heading", { name: "Approvals", exact: true })).toBeVisible()
   await expect(page.getByText("No pending keeper requests", { exact: false })).toBeVisible()
   await expect(page.locator(".approval-card")).toHaveCount(0)
+  await page.goto("/admin/keepers/keeper")
   await expect(page.getByText("Job search", { exact: true })).toBeVisible()
   await expect(page.getByRole("status")).toHaveCount(0)
 })
