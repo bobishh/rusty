@@ -297,8 +297,11 @@ pub async fn serve(
         replication,
     };
     let processing_inbox = state.inbox.clone();
-    tokio::spawn(async move { process_loop(processing_inbox, lead_sender).await });
-    crate::app::serve(state, address).await?;
+    let processing = tokio::spawn(async move { process_loop(processing_inbox, lead_sender).await });
+    let result = crate::app::serve(state, address).await;
+    processing.abort();
+    let _ = processing.await;
+    result?;
     Ok(())
 }
 

@@ -169,6 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let service = Arc::new(Mutex::new(NativeScopeService::new(host.clone())));
     let runtime_overview = replication::RuntimeOverview::default();
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let mut lead_worker = None;
+    let mut http_worker = None;
     if let Ok(bind) = std::env::var("LIGHTHOUSE_HTTP_BIND") {
         let directory = config
             .state_path
@@ -179,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (lead_sender, mut lead_receiver) = tokio::sync::mpsc::channel::<http::LeadRequest>(16);
         let intake_host = host.clone();
         let lead_seed = device_seed;
-        tokio::spawn(async move {
+        lead_worker = Some(tokio::spawn(async move {
             while let Some(request) = lead_receiver.recv().await {
                 let result = intake_host.intake_store().and_then(|target| {
                     let (_, mut store, lead_peer) =
@@ -213,10 +215,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 });
                 let _ = request.response.send(result);
             }
-        });
+        }));
         let http_host = host.clone();
         let http_runtime = runtime_overview.clone();
-        tokio::spawn(async move {
+        http_worker = Some(tokio::spawn(async move {
             match http::serve(
                 directory,
                 address,
@@ -233,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 Err(error) => eprintln!("Lighthouse HTTP: {error}"),
             }
-        });
+        }));
     } else {
         drop(discovery);
         drop(shutdown_sender);
@@ -277,6 +279,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shutdown_receiver,
     )
     .await;
+    // HTTP owns discovery/provisioning (and its Node Arc). Join it before
+    // closing the node so SIGTERM cannot race the server task's final drops.
+    if let Some(worker) = http_worker {
+        let _ = worker.await;
+    }
+    // HTTP shutdown aborts its inbox processor, which drops the sender and
+    // lets this worker finish any in-flight durable write before node close.
+    if let Some(worker) = lead_worker {
+        let _ = worker.await;
+    }
     incoming.abort();
     let _ = incoming.await;
     // Worker cancellation finishes synchronous atomic store writes before releasing the node.
