@@ -559,6 +559,23 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // Given the public hostname, entering at its root reaches the admin UI.
+    let entry_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for (path, target) in [
+        ("/", "/admin/"),
+        ("/?pairing=test-code", "/admin/?pairing=test-code"),
+    ] {
+        let response = entry_client
+            .get(format!("{origin}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()[header::LOCATION], target);
+    }
     let client = reqwest::Client::new();
     let url = format!("{origin}/admin/api/overview");
     assert_eq!(
