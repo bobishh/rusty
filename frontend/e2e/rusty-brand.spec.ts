@@ -4,7 +4,7 @@ for (const unavailable of [false, true]) {
   test(`Given Rusty ${unavailable ? "session outage" : "sign-in"}, when opening its real admin route, then paired branding and usable controls stay visible`, async ({ page }) => {
     await page.route("**/admin/api/session", route => route.fulfill({ status: unavailable ? 503 : 403, json: { message: unavailable ? "Unavailable" : "Forbidden" } }))
     await page.goto("/admin/")
-    await expect(page).toHaveTitle("Rusty · Keeper")
+    await expect(page).toHaveTitle("rusty")
     await expect(page.getByRole("heading", { name: "RUSTY", exact: true })).toBeVisible()
     const robot = page.getByRole("img", { name: "Rusty", exact: true })
     await expect(robot).toBeVisible()
