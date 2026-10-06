@@ -36,6 +36,7 @@ type Pairing = {
   futureBoards: boolean
   operatorApproved: boolean | null
   controllerApproved: boolean | null
+  provisioning?: { status: string } | null
 }
 
 const csrf = ref("")
@@ -48,6 +49,8 @@ const loading = ref(false)
 const error = ref("")
 const overview = ref<Overview | null>(null)
 const pairings = ref<Pairing[]>([])
+const pendingPairings = computed(() => pairings.value.filter(pairing =>
+  pairing.provisioning?.status !== "active" && pairing.operatorApproved !== false && pairing.controllerApproved !== false))
 const corsRequired = ref("")
 const corsDraft = ref("")
 const corsLoaded = ref(false)
@@ -393,10 +396,10 @@ onUnmounted(() => {
 
         <section aria-labelledby="approvals-title" class="admin-section approvals-section">
           <div class="section-heading">
-            <h2 id="approvals-title">Approvals<span v-if="pairings.length"> ({{ pairings.length }})</span></h2>
+            <h2 id="approvals-title">Approvals<span v-if="pendingPairings.length"> ({{ pendingPairings.length }})</span></h2>
           </div>
-          <p v-if="!pairings.length" class="empty-state">No pending keeper requests. Create one from Match → Sync → Add keeper.</p>
-          <article v-for="pairing in pairings" :key="pairing.id" class="approval-card">
+          <p v-if="!pendingPairings.length" class="empty-state">No pending keeper requests. Create one from Match → Sync → Add keeper.</p>
+          <article v-for="pairing in pendingPairings" :key="pairing.id" class="approval-card">
             <h3>{{ pairing.controller.displayName }} · {{ pairing.comparisonCode }}</h3>
             <p class="muted">Controller {{ pairing.controllerFingerprint }} · service {{ pairing.serviceFingerprint }}</p>
             <ul><li v-for="scope in pairing.scopes" :key="scope.title">{{ scope.title }} · {{ scope.mode }}</li></ul>
