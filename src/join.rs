@@ -683,6 +683,7 @@ pub(crate) fn prepare_config(
         capabilities: meta_mesh_core::MESH_CAPABILITIES
             .iter()
             .map(|item| (*item).into())
+            .chain(std::iter::once("causal-write-admission-v1".into()))
             .collect(),
     };
     Ok(Config {

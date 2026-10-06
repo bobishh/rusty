@@ -748,6 +748,15 @@ impl NativeScopeServiceHost for KeeperHost {
         workspace_id: &str,
         request: &MeshHandshake,
     ) -> Result<(WorkspaceWriteAuthorizationSnapshot, Value), String> {
+        if !request
+            .capabilities
+            .iter()
+            .any(|capability| capability == "causal-write-admission-v1")
+        {
+            return Err(
+                "Peer needs causal write admission support. Upgrade the peer and reconnect.".into(),
+            );
+        }
         let mut response = self.outgoing_handshake(workspace_id)?;
         let registry = self
             .registry
@@ -799,6 +808,15 @@ impl NativeScopeServiceHost for KeeperHost {
             .ok_or("Unknown keeper scope")?;
         let mut handshake = scope.local_handshake.clone();
         handshake.owner_workspace_ids = None;
+        if !handshake
+            .capabilities
+            .iter()
+            .any(|capability| capability == "causal-write-admission-v1")
+        {
+            handshake
+                .capabilities
+                .push("causal-write-admission-v1".into());
+        }
         serde_json::to_value(handshake).map_err(|error| error.to_string())
     }
 

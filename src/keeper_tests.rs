@@ -891,7 +891,7 @@ fn owner_scope_inventory_is_withheld_from_unrelated_peer() {
         "ownershipTransfers": [],
         "successionVotes": [],
         "successionClaims": [],
-        "capabilities": [],
+        "capabilities": ["causal-write-admission-v1"],
     }))
     .unwrap();
     let mut host = keeper.host.clone();
@@ -907,7 +907,7 @@ fn owner_scope_inventory_is_withheld_from_unrelated_peer() {
         "ownershipTransfers": [],
         "successionVotes": [],
         "successionClaims": [],
-        "capabilities": [],
+        "capabilities": ["causal-write-admission-v1"],
     }))
     .unwrap();
     let (_, response) = host.prepare_handshake("primary-board", &request).unwrap();
@@ -915,6 +915,57 @@ fn owner_scope_inventory_is_withheld_from_unrelated_peer() {
         response["ownerWorkspaceIds"],
         json!(["primary-board", "second-board"])
     );
+}
+
+#[test]
+fn handshake_requires_causal_admission_before_exchange() {
+    let keeper = TestKeeper::new();
+    let mut host = keeper.host.clone();
+    let legacy: MeshHandshake = serde_json::from_value(json!({
+        "workspaceId": "primary-board", "peer": {}, "capabilities": [],
+        "revocations": [], "deviceRevocations": [], "departures": [],
+        "ownershipTransfers": [], "successionVotes": [], "successionClaims": [],
+    }))
+    .unwrap();
+    assert!(
+        host.prepare_handshake("primary-board", &legacy)
+            .unwrap_err()
+            .contains("causal write admission support")
+    );
+
+    let supported: MeshHandshake = serde_json::from_value(json!({
+        "workspaceId": "primary-board", "peer": {},
+        "capabilities": ["causal-write-admission-v1"],
+        "revocations": [], "deviceRevocations": [], "departures": [],
+        "ownershipTransfers": [], "successionVotes": [], "successionClaims": [],
+    }))
+    .unwrap();
+    assert!(host.prepare_handshake("primary-board", &supported).is_ok());
+}
+
+#[test]
+fn persisted_legacy_handshake_is_upgraded_without_repairing_scope() {
+    let keeper = TestKeeper::new();
+    {
+        let mut registry = keeper.host.registry.lock().unwrap();
+        registry
+            .scopes
+            .get_mut("primary-board")
+            .unwrap()
+            .local_handshake
+            .capabilities
+            .retain(|value| value != "causal-write-admission-v1");
+    }
+    let mut host = keeper.host.clone();
+    let handshake = host.outgoing_handshake("primary-board").unwrap();
+    assert!(
+        handshake["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "causal-write-admission-v1")
+    );
+    assert_eq!(host.scopes().unwrap().len(), 1);
 }
 
 #[test]
@@ -1084,6 +1135,12 @@ fn outbound_inventory_uses_signed_route_person_field_and_only_targets_owner() {
         "primary-board",
     )
     .unwrap();
+    assert!(
+        decoded
+            .capabilities
+            .iter()
+            .any(|capability| capability == "causal-write-admission-v1")
+    );
     assert_eq!(
         decoded.owner_workspace_ids,
         Some(vec!["primary-board".into()])

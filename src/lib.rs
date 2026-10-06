@@ -630,7 +630,7 @@ impl NativeScopeHost for MatchScopeStore {
         Ok(NativeScopeSnapshot {
             document: guard.state.document.clone(),
             authorization: Some(guard.state.authorization.clone()),
-            chat: Some(guard.state.chat.clone()),
+            chat: Some(contextual_chat_wire(&guard.state.chat)),
             mesh: Some(verified_mesh_for(&guard.state, &authority)?),
         })
     }
@@ -913,7 +913,18 @@ fn catalog_authority_is_admitted(
 }
 
 fn merge_chat(current: &Value, incoming: &Value) -> Result<Value, String> {
-    if incoming.get("version").and_then(Value::as_u64) != Some(1) {
+    let version = incoming.get("version").and_then(Value::as_u64);
+    if !matches!(version, Some(1) | Some(2))
+        || (version == Some(2)
+            && !incoming
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .is_some_and(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == Some("contextual-v2"))
+                }))
+    {
         return Err("Invalid chat batch".into());
     }
     if serde_json::to_vec(incoming)
@@ -962,8 +973,32 @@ fn merge_chat(current: &Value, incoming: &Value) -> Result<Value, String> {
         result.insert(field.into(), Value::Array(values));
     }
     result.insert("version".into(), json!(1));
+    result.insert("capabilities".into(), json!(["contextual-v2"]));
     result.insert("typing".into(), json!([]));
     Ok(Value::Object(result))
+}
+
+fn contextual_chat_wire(chat: &Value) -> Value {
+    let mut wire = chat.clone();
+    if let Some(object) = wire.as_object_mut() {
+        let has_contextual_record = object
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|record| {
+                    record
+                        .pointer("/signed/payload/version")
+                        .and_then(Value::as_u64)
+                        == Some(2)
+                })
+            });
+        object.insert(
+            "version".into(),
+            json!(if has_contextual_record { 2 } else { 1 }),
+        );
+        object.insert("capabilities".into(), json!(["contextual-v2"]));
+    }
+    wire
 }
 
 pub fn now_ms() -> Result<i128, String> {
@@ -982,6 +1017,87 @@ mod tests {
         WorkspaceChangeAuthorizationPayload, public_key_from_seed, public_key_id,
         sign_device_certificate, sign_json_envelope,
     };
+
+    #[test]
+    fn contextual_chat_wire_preserves_signed_context_and_advertises_support() {
+        let public_key = public_key_from_seed(&[1; 32]).unwrap();
+        let person_id = public_key_id(&public_key).unwrap();
+        let device_public_key = public_key_from_seed(&[2; 32]).unwrap();
+        let device_id = public_key_id(&device_public_key).unwrap();
+        let certificate = sign_device_certificate(
+            &[1; 32],
+            DeviceCertificatePayload {
+                kind: "device-certificate".into(),
+                version: 1,
+                person_id: person_id.clone(),
+                device_id: device_id.clone(),
+                device_public_key: device_public_key.clone(),
+                issuer_certificate_hash: None,
+                can_enroll_devices: true,
+            },
+            &person_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let signed_record = |version, id: &str, context: Option<Value>| {
+            let mut payload = json!({"kind":"chat-message", "version":version,
+                "workspaceId":"board", "personId":person_id, "deviceId":device_id,
+                "id":id, "createdAt":"2026-10-06T00:00:00.000Z", "text":"hello",
+                "revision":0});
+            if let Some(context) = context {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("context".into(), context);
+            }
+            json!({"signed": sign_json_envelope(&[2; 32], payload, &device_id,
+                DEFAULT_SIGNATURE_DOMAIN).unwrap(), "publicKey":public_key,
+                "certificates":[certificate], "authority":{"publicKey":public_key,
+                    "certificates":[certificate]}})
+        };
+        let contextual = signed_record(
+            2,
+            "message-2",
+            Some(json!({
+                "replyTo":"message-1", "references":[{"scopeId":"board", "recordId":"item-1"}]
+            })),
+        );
+        let plain = signed_record(1, "message-1", None);
+        let incoming = json!({"version": 2, "capabilities": ["contextual-v2"],
+            "messages": [plain, contextual], "profiles": [], "typing": []});
+        let merged = merge_chat(&empty_chat(), &incoming).unwrap();
+        assert_eq!(merged["messages"][0], plain);
+        assert_eq!(merged["messages"][1], contextual);
+        for record in merged["messages"].as_array().unwrap() {
+            let envelope: meta_mesh_core::SignedEnvelope<Value> =
+                serde_json::from_value(record["signed"].clone()).unwrap();
+            assert!(
+                meta_mesh_core::verify_signed_envelope(
+                    &envelope,
+                    &device_public_key,
+                    DEFAULT_SIGNATURE_DOMAIN
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(merged["capabilities"], json!(["contextual-v2"]));
+        let wire = contextual_chat_wire(&merged);
+        assert_eq!(wire["version"], 2);
+        assert_eq!(wire["messages"][1], contextual);
+        let legacy = merge_chat(
+            &empty_chat(),
+            &json!({"version": 1, "messages": [], "profiles": [], "typing": []}),
+        )
+        .unwrap();
+        assert_eq!(contextual_chat_wire(&legacy)["version"], 1);
+        assert!(
+            merge_chat(
+                &empty_chat(),
+                &json!({"version":2, "messages":[], "profiles":[], "typing":[]})
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn signed_document_survives_restart_but_unsigned_change_never_replaces_it() {
