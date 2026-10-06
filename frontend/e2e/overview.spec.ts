@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test"
 
 const overview = (state: string) => ({
   keeper: {
-    displayName: "mesh-lighthouse", personId: "keeper-person", deviceId: "keeper-device",
+    displayName: "Rusty", personId: "keeper-person", deviceId: "keeper-device",
     boards: [{ workspaceId: "board-1", title: "Garden", isPrimary: true, heads: ["head-1"], peerCount: 2,
       replication: { state, activePeers: state === "connected" ? 1 : 0 } }],
   },
@@ -22,15 +22,21 @@ test("Given an operator session, when overview changes, then Lighthouse updates 
   await page.route("**/admin/api/settings/cors", route => route.fulfill({ json: { requiredOrigin: "https://match.example", origins: ["https://match.example"] } }))
 
   await page.goto("/admin/")
-  await expect(page.getByRole("heading", { name: "LIGHTHOUSE", exact: true })).toBeVisible()
+  await expect(page.getByRole("heading", { name: "RUSTY", exact: true })).toBeVisible()
   await expect(page.getByText("Replication idle", { exact: true })).toBeVisible()
   await expect(page.getByText("Garden")).toBeVisible()
+  await expect(page.getByRole("navigation", { name: "Keeper sections" })).toBeVisible()
+  expect(await page.getByRole("heading", { name: "Keepers", exact: true }).evaluate(el => getComputedStyle(el).fontFamily)).toContain("Inter")
   await expect(page.getByRole("button", { name: "Refresh overview" })).toHaveCount(0)
   await expect(page.getByText("Service keeper")).toHaveCount(0)
   await expect(page.getByText("Separate from keeper status")).toHaveCount(0)
   await page.clock.runFor(5_000)
   await expect(page.getByText("Replication connected", { exact: true })).toBeVisible()
   expect(reads).toBeGreaterThan(1)
+  await page.screenshot({ path: "/tmp/rusty-dashboard.png", fullPage: true })
+  await page.setViewportSize({ width: 375, height: 812 })
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await page.screenshot({ path: "/tmp/rusty-dashboard-mobile.png", fullPage: true })
 })
 
 test("Given a live overview, when one poll fails, then prior data stays and next poll recovers", async ({ page }) => {

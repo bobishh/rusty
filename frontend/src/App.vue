@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue"
-import LighthouseMark from "./LighthouseMark.vue"
+import RustyMark from "./RustyMark.vue"
 
 type Board = {
   workspaceId: string
@@ -12,6 +12,7 @@ type Board = {
   replication?: { state: string; activePeers: number; lastSuccessAt?: number | null; lastErrorCategory?: string | null }
 }
 type Trigger = {
+  errorDetail?: string | null
   id: string
   name: string
   configured: boolean
@@ -36,7 +37,28 @@ type Pairing = {
   futureBoards: boolean
   operatorApproved: boolean | null
   controllerApproved: boolean | null
-  provisioning?: { status: string } | null
+  provisioning?: { status: string; scopes: { workspaceId: string; status: string; error?: string; errorDetail?: string }[] } | null
+}
+
+const resetOpen = ref(false)
+const resetToken = ref("")
+const resetError = ref("")
+const resetNotice = ref("")
+const resetting = ref(false)
+let resetRequestedAt = 0
+
+async function resetKeeper() {
+  resetError.value = ""
+  resetting.value = true
+  try {
+    await api("/admin/api/reset", { method: "POST", body: JSON.stringify({ secret: resetToken.value }) })
+    resetToken.value = ""
+    resetRequestedAt = Date.now()
+    resetNotice.value = "Reset requested. Rusty is restarting…"
+  } catch (cause) {
+    resetting.value = false
+    resetError.value = cause instanceof Error ? cause.message : "Could not reset keeper"
+  }
 }
 
 const csrf = ref("")
@@ -57,6 +79,9 @@ const corsLoaded = ref(false)
 const corsSaving = ref(false)
 const corsError = ref("")
 const corsNotice = ref("")
+const unsubscribeBoard = ref<Board | null>(null)
+const unsubscribing = ref(false)
+const unsubscribeError = ref("")
 const pollIntervalMs = 5_000
 let pollTimer: ReturnType<typeof setInterval> | undefined
 let refreshInFlight = false
@@ -90,7 +115,7 @@ function validMatchLoginUrl(value: string, challengeId: string) {
     || target.searchParams.get("keeper") !== window.location.origin
     || target.searchParams.get("challenge") !== challengeId
     || (target.protocol !== "https:" && !(loopback && target.protocol === "http:"))) {
-    throw new Error("Lighthouse returned an unsafe Match sign-in link.")
+    throw new Error("Rusty returned an unsafe Match sign-in link.")
   }
   return target.toString()
 }
@@ -234,6 +259,22 @@ async function signIn() {
 
 async function refresh() {
   if (refreshInFlight || !signedIn.value) return
+  if (resetting.value) {
+    if (!resetRequestedAt) return
+    try { await api("/admin/api/session") }
+    catch (cause) {
+      if (cause instanceof ApiError && cause.status === 403) {
+        clearIdentity()
+        resetting.value = false
+        resetOpen.value = false
+        resetNotice.value = "Keeper reset. Sign in again to add boards."
+      }
+    }
+    if (resetting.value && Date.now() - resetRequestedAt > 60_000) {
+      resetNotice.value = "Reset restart not confirmed. Reload Rusty to check status."
+    }
+    return
+  }
   refreshInFlight = true
   const version = sessionVersion
   try {
@@ -276,6 +317,23 @@ function date(value?: number | null) {
   return new Date(value * 1000).toLocaleString()
 }
 
+async function unsubscribe() {
+  const board = unsubscribeBoard.value
+  if (!board || unsubscribing.value) return
+  unsubscribing.value = true
+  unsubscribeError.value = ""
+  try {
+    await api(`/admin/api/boards/${encodeURIComponent(board.workspaceId)}/unsubscribe`, { method: "POST", body: "{}" })
+    if (overview.value) overview.value.keeper.boards = overview.value.keeper.boards.filter(value => value.workspaceId !== board.workspaceId)
+    unsubscribeBoard.value = null
+    await refresh()
+  } catch (cause) {
+    unsubscribeError.value = cause instanceof Error ? cause.message : "Could not unsubscribe board"
+  } finally {
+    unsubscribing.value = false
+  }
+}
+
 function pairingStatus(pairing: Pairing) {
   if (pairing.operatorApproved === false || pairing.controllerApproved === false) return "Keeper request declined. No access granted."
   if (pairing.operatorApproved === null) return "Waiting for keeper operator to approve service access."
@@ -300,12 +358,12 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="shell lighthouse-admin">
+  <div class="shell rusty-admin">
     <header class="topbar">
       <div class="brand">
-        <LighthouseMark />
+        <RustyMark />
         <div>
-          <h1>LIGHTHOUSE</h1>
+          <h1>RUSTY</h1>
         </div>
       </div>
       <div v-if="signedIn" class="admin-header-actions">
@@ -314,10 +372,13 @@ onUnmounted(() => {
     </header>
 
     <main class="admin-content">
+      <nav v-if="signedIn" class="admin-nav" aria-label="Keeper sections">
+        <a href="#keepers-title">Overview</a><a href="#approvals-title">Approvals<span v-if="pendingPairings.length" class="count-badge">{{ pendingPairings.length }}</span></a><a v-if="adminIdentity?.operator" href="#settings-title">Settings</a>
+      </nav>
       <p v-if="sessionLoading" class="empty-state" role="status">Checking operator session…</p>
       <section v-else-if="sessionUnavailable" class="login-card">
         <h2>Session check unavailable</h2>
-        <p class="section-copy">Could not reach Lighthouse. Retry to check your operator session.</p>
+        <p class="section-copy">Could not reach Rusty. Retry to check your operator session.</p>
         <button class="button button-primary" type="button" @click="restoreSession">Retry session check</button>
       </section>
       <form v-else-if="!signedIn" class="login-card" @submit.prevent="signIn">
@@ -334,25 +395,10 @@ onUnmounted(() => {
       </form>
 
       <p v-if="error" class="admin-notice admin-notice-error" role="status">{{ error }}</p>
+      <p v-if="resetNotice" class="admin-notice" role="status">{{ resetNotice }}</p>
 
-      <template v-if="signedIn && overview">
-        <section v-if="adminIdentity?.operator" aria-labelledby="settings-title" class="admin-section">
-          <div class="section-heading"><h2 id="settings-title">Settings</h2></div>
-          <form class="keeper-card cors-settings" @submit.prevent="saveCorsSettings">
-            <h3>Allowed website origins</h3>
-            <p class="section-copy">Match sign-in origin stays enabled. Add other websites allowed to reach Lighthouse intake, one HTTPS origin per line.</p>
-            <p class="muted">Match: {{ corsRequired || "Loading…" }}</p>
-            <label class="field-label" for="cors-origins">Additional origins</label>
-            <textarea id="cors-origins" v-model="corsDraft" :disabled="!corsLoaded || corsSaving" rows="3" placeholder="https://example.com"></textarea>
-            <div class="cors-actions">
-              <button class="button button-small button-primary" type="submit" :disabled="!corsLoaded || corsSaving">{{ corsSaving ? "Saving…" : "Save origins" }}</button>
-              <button v-if="!corsLoaded" class="button button-small" type="button" @click="loadCorsSettings">Retry loading</button>
-            </div>
-            <p v-if="corsError" class="admin-notice admin-notice-error" role="alert">{{ corsError }}</p>
-            <p v-if="corsNotice" class="admin-notice" role="status">{{ corsNotice }}</p>
-          </form>
-        </section>
-        <section aria-labelledby="keepers-title" class="admin-section">
+      <template v-if="signedIn">
+        <section v-if="overview" aria-labelledby="keepers-title" class="admin-section">
           <div class="section-heading">
             <div>
               <h2 id="keepers-title">Keepers</h2>
@@ -364,7 +410,7 @@ onUnmounted(() => {
             <div class="keeper-heading">
               <div>
                 <h3>{{ overview.keeper.displayName }}</h3>
-                <p class="muted">{{ overview.keeper.personId }}</p>
+                <p class="muted keeper-identity">{{ overview.keeper.personId }}</p>
               </div>
             </div>
 
@@ -378,6 +424,16 @@ onUnmounted(() => {
                   <p>Saved {{ date(board.lastSavedAt) }} · replication {{ board.replication?.state ?? "idle" }}</p>
                   <p v-if="board.replication?.lastSuccessAt">Last exchange {{ date(board.replication.lastSuccessAt) }}</p>
                   <p v-if="board.replication?.lastErrorCategory" class="muted">Last transport state: {{ board.replication.lastErrorCategory }}</p>
+                  <button class="button button-small" type="button" :disabled="unsubscribing" @click="unsubscribeBoard = board; unsubscribeError = ''">Unsubscribe</button>
+                  <div v-if="unsubscribeBoard?.workspaceId === board.workspaceId" class="unsubscribe-confirm">
+                    <p>Stop replicating {{ board.title }}?</p>
+                    <p class="muted">Disconnects this board from Rusty and ends its owner's future-board subscription. Match keeps its copy.</p>
+                    <div class="dialog-actions">
+                      <button class="button button-small" type="button" :disabled="unsubscribing" @click="unsubscribe">{{ unsubscribing ? 'Unsubscribing…' : 'Confirm unsubscribe' }}</button>
+                      <button class="button button-small" type="button" :disabled="unsubscribing" @click="unsubscribeBoard = null">Cancel</button>
+                    </div>
+                    <p v-if="unsubscribeError" class="admin-notice admin-notice-error" role="alert">{{ unsubscribeError }}</p>
+                  </div>
                 </article>
               </section>
 
@@ -386,6 +442,7 @@ onUnmounted(() => {
                 <p v-if="!overview.triggers.length" class="muted">No configured triggers.</p>
                 <article v-for="trigger in overview.triggers" :key="trigger.id" class="board-row">
                   <div class="board-title"><strong>{{ trigger.name }}</strong></div>
+                  <p v-if="trigger.errorDetail" class="admin-notice admin-notice-error" role="alert">{{ trigger.errorDetail }}</p>
                   <p>{{ trigger.configured ? "Configured" : "Not configured" }} · {{ trigger.pendingCount }} pending · {{ trigger.model }}</p>
                   <p>{{ trigger.outcomes.cardCreated }} cards created · {{ trigger.outcomes.chatQueued }} chats queued · {{ trigger.outcomes.awaitingMesh }} awaiting Match</p>
                 </article>
@@ -405,6 +462,8 @@ onUnmounted(() => {
             <ul><li v-for="scope in pairing.scopes" :key="scope.title">{{ scope.title }} · {{ scope.mode }}</li></ul>
             <p>{{ pairing.futureBoards ? "Future boards included in approval" : "Future boards not included" }}</p>
             <p>Controller approval: {{ pairing.controllerApproved === true ? "approved" : pairing.controllerApproved === false ? "declined" : "pending" }}</p>
+            <p v-if="pairing.provisioning">Board setup: {{ pairing.provisioning.status }}</p>
+            <p v-for="scope in pairing.provisioning?.scopes.filter(scope => scope.error) ?? []" :key="scope.workspaceId" class="admin-notice admin-notice-error" role="alert">{{ scope.workspaceId }}: {{ scope.errorDetail || scope.error }}</p>
             <div class="dialog-actions">
               <template v-if="adminIdentity?.operator">
                 <button class="button button-primary" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'approve')">Approve exact boards</button>
@@ -413,6 +472,36 @@ onUnmounted(() => {
             <p v-else class="muted" role="status">{{ pairingStatus(pairing) }}</p>
             </div>
           </article>
+        </section>
+        <section v-if="adminIdentity?.operator" aria-labelledby="settings-title" class="admin-section">
+          <div class="section-heading"><h2 id="settings-title">Settings</h2></div>
+          <form class="keeper-card cors-settings" @submit.prevent="saveCorsSettings">
+            <h3>Allowed website origins</h3>
+            <p class="section-copy">Match sign-in origin stays enabled. Add other websites allowed to reach Rusty intake, one HTTPS origin per line.</p>
+            <p class="muted">Match: {{ corsRequired || "Loading…" }}</p>
+            <label class="field-label" for="cors-origins">Additional origins</label>
+            <textarea id="cors-origins" v-model="corsDraft" :disabled="!corsLoaded || corsSaving" rows="3" placeholder="https://example.com"></textarea>
+            <div class="cors-actions">
+              <button class="button button-small button-primary" type="submit" :disabled="!corsLoaded || corsSaving">{{ corsSaving ? "Saving…" : "Save origins" }}</button>
+              <button v-if="!corsLoaded" class="button button-small" type="button" @click="loadCorsSettings">Retry loading</button>
+            </div>
+            <p v-if="corsError" class="admin-notice admin-notice-error" role="alert">{{ corsError }}</p>
+            <p v-if="corsNotice" class="admin-notice" role="status">{{ corsNotice }}</p>
+          </form>
+          <div class="keeper-card danger-zone">
+            <h3>Reset keeper</h3>
+            <p>Remove all boards, pairing requests, intake messages and JEV results. Rusty keeps its identity and website settings. Match keeps its boards. A private recovery backup stays on the server.</p>
+            <button v-if="!resetOpen" class="button button-small" type="button" @click="resetOpen = true; resetError = ''">Reset keeper</button>
+            <form v-else @submit.prevent="resetKeeper">
+              <label class="field-label" for="reset-token">Reset operator token</label>
+              <input id="reset-token" v-model="resetToken" type="password" autocomplete="off" :disabled="resetting" required />
+              <div class="dialog-actions">
+                <button class="button button-small" type="submit" :disabled="resetting || !resetToken">{{ resetting ? 'Resetting…' : 'Delete all keeper data' }}</button>
+                <button class="button button-small" type="button" :disabled="resetting" @click="resetOpen = false; resetToken = ''">Cancel</button>
+              </div>
+              <p v-if="resetError" class="admin-notice admin-notice-error" role="alert">{{ resetError }}</p>
+            </form>
+          </div>
         </section>
       </template>
     </main>

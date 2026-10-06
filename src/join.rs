@@ -521,7 +521,7 @@ pub(crate) fn guest_bundle(
             "deviceId": device_id, "endpoint": endpoint,
             "issuedAt": OffsetDateTime::from_unix_timestamp_nanos(now_ms()? * 1_000_000)?
                 .format(format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"))?,
-            "deviceName": "Lighthouse",
+            "deviceName": "Rusty",
             "userAgent": concat!("mesh-lighthouse/", env!("CARGO_PKG_VERSION")),
         }),
         device_id,
@@ -700,6 +700,7 @@ pub(crate) fn prepare_config(
         identity_seed: identity_seed.to_vec(),
         device_seed: device_seed.to_vec(),
         additional_scopes: Vec::new(),
+        primary_detached: false,
         controller_person_id: None,
         provisioning_commits: Vec::new(),
     })

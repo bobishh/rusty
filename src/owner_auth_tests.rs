@@ -249,6 +249,15 @@ fn token_login_remains_operator_session() {
 }
 
 #[test]
+fn unsubscribe_mutation_requires_valid_session_and_csrf() {
+    let service = pairings();
+    let (cookie, csrf) = service.login(OPERATOR_SECRET).unwrap();
+    assert!(service.mutation_owner(&cookie, "wrong-csrf").is_err());
+    assert!(service.mutation_owner("invalid-session", &csrf).is_err());
+    assert_eq!(service.mutation_owner(&cookie, &csrf).unwrap(), None);
+}
+
+#[test]
 fn logout_requires_csrf_and_revokes_only_valid_session() {
     let service = pairings();
     let (cookie, csrf) = service.login(OPERATOR_SECRET).unwrap();
@@ -424,5 +433,118 @@ fn proof_rejects_wrong_service_audience_and_spoofed_controller_identity_without_
                 &challenge.challenge_id
             )
             .is_ok()
+    );
+}
+
+#[test]
+fn exact_provision_failure_survives_restart_in_signed_status() {
+    let service = pairings();
+    let now = now_seconds();
+    let (_, owner, device_id, certificates) = test_peer("Owner", [3; 32], [4; 32]);
+    let id = "failed-provision";
+    let challenge = sign_json_envelope(
+        &service.service_seed,
+        json!({"kind":"lighthouse-pairing-challenge", "version":1}),
+        &service.service_device_id,
+        CONTROL_DOMAIN,
+    )
+    .unwrap();
+    let record = PairingRecord {
+        id: id.into(),
+        expires_at: now + 600,
+        created_at: now,
+        transcript_hash: "approved-transcript".into(),
+        comparison_code: "123456".into(),
+        operator_approved: Some(true),
+        controller_approved: Some(true),
+        controller_decision_operation: None,
+        controller_decision_hash: None,
+        controller: owner,
+        controller_device_id: device_id,
+        controller_certificates: certificates,
+        offer: json!({}),
+        challenge,
+        last_operation_id: "operation".into(),
+        provisioning: Some(ProvisioningRecord {
+            operation_id: "operation".into(),
+            request_hash: "request".into(),
+            status: "provisioning".into(),
+            scopes: vec![ProvisionedScope {
+                workspace_id: "board".into(),
+                status: "pending".into(),
+                error: None,
+                error_detail: None,
+            }],
+        }),
+    };
+    service
+        .state
+        .lock()
+        .unwrap()
+        .records
+        .insert(id.into(), record);
+    service
+        .complete_provision(
+            id,
+            vec![ProvisionedScope {
+                workspace_id: "board".into(),
+                status: "pending".into(),
+                error: Some("join_failed".into()),
+                error_detail: Some("Mesh snapshot rejected: stale authorization epoch".into()),
+            }],
+            false,
+        )
+        .unwrap();
+    let (peer, _, _, _) = test_peer("Lighthouse", [6; 32], [7; 32]);
+    let reopened = PairingService::open(
+        service.directory.as_ref().clone(),
+        &peer,
+        "https://keeper.example".into(),
+        [7; 32],
+        OPERATOR_SECRET.into(),
+    )
+    .unwrap();
+    let status = reopened.signed_provision_status(id).unwrap();
+    assert_eq!(
+        status.payload["provisioning"]["scopes"][0]["errorDetail"],
+        "Mesh snapshot rejected: stale authorization epoch"
+    );
+    assert_eq!(status.payload["status"], "provisioning");
+    let key = public_key_from_seed(&[7; 32]).unwrap();
+    verify_signed_envelope(&status, &key, CONTROL_DOMAIN).unwrap();
+}
+
+#[test]
+fn reset_requires_operator_session_csrf_and_fresh_token() {
+    let service = pairings();
+    let (cookie, csrf) = service.login(OPERATOR_SECRET).unwrap();
+    assert!(service.authorize_reset(&cookie, &csrf, "wrong").is_err());
+    assert!(
+        service
+            .authorize_reset(&cookie, "wrong", OPERATOR_SECRET)
+            .is_err()
+    );
+    assert!(
+        service
+            .authorize_reset("wrong", &csrf, OPERATOR_SECRET)
+            .is_err()
+    );
+    assert!(
+        service
+            .authorize_reset(&cookie, &csrf, OPERATOR_SECRET)
+            .is_ok()
+    );
+    service
+        .state
+        .lock()
+        .unwrap()
+        .sessions
+        .get_mut(&cookie)
+        .unwrap()
+        .operator = false;
+    assert!(
+        service
+            .authorize_reset(&cookie, &csrf, OPERATOR_SECRET)
+            .is_err()
     );
 }

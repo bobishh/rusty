@@ -355,6 +355,131 @@ impl Drop for TestKeeper {
     }
 }
 
+#[test]
+fn unsubscribe_primary_survives_restart_and_keeps_service_identity() {
+    let keeper = TestKeeper::new();
+    let before = keeper.host.configuration().unwrap();
+    keeper
+        .host
+        .unsubscribe("primary-board", Some(&keeper.owner.person_id))
+        .unwrap();
+    assert!(keeper.host.scopes().unwrap().is_empty());
+    let persisted: Config =
+        serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    assert!(persisted.primary_detached);
+    assert!(persisted.initial_state.document.is_empty());
+    assert!(persisted.initial_state.authorization.is_null());
+    assert_eq!(persisted.identity_seed, before.identity_seed);
+    assert_eq!(persisted.device_seed, before.device_seed);
+    assert_eq!(persisted.iroh_secret, before.iroh_secret);
+    let reopened = KeeperHost::open(persisted, keeper.config_path.clone()).unwrap();
+    assert!(reopened.scopes().unwrap().is_empty());
+    assert!(
+        reopened.admin_overview().unwrap()["keeper"]["boards"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(reopened.intake_store().unwrap().is_none());
+}
+
+#[test]
+fn unsubscribe_rejects_another_owner_without_changing_registry() {
+    let keeper = TestKeeper::new();
+    let before = fs::read(&keeper.config_path).unwrap();
+    assert!(
+        keeper
+            .host
+            .unsubscribe("primary-board", Some("another-owner"))
+            .is_err()
+    );
+    assert_eq!(fs::read(&keeper.config_path).unwrap(), before);
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+}
+
+#[test]
+fn unsubscribe_cannot_hide_board_when_registry_write_fails() {
+    let keeper = TestKeeper::new();
+    fs::remove_file(&keeper.config_path).unwrap();
+    fs::create_dir(&keeper.config_path).unwrap();
+    assert!(keeper.host.unsubscribe("primary-board", None).is_err());
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+    assert!(!keeper.host.configuration().unwrap().primary_detached);
+}
+
+#[test]
+fn unsubscribed_primary_can_be_added_again_by_fresh_provisioning() {
+    let keeper = TestKeeper::new();
+    keeper.host.unsubscribe("primary-board", None).unwrap();
+    let scope = keeper.staged_scope("primary-board");
+    let commit = ProvisioningCommit {
+        pairing_id: "new-pairing".into(),
+        operation_id: "new-operation".into(),
+        transcript_hash: "new-transcript".into(),
+        invitation_id: "new-invitation".into(),
+        workspace_ids: vec!["primary-board".into()],
+        snapshot_hash: "new-snapshot".into(),
+        future_boards: true,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![scope], commit)
+        .unwrap();
+    let persisted: Config =
+        serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    assert!(!persisted.primary_detached);
+    assert!(persisted.additional_scopes.is_empty());
+    assert_eq!(
+        KeeperHost::open(persisted, keeper.config_path.clone())
+            .unwrap()
+            .scopes()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn unsubscribed_additional_board_can_receive_a_fresh_grant() {
+    let keeper = TestKeeper::new();
+    let mut commit = ProvisioningCommit {
+        pairing_id: "first-pairing".into(),
+        operation_id: "first-operation".into(),
+        transcript_hash: "transcript".into(),
+        invitation_id: "invitation".into(),
+        workspace_ids: vec!["second-board".into()],
+        snapshot_hash: "snapshot".into(),
+        future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![keeper.staged_scope("second-board")], commit.clone())
+        .unwrap();
+    let old_path = keeper.host.configuration().unwrap().additional_scopes[0]
+        .state_path
+        .clone();
+    keeper.host.unsubscribe("second-board", None).unwrap();
+    assert!(old_path.is_file());
+    commit.pairing_id = "fresh-pairing".into();
+    commit.operation_id = "fresh-operation".into();
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![keeper.staged_scope("second-board")], commit)
+        .unwrap();
+    let config = keeper.host.configuration().unwrap();
+    assert_ne!(config.additional_scopes[0].state_path, old_path);
+    assert_eq!(
+        KeeperHost::open(config, keeper.config_path.clone())
+            .unwrap()
+            .scopes()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 #[path = "keeper_owner_tests.rs"]
 mod owner_tests;
 
@@ -518,6 +643,59 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
     ] {
         assert!(!body.contains(private));
     }
+    let detach_url = format!("{origin}/admin/api/boards/second-board/unsubscribe");
+    let denied = client
+        .post(&detach_url)
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(keeper.host.scopes().unwrap().len(), 2);
+    let detached = client
+        .post(&detach_url)
+        .header(header::COOKIE, &cookie)
+        .header(
+            "x-csrf-token",
+            original_session["csrfToken"].as_str().unwrap(),
+        )
+        .header(header::ORIGIN, "http://127.0.0.1:4283")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detached.status(), StatusCode::OK);
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+    assert!(
+        keeper
+            .host
+            .configuration()
+            .unwrap()
+            .additional_scopes
+            .is_empty()
+    );
+    for id in ["jobs-a", "jobs-b"] {
+        let jobs = fixture_with_preset(&keeper.owner, &keeper.keeper, id, Some("job-search"));
+        keeper
+            .merge_offer(
+                keeper.peer(&keeper.owner, "primary-board"),
+                &keeper.offer(&jobs),
+            )
+            .unwrap();
+    }
+    let ambiguous = client
+        .get(&url)
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ambiguous.status(), StatusCode::OK);
+    let ambiguous = ambiguous.json::<Value>().await.unwrap();
+    assert_eq!(ambiguous["keeper"]["boards"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        ambiguous["triggers"][0]["errorDetail"],
+        "Multiple job-search boards in keeper scopes"
+    );
+    assert!(ambiguous["triggers"][0]["targetWorkspaceId"].is_null());
     // Missing durable result storage is a sanitized failure, never an empty
     // success that hides lost intake data or leaked filesystem diagnostics.
     fs::remove_dir_all(keeper.directory.join("results")).unwrap();
@@ -531,7 +709,59 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
     let failure = failed.text().await.unwrap();
     assert!(!failure.contains(keeper.directory.to_str().unwrap()));
     assert!(!failure.contains("private employer"));
+    let reset_url = format!("{origin}/admin/api/reset");
+    for (secret, csrf, status) in [
+        (
+            "wrong-token",
+            original_session["csrfToken"].as_str().unwrap(),
+            StatusCode::FORBIDDEN,
+        ),
+        (admin_secret, "wrong-csrf", StatusCode::FORBIDDEN),
+        (
+            admin_secret,
+            original_session["csrfToken"].as_str().unwrap(),
+            StatusCode::ACCEPTED,
+        ),
+    ] {
+        let response = client
+            .post(&reset_url)
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", csrf)
+            .header(header::ORIGIN, "http://127.0.0.1:4283")
+            .json(&json!({"secret":secret}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            keeper.directory.join("reset-request.json").exists(),
+            status == StatusCode::ACCEPTED
+        );
+    }
     server.abort();
+    crate::reset::apply_pending(&keeper.config_path).unwrap();
+    let reset_config: Config =
+        serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    assert_eq!(reset_config.identity_seed, config.identity_seed);
+    assert_eq!(reset_config.device_seed, config.device_seed);
+    assert_eq!(reset_config.iroh_secret, config.iroh_secret);
+    assert!(
+        KeeperHost::open(reset_config, keeper.config_path.clone())
+            .unwrap()
+            .scopes()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!keeper.directory.join("state.json").exists());
+    assert!(!keeper.directory.join("inbox").exists());
+    assert!(!keeper.directory.join("reset-request.json").exists());
+    assert_eq!(
+        fs::read_dir(keeper.directory.join("reset-backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    crate::reset::apply_pending(&keeper.config_path).unwrap();
 }
 
 #[test]
@@ -1019,4 +1249,173 @@ async fn config_mode_sigterm_drains_http_and_exits_without_losing_durable_state(
     let peer = keeper.peer(&keeper.keeper, "primary-board");
     host.open_scope(&peer)
         .expect("signed durable snapshot remains admissible after SIGTERM");
+}
+
+#[tokio::test]
+#[ignore = "requires the separately built mesh-lighthouse executable"]
+async fn detached_identity_starts_with_empty_boards_and_provisioning_enabled() {
+    use std::{process::Command, time::Duration};
+    let keeper = TestKeeper::new();
+    keeper.host.unsubscribe("primary-board", None).unwrap();
+    fs::remove_file(keeper.directory.join("state.json")).ok();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let binary = std::env::var_os("LIGHTHOUSE_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/mesh-lighthouse")
+        });
+    let output = fs::File::create(keeper.directory.join("empty-runtime.log")).unwrap();
+    let mut child = Command::new(binary)
+        .arg(&keeper.config_path)
+        .env("LIGHTHOUSE_HTTP_BIND", format!("127.0.0.1:{port}"))
+        .env("LIGHTHOUSE_PUBLIC_ORIGIN", &origin)
+        .env(
+            "LIGHTHOUSE_ADMIN_TOKEN",
+            "test-detached-runtime-token-20261006",
+        )
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .unwrap();
+    let client = reqwest::Client::new();
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(response) = client
+                .get(format!("{origin}/.well-known/mesh-lighthouse"))
+                .send()
+                .await
+            {
+                if response.status().is_success() {
+                    return response.json::<Value>().await.unwrap();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let discovery = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "Empty runtime failed: {error}: {}",
+                fs::read_to_string(keeper.directory.join("empty-runtime.log")).unwrap()
+            );
+        }
+    };
+    let login = client
+        .post(format!("{origin}/admin/api/session"))
+        .header("content-type", "application/json")
+        .header("origin", &origin)
+        .body(r#"{"secret":"test-detached-runtime-token-20261006"}"#)
+        .send()
+        .await
+        .unwrap();
+    let cookie = login.headers()[reqwest::header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let overview = client
+        .get(format!("{origin}/admin/api/overview"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let csrf = login.json::<Value>().await.unwrap()["csrfToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(
+        keeper.directory.join("inbox/reset-fixture.json"),
+        "private intake fixture",
+    )
+    .unwrap();
+    let reset = client
+        .post(format!("{origin}/admin/api/reset"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", csrf)
+        .header("origin", &origin)
+        .json(&json!({"secret":"test-detached-runtime-token-20261006"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), reqwest::StatusCode::ACCEPTED);
+    let stopped = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if stopped.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        stopped
+            .expect("Reset must drain and stop runtime")
+            .success()
+    );
+    assert!(keeper.directory.join("reset-request.json").exists());
+    let binary = std::env::var_os("LIGHTHOUSE_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/mesh-lighthouse")
+        });
+    let mut restarted = Command::new(binary);
+    let output = fs::File::create(keeper.directory.join("reset-restart.log")).unwrap();
+    let mut restarted = restarted
+        .arg(&keeper.config_path)
+        .env("LIGHTHOUSE_HTTP_BIND", format!("127.0.0.1:{port}"))
+        .env("LIGHTHOUSE_PUBLIC_ORIGIN", &origin)
+        .env(
+            "LIGHTHOUSE_ADMIN_TOKEN",
+            "test-detached-runtime-token-20261006",
+        )
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if client
+                .get(format!("{origin}/health"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    ready.expect("Reset runtime restarts with preserved identity");
+    assert!(!keeper.directory.join("reset-request.json").exists());
+    assert!(!keeper.directory.join("inbox/reset-fixture.json").exists());
+    assert_eq!(
+        fs::read_dir(keeper.directory.join("reset-backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(discovery["capabilities"]["provisioning"], true);
+    assert_eq!(overview["keeper"]["personId"], keeper.keeper.person_id);
+    assert!(overview["keeper"]["boards"].as_array().unwrap().is_empty());
 }

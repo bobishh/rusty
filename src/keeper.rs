@@ -141,6 +141,9 @@ impl KeeperHost {
         }
         let mut scopes = BTreeMap::new();
         for scope in std::iter::once(&config).chain(config.additional_scopes.iter()) {
+            if scope.primary_detached {
+                continue;
+            }
             if scope.device_id != config.device_id
                 || scope.iroh_secret != config.iroh_secret
                 || scope.device_seed != config.device_seed
@@ -233,6 +236,59 @@ impl KeeperHost {
             .clone())
     }
 
+    pub(crate) fn request_reset(&self) -> Result<(), String> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        crate::reset::request(&registry.config_path)
+    }
+
+    /// Persist subscription removal before exposing it to the replication scheduler.
+    /// Keep service keys and the disconnected files for operator recovery.
+    pub(crate) fn unsubscribe(
+        &self,
+        workspace_id: &str,
+        owner: Option<&str>,
+    ) -> Result<(), String> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        let scope = registry
+            .scopes
+            .get(workspace_id)
+            .ok_or("Board is not attached")?;
+        let scope_owner = current_owner(scope)?;
+        if owner.is_some_and(|owner| owner != scope_owner) {
+            return Err("Board belongs to another owner".into());
+        }
+        let mut next = registry.config.clone();
+        next.additional_scopes
+            .retain(|scope| scope.workspace_id != workspace_id);
+        if next.workspace_id == workspace_id {
+            next.primary_detached = true;
+            next.initial_state.document.clear();
+            next.initial_state.authorization = Value::Null;
+            next.initial_state.chat =
+                json!({"version": 1, "messages": [], "profiles": [], "typing": []});
+            next.initial_state.mesh = None;
+            next.transport_secret.clear();
+            next.controller_person_id = None;
+        }
+        // Removing one board also ends the prior owner's future-board subscription.
+        // A fresh dual approval is required to enable that policy again.
+        next.provisioning_commits.retain(|commit| {
+            !commit.workspace_ids.iter().any(|id| id == workspace_id)
+                && commit.controller_person_id.as_deref() != Some(scope_owner.as_str())
+        });
+        let bytes = serde_json::to_vec(&next).map_err(|error| error.to_string())?;
+        FileScopeStore::new(&registry.config_path).write_validated(&bytes, None, |_, _| Ok(()))?;
+        registry.config = next;
+        registry.scopes.remove(workspace_id);
+        Ok(())
+    }
+
     pub(crate) fn admin_overview(&self) -> Result<Value, String> {
         self.overview_for_owner(None)
     }
@@ -282,7 +338,7 @@ impl KeeperHost {
         boards.sort_by_key(|board| !board["isPrimary"].as_bool().unwrap_or(false));
         Ok(json!({
             "keeper": {
-                "displayName": peer.pointer("/advertisement/payload/deviceName").and_then(Value::as_str).unwrap_or("Lighthouse"),
+                "displayName": crate::keeper_display_name(peer.pointer("/advertisement/payload/deviceName").and_then(Value::as_str)),
                 "personId": peer.pointer("/advertisement/payload/personId").and_then(Value::as_str).unwrap_or_default(),
                 "deviceId": registry.config.device_id,
                 "boards": boards,
@@ -415,7 +471,17 @@ impl KeeperHost {
                 return Err(error);
             }
         };
-        next.additional_scopes.extend(staged.iter().cloned());
+        for scope in &staged {
+            if next.primary_detached && scope.workspace_id == next.workspace_id {
+                let additional = std::mem::take(&mut next.additional_scopes);
+                let commits = std::mem::take(&mut next.provisioning_commits);
+                next = scope.clone();
+                next.additional_scopes = additional;
+                next.provisioning_commits = commits;
+            } else {
+                next.additional_scopes.push(scope.clone());
+            }
+        }
         next.provisioning_commits.push(commit);
         let bytes = match serde_json::to_vec(&next) {
             Ok(bytes) => bytes,
@@ -533,8 +599,23 @@ fn relocate_provisioned_scope_dirs(
             .parent()
             .ok_or("Invalid staged scope state path")?
             .to_path_buf();
-        let key = URL_SAFE_NO_PAD.encode(Sha256::digest(scope.workspace_id.as_bytes()));
-        let destination = scopes_root.join(key);
+        // Fresh grants receive separate storage, so detached snapshots cannot
+        // block re-adding a board. Retries still select the same destination.
+        let marker = ScopeActivationMarker::new(commit, &scope.workspace_id);
+        let activation = serde_json::to_vec(&marker).map_err(|error| error.to_string())?;
+        let key = URL_SAFE_NO_PAD.encode(Sha256::digest(&activation));
+        let mut destination = scopes_root.join(key);
+        // Recover an orphan created before activation-specific directories.
+        let legacy_key = URL_SAFE_NO_PAD.encode(Sha256::digest(scope.workspace_id.as_bytes()));
+        let legacy = scopes_root.join(legacy_key);
+        if !destination.exists()
+            && fs::read(legacy.join(".lighthouse-provisioning.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ScopeActivationMarker>(&bytes).ok())
+                .is_some_and(|existing| existing == marker)
+        {
+            destination = legacy;
+        }
         if destination.exists() {
             let marker_path = destination.join(".lighthouse-provisioning.json");
             let marker_bytes = match fs::read(&marker_path) {

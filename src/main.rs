@@ -20,6 +20,14 @@ mod keeper;
 mod pairing;
 mod provisioning;
 mod replication;
+mod reset;
+
+fn keeper_display_name(name: Option<&str>) -> &str {
+    match name {
+        None | Some("Lighthouse" | "mesh-lighthouse") => "Rusty",
+        Some(name) => name,
+    }
+}
 
 #[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +47,8 @@ pub(crate) struct Config {
     pub(crate) device_seed: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) additional_scopes: Vec<Config>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) primary_detached: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) controller_person_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -101,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.next().is_some() {
         return Err("Too many arguments".into());
     }
+    reset::apply_pending(std::path::Path::new(&path))?;
     let config: Config = serde_json::from_slice(&fs::read(&path)?)?;
     let discovery = match std::env::var("LIGHTHOUSE_PUBLIC_ORIGIN") {
         Ok(origin) => {
@@ -325,7 +336,7 @@ fn refresh_route(
         .map_err(|error| error.to_string())?;
     payload["issuedAt"] = Value::String(issued_at);
     payload["routeSequence"] = Value::from(sequence);
-    payload["deviceName"] = Value::String("Lighthouse".into());
+    payload["deviceName"] = Value::String("Rusty".into());
     payload["userAgent"] =
         Value::String(concat!("mesh-lighthouse/", env!("CARGO_PKG_VERSION")).into());
     let signed = serde_json::to_value(sign_json_envelope(

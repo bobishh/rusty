@@ -1,18 +1,18 @@
-.lighthouse-admin { min-height: 100vh; }
-.lighthouse-admin .topbar { position: sticky; top: 0; z-index: 2; }
-.lighthouse-admin .brand h1 { text-transform: uppercase; }
+.rusty-admin { min-height: 100vh; }
+.rusty-admin .topbar { z-index: 2; }
+.rusty-admin .brand h1 { text-transform: uppercase; }
 .admin-content { width: min(1000px, 100%); margin: 0 auto; padding: clamp(20px, 5vw, 56px) clamp(16px, 4vw, 40px) 64px; }
 .admin-section { margin: 0 0 44px; }
 .section-heading { justify-content: space-between; margin-bottom: 16px; }
 .section-heading h2 { margin: 0; font-size: clamp(1.5rem, 4vw, 2rem); letter-spacing: -.04em; }
 .section-copy, .muted { color: var(--muted); line-height: 1.5; }
-.keeper-card, .approval-card, .login-card { padding: clamp(16px, 3vw, 24px); border: 2px solid var(--line); background: var(--panel); box-shadow: var(--shadow); }
+.keeper-card, .approval-card, .login-card { padding: clamp(16px, 3vw, 24px); border: 2px solid var(--line); background: var(--panel); }
 .keeper-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding-bottom: 18px; border-bottom: 2px solid var(--soft); }
 .keeper-heading h3, .approval-card h3 { margin: 0 0 5px; }
-.keeper-heading p { margin: 0; overflow-wrap: anywhere; font: 700 .7rem/1.5 ui-monospace, monospace; }
-.replication-status { margin: 0; color: var(--muted); font: 700 .75rem/1.4 ui-monospace, monospace; }
-.replication-status[data-state="connected"] { color: #3f6848; }
-.replication-status[data-state="retrying"] { color: #9a6b20; }
+.keeper-heading p { margin: 0; overflow-wrap: anywhere; font: 700 .7rem/1.5 var(--site-font-mono); }
+.replication-status { margin: 0; color: var(--muted); font: 700 .75rem/1.4 var(--site-font-mono); }
+.replication-status[data-state="connected"] { color: var(--focus); }
+.replication-status[data-state="retrying"] { color: var(--muted); }
 .overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); gap: 26px; padding-top: 8px; }
 .overview-group h4 { margin: 12px 0; font-size: .95rem; }
 .board-row { padding: 13px 0; border-top: 1px solid var(--soft); }
@@ -20,7 +20,6 @@
 .board-row p, .approval-card p { margin: 6px 0 0; color: var(--muted); font-size: .84rem; line-height: 1.45; }
 .empty-state { padding: 18px; border: 2px dashed var(--line); color: var(--muted); line-height: 1.55; }
 .approvals-section { display: grid; gap: 14px; }
-.approval-card { box-shadow: 4px 4px 0 var(--ink); }
 .approval-card ul { padding-left: 22px; line-height: 1.7; }
 .login-card { display: grid; justify-items: start; gap: 12px; max-width: 480px; margin: 32px auto; }
 .login-card h2, .login-card p { margin: 0; }
@@ -28,4 +27,45 @@
 .login-card input { width: min(360px, 80vw); min-height: var(--control-size); padding: 9px 12px; border: 2px solid var(--line); background: var(--panel); }
 .admin-notice { min-height: 1.5em; margin: 0 0 20px; padding: 8px 12px; border: 1px solid var(--soft); color: var(--ink); background: var(--panel); font-weight: 700; line-height: 1.4; }
 .admin-notice-error { border-color: #9d2f21; color: #9d2f21; background: #fff5f2; }
-@media (max-width: 600px) { .lighthouse-admin .topbar { padding: 12px 16px; } .keeper-heading { flex-direction: column; } }
+@media (max-width: 600px) { .rusty-admin .topbar { padding: 12px 16px; } .keeper-heading { flex-direction: column; } }
+
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("/assets/inter-latin-wght-normal.woff2") format("woff2"); }
+.rusty-admin { --site-font-sans: "Inter", system-ui, sans-serif; font-family: var(--site-font-sans); font-size: 16px; line-height: 1.55; }
+.rusty-admin .topbar { z-index: 2; gap: 20px; background: var(--panel); }
+.rusty-admin .brand h1 { font-family: "Caveat", cursive; text-transform: uppercase; }
+.rusty-admin h2, .rusty-admin h3, .rusty-admin h4, .rusty-admin .button { font-family: var(--site-font-sans); }
+.rusty-admin h2 { font-size: 24px; letter-spacing: -.035em; }
+.rusty-admin h3 { font-size: 19px; letter-spacing: -.025em; }
+.rusty-admin h4 { font-size: 16px; }
+.rusty-admin .button { font-size: 14px; line-height: 1.4; font-weight: 650; min-height: 42px; border-radius: 8px; }
+.rusty-admin .button-small { min-height: 36px; font-size: 13px; }
+.admin-content { width: min(1120px, 100%); padding-top: 28px; }
+.admin-nav { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 32px; padding-bottom: 18px; border-bottom: 1px solid var(--soft); }
+.admin-nav a { display: inline-flex; align-items: center; gap: 8px; padding: 9px 14px; border-radius: 8px; color: var(--ink); text-decoration: none; font-weight: 650; }
+.admin-nav a:hover, .admin-nav a:focus-visible { background: var(--soft); }
+.count-badge { padding: 1px 7px; border-radius: 20px; background: var(--yellow); font-size: 12px; }
+.admin-section { scroll-margin-top: 100px; margin-bottom: 32px; }
+.section-heading { align-items: center; gap: 16px; margin-bottom: 16px; }
+.keeper-card, .approval-card, .login-card { border: 1px solid #d9d4c8; border-radius: 14px; padding: 24px; }
+.admin-section > .keeper-card + .keeper-card { margin-top: 16px; }
+.keeper-heading { border-bottom: 1px solid var(--soft); }
+.keeper-identity { font-size: 12px; font-weight: 400; }
+.overview-grid { gap: 32px; }
+.board-row { padding: 18px 0; }
+.board-row .button { margin-top: 12px; }
+.board-row p, .approval-card p, .replication-status { font-family: var(--site-font-sans); font-size: 13px; font-weight: 400; }
+.board-title strong { font-size: 16px; font-weight: 650; }
+.replication-status { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 20px; background: var(--soft); }
+.replication-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.replication-status[data-state="connected"]::before { background: var(--focus); }
+.replication-status[data-state="retrying"]::before { background: #ad791c; }
+.empty-state { border: 1px dashed #c5bfb2; border-radius: 12px; font-size: 14px; }
+.login-card { margin-top: 48px; gap: 18px; }
+.field-label { font-size: 13px; font-weight: 600; }
+.rusty-admin input, .rusty-admin textarea { font-family: var(--site-font-sans); font-size: 14px; border-radius: 8px; }
+.admin-notice { border-radius: 8px; font-size: 14px; font-weight: 500; }
+.danger-zone { border-color: #d5b0a6; }
+.danger-zone > h3 { color: #9d2f21; }
+.unsubscribe-confirm { margin-top: 14px; padding: 16px; border-radius: 10px; background: var(--paper); }
+.rusty-admin .dialog-actions { flex-wrap: wrap; }
+@media (max-width: 600px) { .rusty-admin .topbar { padding: 12px 16px; } .admin-content { padding-top: 20px; } .keeper-card, .approval-card, .login-card { padding: 18px; } .section-heading { flex-wrap: wrap; } .overview-grid { grid-template-columns: 1fr; gap: 18px; } .login-card { margin-top: 20px; } .admin-nav a { padding: 8px 10px; font-size: 14px; } }

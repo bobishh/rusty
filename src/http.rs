@@ -119,7 +119,7 @@ impl Discovery {
             descriptor: json!({
                 "protocolVersions": [1],
                 "service": service,
-                "displayName": identity.get("deviceName").and_then(Value::as_str).unwrap_or("Lighthouse"),
+                "displayName": crate::keeper_display_name(identity.get("deviceName").and_then(Value::as_str)),
                 "capabilities": {
                     "products": ["match"],
                     "modes": ["replicate"],
@@ -445,15 +445,19 @@ pub(crate) async fn pairing_provision(
                 .await
             {
                 Ok(scopes) => scopes,
-                Err(_) => provision
-                    .scopes
-                    .iter()
-                    .map(|workspace_id| ProvisionedScope {
-                        workspace_id: workspace_id.clone(),
-                        status: "pending".into(),
-                        error: Some("join_failed".into()),
-                    })
-                    .collect(),
+                Err(error) => {
+                    eprintln!("Lighthouse provisioning failed for pairing {id}: {error}");
+                    provision
+                        .scopes
+                        .iter()
+                        .map(|workspace_id| ProvisionedScope {
+                            workspace_id: workspace_id.clone(),
+                            status: "pending".into(),
+                            error: Some("join_failed".into()),
+                            error_detail: Some(error.chars().take(1024).collect()),
+                        })
+                        .collect()
+                }
             }
         } else {
             provision
@@ -463,6 +467,7 @@ pub(crate) async fn pairing_provision(
                     workspace_id: workspace_id.clone(),
                     status: "pending".into(),
                     error: Some("runtime_unavailable".into()),
+                    error_detail: Some("Lighthouse replication runtime is unavailable".into()),
                 })
                 .collect()
         };
@@ -694,6 +699,7 @@ pub(crate) async fn admin_list(
         "scopes":record.offer["body"]["scopes"],"transcriptHash":record.transcript_hash,
         "futureBoards":record.offer.pointer("/body/policy/futureBoards").and_then(Value::as_bool).unwrap_or(false),
         "operatorApproved":record.operator_approved,"controllerApproved":record.controller_approved,
+        "provisioning":record.provisioning,
     })).collect::<Vec<_>>();
     let mut response = Json(json!({"pairings":rows})).into_response();
     response
@@ -779,6 +785,80 @@ pub(crate) async fn update_admin_cors_settings(
     admin_cors_settings(state, headers).await
 }
 
+pub(crate) async fn admin_reset(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    input: crate::pairing::LoginRequest,
+) -> Result<Response, PairingResponseError> {
+    enforce_same_origin(&state, &headers)?;
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    pairings
+        .authorize_reset(cookie, csrf, &input.secret)
+        .map_err(PairingResponseError)?;
+    let keeper = state
+        .keeper
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    keeper.request_reset().map_err(|error| {
+        eprintln!("Keeper reset request failed: {error}");
+        PairingResponseError(PairingError::Unavailable)
+    })?;
+    // Respond before requesting graceful process shutdown. Docker's restart
+    // policy restarts the same identity; startup performs the offline reset.
+    #[cfg(not(test))]
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Err(error) = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -TERM $PPID"])
+            .status()
+        {
+            eprintln!("Keeper reset shutdown failed: {error}");
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(json!({"resetting":true}))).into_response())
+}
+
+pub(crate) async fn admin_unsubscribe(
+    state: AppState,
+    id: String,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, PairingResponseError> {
+    enforce_same_origin(&state, &headers)?;
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let owner = pairings
+        .mutation_owner(cookie, csrf)
+        .map_err(PairingResponseError)?;
+    let keeper = state
+        .keeper
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    keeper.unsubscribe(&id, owner.as_deref()).map_err(|error| {
+        eprintln!("Lighthouse unsubscribe failed for board {id}: {error}");
+        PairingResponseError(if error == "Board belongs to another owner" {
+            PairingError::Forbidden
+        } else {
+            PairingError::Invalid("Could not unsubscribe board")
+        })
+    })?;
+    Ok(Json(json!({"detached": true})))
+}
+
 pub(crate) async fn admin_overview(
     state: AppState,
     headers: axum::http::HeaderMap,
@@ -824,10 +904,12 @@ pub(crate) async fn admin_overview(
         board["replication"] =
             serde_json::to_value(status).unwrap_or_else(|_| json!({"state":"unknown"}));
     }
-    let target_workspace_id = keeper
-        .intake_store()
-        .map_err(|_| PairingResponseError(PairingError::Unavailable))?
-        .map(|(workspace_id, _, _)| workspace_id);
+    // An ambiguous intake destination must not hide the boards needed to fix it.
+    let (target_workspace_id, intake_error) = match keeper.intake_store() {
+        Ok(target) => (target.map(|(workspace_id, _, _)| workspace_id), None),
+        Err(error) if error == "Multiple job-search boards in keeper scopes" => (None, Some(error)),
+        Err(_) => return Err(PairingResponseError(PairingError::Unavailable)),
+    };
     let primary_workspace_id = keeper
         .configuration()
         .map_err(|_| PairingResponseError(PairingError::Unavailable))?
@@ -905,6 +987,7 @@ pub(crate) async fn admin_overview(
     overview["triggers"] = json!([{
         "id":"jev-intake",
         "name":"JEV intake",
+        "errorDetail":intake_error,
         "configured":std::env::var("JEV_API_KEY").is_ok_and(|key| !key.trim().is_empty()),
         "model":JEV_MODEL,
         "targetWorkspaceId":target_workspace_id,
