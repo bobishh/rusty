@@ -1,6 +1,6 @@
 # Rusty
 
-Repository: https://github.com/bobishh/rusty. Rusty pairs with tincanban as a storage and replication keeper. Its admin interface uses Inter for controls and content, Caveat only for the header wordmark, and Fira Code for identity details.
+Repository: https://github.com/bobishh/rusty. Rusty pairs with tincanban as a storage and replication keeper. Its admin interface uses Fira Code for controls and content, Caveat only for the header wordmark, and Fira Code for identity details. All styling comes from the complete `src/styles/design-system/index.css` bundle in tincanban, pinned by `MATCH_UI_REV` in the Docker build; local development uses `MATCH_UI_SOURCE`. Rusty has no private stylesheet.
 
 Rusty is tincanban’s companion keeper: a little tin robot listening to several can telephones. Native Rust MetaMesh participant. Match is the first consumer. A single service identity stores signed state for multiple Match workspaces and synchronizes each scope over Iroh. Each scope and peer has its own retry loop, so an unreachable peer does not delay other boards.
 

@@ -2,8 +2,8 @@ FROM node:22-bookworm-slim AS frontend
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-# Share the released tincanban stylesheet without changing native authority dependencies.
-ARG MATCH_UI_REV=123c3d6cdb00014b856124d1493f9a48783456e5
+# Import the complete pinned tincanban design system; native authority dependencies stay independent.
+ARG MATCH_UI_REV=90818c9fec7be41bc92f03d169659fcbb1cfe8bf
 RUN git init /match \
     && git -C /match remote add origin https://github.com/bobishh/tincanban.git \
     && git -C /match fetch --depth=1 origin "$MATCH_UI_REV" \

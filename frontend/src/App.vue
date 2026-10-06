@@ -358,7 +358,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="shell rusty-admin">
+  <div class="shell keeper-admin">
     <header class="topbar">
       <div class="brand">
         <RustyMark />
@@ -373,7 +373,7 @@ onUnmounted(() => {
 
     <main class="admin-content">
       <nav v-if="signedIn" class="admin-nav" aria-label="Keeper sections">
-        <a href="#keepers-title">Overview</a><a href="#approvals-title">Approvals<span v-if="pendingPairings.length" class="count-badge">{{ pendingPairings.length }}</span></a><a v-if="adminIdentity?.operator" href="#settings-title">Settings</a>
+        <a class="button button-small button-quiet" href="#keepers-title">Overview</a><a class="button button-small button-quiet" href="#approvals-title">Approvals<span v-if="pendingPairings.length" class="count-badge">{{ pendingPairings.length }}</span></a><a v-if="adminIdentity?.operator" class="button button-small button-quiet" href="#settings-title">Settings</a>
       </nav>
       <p v-if="sessionLoading" class="empty-state" role="status">Checking operator session…</p>
       <section v-else-if="sessionUnavailable" class="login-card">
@@ -496,7 +496,7 @@ onUnmounted(() => {
               <label class="field-label" for="reset-token">Reset operator token</label>
               <input id="reset-token" v-model="resetToken" type="password" autocomplete="off" :disabled="resetting" required />
               <div class="dialog-actions">
-                <button class="button button-small" type="submit" :disabled="resetting || !resetToken">{{ resetting ? 'Resetting…' : 'Delete all keeper data' }}</button>
+                <button class="button button-small button-danger" type="submit" :disabled="resetting || !resetToken">{{ resetting ? 'Resetting…' : 'Delete all keeper data' }}</button>
                 <button class="button button-small" type="button" :disabled="resetting" @click="resetOpen = false; resetToken = ''">Cancel</button>
               </div>
               <p v-if="resetError" class="admin-notice admin-notice-error" role="alert">{{ resetError }}</p>
@@ -507,14 +507,3 @@ onUnmounted(() => {
     </main>
   </div>
 </template>
-
-<style scoped>
-.admin-header-actions { display: flex; gap: 8px; }
-.service-admin-fallback { display: grid; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--soft); }
-.service-admin-fallback summary { color: var(--muted); cursor: pointer; font-weight: 750; }
-.service-admin-fallback input { width: min(360px, 80vw); min-height: var(--control-size); padding: 9px 12px; border: 2px solid var(--line); background: var(--panel); }
-.cors-settings { display: grid; gap: 12px; }
-.cors-settings h3, .cors-settings p { margin: 0; }
-.cors-settings textarea { width: 100%; padding: 10px 12px; border: 2px solid var(--line); background: var(--panel); color: var(--ink); font: inherit; resize: vertical; }
-.cors-actions { display: flex; gap: 10px; }
-</style>
