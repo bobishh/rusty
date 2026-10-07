@@ -294,15 +294,6 @@ fn future_board_offer_accepts_owner_signed_editor_grant_only_when_enabled() {
     let mut host = keeper.host.clone();
     let mut scope = host.open_scope(&peer).unwrap();
 
-    let preexisting = complete_owner_offer(&keeper.owner, &keeper.keeper, "primary-board");
-    assert!(
-        scope
-            .prepare_owner_offer(preexisting.to_string().as_bytes())
-            .err()
-            .expect("baseline workspace is rejected")
-            .contains("Pre-existing board")
-    );
-
     assert!(
         scope
             .prepare_owner_offer(&offer.to_string().into_bytes())
@@ -380,6 +371,14 @@ fn future_owner_offer_updates_scope_ledger_atomically_and_replays_idempotently()
         !record
             .baseline_workspace_ids
             .contains(&"future-ledger-board".into())
+    );
+    let baseline_offer = complete_owner_offer(&keeper.owner, &keeper.keeper, "primary-board");
+    assert!(
+        scope
+            .prepare_owner_offer(baseline_offer.to_string().as_bytes())
+            .err()
+            .expect("baseline workspace is rejected")
+            .contains("Pre-existing board")
     );
     assert!(
         scope_record

@@ -401,6 +401,26 @@ impl TestKeeper {
         config.controller_person_id = Some(self.owner.person_id.clone());
         config
     }
+
+    fn enable_future_boards_for_primary(&mut self) {
+        let mut config = self.host.configuration().unwrap();
+        let staged = vec![config.clone()];
+        config.provisioning_commits.push(ProvisioningCommit {
+            pairing_id: format!("test-future-{}", rand::random::<u64>()),
+            integration_id: crate::integration_id(&self.owner.person_id, &self.keeper.person_id),
+            operation_id: format!("test-future-operation-{}", rand::random::<u64>()),
+            transcript_hash: "test-future-transcript".into(),
+            invitation_id: "test-future-invitation".into(),
+            workspace_ids: vec!["primary-board".into()],
+            snapshot_hash: "test-future-snapshot".into(),
+            future_boards: true,
+            baseline_workspace_ids: vec!["primary-board".into()],
+            controller_person_id: Some(self.owner.person_id.clone()),
+        });
+        super::record_activated_integration(&mut config, &staged).unwrap();
+        fs::write(&self.config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        self.host = KeeperHost::open(config, self.config_path.clone()).unwrap();
+    }
 }
 
 fn controller_request(
@@ -548,7 +568,7 @@ fn approved_active_pairing(
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "http-contract-snapshot".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["second-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -801,7 +821,7 @@ fn unsubscribed_additional_board_can_receive_a_fresh_grant() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["second-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -846,7 +866,7 @@ fn unsubscribe_removes_only_the_owned_scope_files() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["second-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -936,7 +956,7 @@ fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "new-snapshot".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["second-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -989,7 +1009,7 @@ fn disconnect_cleanup_failure_stays_pending_and_retries_after_restart() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["second-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1069,7 +1089,7 @@ fn local_unsubscribe_retries_the_same_scope_cleanup_without_restart() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["second-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1146,7 +1166,7 @@ fn local_unsubscribe_cannot_drop_another_scope_during_pending_cleanup() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot-b".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["second-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1162,7 +1182,7 @@ fn local_unsubscribe_cannot_drop_another_scope_during_pending_cleanup() {
         workspace_ids: vec!["third-board".into()],
         snapshot_hash: "snapshot-c".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["third-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1593,12 +1613,53 @@ fn scope_cleanup_refuses_the_scopes_root_itself() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn scope_cleanup_removes_owned_legacy_scope_without_touching_neighbor_or_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let keeper = TestKeeper::new();
+    let config = keeper.host.configuration().unwrap();
+    let scopes_root = keeper.directory.join("scopes");
+    fs::create_dir_all(&scopes_root).unwrap();
+
+    let legacy = keeper.directory.join(format!("scope-{}", "a".repeat(32)));
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("state.json"), b"legacy owned scope").unwrap();
+    let mut legacy_scope = config.clone();
+    legacy_scope.state_path = legacy.join("state.json");
+    super::cleanup_scope_storage(&keeper.directory, &legacy_scope, false).unwrap();
+    assert!(!legacy.exists());
+
+    let neighbor = scopes_root.join("unrelated-scope");
+    fs::create_dir_all(&neighbor).unwrap();
+    fs::write(neighbor.join("state.json"), b"keep neighboring board").unwrap();
+    let outside = keeper.directory.join("outside-owned-scope");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("state.json"), b"keep external board").unwrap();
+    let linked = scopes_root.join("scope-linked");
+    symlink(&outside, &linked).unwrap();
+    let mut linked_scope = config;
+    linked_scope.state_path = linked.join("state.json");
+
+    assert!(super::cleanup_scope_storage(&keeper.directory, &linked_scope, false).is_err());
+    assert_eq!(
+        fs::read(neighbor.join("state.json")).unwrap(),
+        b"keep neighboring board"
+    );
+    assert_eq!(
+        fs::read(outside.join("state.json")).unwrap(),
+        b"keep external board"
+    );
+}
+
 #[path = "keeper_owner_tests.rs"]
 mod owner_tests;
 
 #[test]
 fn intake_follows_the_job_search_preset_across_keeper_scopes() {
-    let keeper = TestKeeper::new();
+    let mut keeper = TestKeeper::new();
+    keeper.enable_future_boards_for_primary();
     assert!(keeper.host.intake_store().unwrap().is_none());
     let jobs = fixture_with_preset(
         &keeper.owner,
@@ -1622,7 +1683,8 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
 {
     use crate::{http, pairing::PairingService};
     use axum::http::{StatusCode, header};
-    let keeper = TestKeeper::new();
+    let mut keeper = TestKeeper::new();
+    keeper.enable_future_boards_for_primary();
     let staged = keeper.staged_scope("second-board");
     keeper
         .host
@@ -1639,8 +1701,8 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
                 invitation_id: "overview-invitation".into(),
                 workspace_ids: vec!["second-board".into()],
                 snapshot_hash: "overview-snapshot".into(),
-                future_boards: false,
-                baseline_workspace_ids: Vec::new(),
+                future_boards: true,
+                baseline_workspace_ids: vec!["primary-board".into(), "second-board".into()],
                 controller_person_id: Some(keeper.owner.person_id.clone()),
             },
         )
@@ -1778,6 +1840,17 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
     ] {
         assert!(!body.contains(private));
     }
+    // Follow-owner offers are allowed only while signed future-board consent
+    // remains active. Unsubscribe revokes that consent with the selected scope.
+    for id in ["jobs-a", "jobs-b"] {
+        let jobs = fixture_with_preset(&keeper.owner, &keeper.keeper, id, Some("job-search"));
+        keeper
+            .merge_offer(
+                keeper.peer(&keeper.owner, "primary-board"),
+                &keeper.offer(&jobs),
+            )
+            .unwrap();
+    }
     let detach_url = format!("{origin}/admin/api/boards/second-board/unsubscribe");
     let denied = client
         .post(&detach_url)
@@ -1786,7 +1859,7 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-    assert_eq!(keeper.host.scopes().unwrap().len(), 2);
+    assert_eq!(keeper.host.scopes().unwrap().len(), 4);
     let detached = client
         .post(&detach_url)
         .header(header::COOKIE, &cookie)
@@ -1799,24 +1872,16 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
         .await
         .unwrap();
     assert_eq!(detached.status(), StatusCode::OK);
-    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+    assert_eq!(keeper.host.scopes().unwrap().len(), 3);
     assert!(
         keeper
             .host
             .configuration()
             .unwrap()
             .additional_scopes
-            .is_empty()
+            .iter()
+            .all(|scope| scope.workspace_id != "second-board")
     );
-    for id in ["jobs-a", "jobs-b"] {
-        let jobs = fixture_with_preset(&keeper.owner, &keeper.keeper, id, Some("job-search"));
-        keeper
-            .merge_offer(
-                keeper.peer(&keeper.owner, "primary-board"),
-                &keeper.offer(&jobs),
-            )
-            .unwrap();
-    }
     let ambiguous = client
         .get(&url)
         .header(header::COOKIE, &cookie)
@@ -1901,7 +1966,8 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
 
 #[test]
 fn approved_owner_offer_activates_and_persists_scope_with_shared_service_identity() {
-    let keeper = TestKeeper::new();
+    let mut keeper = TestKeeper::new();
+    keeper.enable_future_boards_for_primary();
     let scope_fixture = fixture(&keeper.owner, &keeper.keeper, "second-board");
     let offer = keeper.offer(&scope_fixture);
 
@@ -1973,7 +2039,8 @@ fn invalid_grant_or_document_never_activates_offered_scope() {
 
 #[test]
 fn repeated_offer_is_idempotent_but_revalidates_signed_grant() {
-    let keeper = TestKeeper::new();
+    let mut keeper = TestKeeper::new();
+    keeper.enable_future_boards_for_primary();
     let scope_fixture = fixture(&keeper.owner, &keeper.keeper, "second-board");
     let peer = keeper.peer(&keeper.owner, "primary-board");
     let offer = keeper.offer(&scope_fixture);
@@ -1991,7 +2058,8 @@ fn repeated_offer_is_idempotent_but_revalidates_signed_grant() {
 
 #[test]
 fn owner_scope_inventory_is_withheld_from_unrelated_peer() {
-    let keeper = TestKeeper::new();
+    let mut keeper = TestKeeper::new();
+    keeper.enable_future_boards_for_primary();
     let scope_fixture = fixture(&keeper.owner, &keeper.keeper, "second-board");
     keeper
         .merge_offer(
@@ -2122,7 +2190,7 @@ fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
         workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
         snapshot_hash: "snapshot-test".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     let mut orphaned = vec![keeper.staged_scope("selected-board-a")];
@@ -2202,7 +2270,7 @@ fn failed_scope_validation_never_activates_a_subset_of_provisioned_scopes() {
         workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
         snapshot_hash: "snapshot-test".into(),
         future_boards: false,
-        baseline_workspace_ids: Vec::new(),
+        baseline_workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
 

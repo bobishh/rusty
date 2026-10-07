@@ -1658,43 +1658,71 @@ fn cleanup_scope_storage(
         return Err("Refusing to remove an unrecognized scope state path".into());
     }
     let parent = state_path.parent().ok_or("Invalid scope state path")?;
-    let expected_parent = if primary {
-        config_directory.to_path_buf()
-    } else {
-        config_directory.join("scopes")
-    };
-    let valid_parent = if primary {
-        parent == expected_parent
-    } else {
-        parent != expected_parent && parent.parent() == Some(expected_parent.as_path())
-    };
-    if !valid_parent {
-        return Err("Refusing to remove scope data outside its configured storage root".into());
-    }
+    let canonical_config = fs::canonicalize(config_directory).map_err(|error| error.to_string())?;
     if !primary {
-        if parent
+        let parent_name = parent
             .file_name()
             .and_then(|name| name.to_str())
-            .is_none_or(|name| name.is_empty())
-        {
-            return Err("Invalid configured scope directory".into());
-        }
-        if let Ok(metadata) = fs::symlink_metadata(parent)
-            && !metadata.file_type().is_dir()
+            .ok_or("Invalid configured scope directory")?;
+        let metadata = match fs::symlink_metadata(parent) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.file_type().is_dir())
         {
             return Err("Configured scope directory is not a real directory".into());
         }
-        if parent.exists() {
-            let expected_root = config_directory.join("scopes");
-            let canonical_root =
-                fs::canonicalize(expected_root).map_err(|error| error.to_string())?;
-            let canonical_parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
-            if canonical_parent.parent() != Some(canonical_root.as_path()) {
-                return Err("Configured scope directory escaped its storage root".into());
+        let scopes_root = config_directory.join("scopes");
+        let canonical_scopes_root = match fs::symlink_metadata(&scopes_root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                let root = fs::canonicalize(&scopes_root).map_err(|error| error.to_string())?;
+                if root.parent() != Some(canonical_config.as_path()) {
+                    return Err("Configured scopes directory escaped its storage root".into());
+                }
+                Some(root)
             }
+            Ok(_) => return Err("Configured scopes path is not a real directory".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let legacy_scope_name = is_legacy_scope_directory(parent_name);
+        let valid_location = if metadata.is_some() {
+            let canonical_parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+            let managed_child = canonical_scopes_root.as_ref().is_some_and(|root| {
+                canonical_parent != *root && canonical_parent.parent() == Some(root.as_path())
+            });
+            let legacy_child = legacy_scope_name
+                && canonical_parent != canonical_config
+                && canonical_parent.parent() == Some(canonical_config.as_path());
+            managed_child || legacy_child
+        } else {
+            let ancestor = parent
+                .parent()
+                .ok_or("Invalid configured scope directory")?;
+            let canonical_ancestor =
+                fs::canonicalize(ancestor).map_err(|error| error.to_string())?;
+            let managed_child = canonical_scopes_root
+                .as_ref()
+                .is_some_and(|root| canonical_ancestor == *root);
+            let legacy_child = legacy_scope_name && canonical_ancestor == canonical_config;
+            managed_child || legacy_child
+        };
+        if !valid_location {
+            return Err("Refusing to remove scope data outside its configured storage root".into());
+        }
+        if metadata.is_some() {
             fs::remove_dir_all(parent).map_err(|error| error.to_string())?;
         }
     } else {
+        let canonical_parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+        if canonical_parent != canonical_config {
+            return Err(
+                "Refusing to remove primary scope outside its configured storage root".into(),
+            );
+        }
         remove_file_if_present(state_path)?;
         let cache = state_path.with_file_name(format!(
             "{}.proof-staging",
@@ -1705,15 +1733,40 @@ fn cleanup_scope_storage(
         ));
         remove_dir_if_present(&cache)?;
     }
-    let sync_directory = if primary {
-        config_directory.to_path_buf()
+    let scopes_root = canonical_config.join("scopes");
+    let sync_directory = if !primary && scopes_root.is_dir() {
+        scopes_root
     } else {
-        config_directory.join("scopes")
+        canonical_config
     };
     fs::File::open(sync_directory)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn is_legacy_scope_directory(name: &str) -> bool {
+    name.strip_prefix("scope-").is_some_and(|suffix| {
+        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn ensure_scopes_storage_root(config_directory: &std::path::Path) -> Result<PathBuf, String> {
+    let canonical_config = fs::canonicalize(config_directory).map_err(|error| error.to_string())?;
+    let scopes_root = canonical_config.join("scopes");
+    match fs::symlink_metadata(&scopes_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err("Configured scopes path is not a real directory".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            join::create_private_directory(&scopes_root).map_err(|error| error.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    let canonical_root = fs::canonicalize(&scopes_root).map_err(|error| error.to_string())?;
+    if canonical_root.parent() != Some(canonical_config.as_path()) {
+        return Err("Configured scopes directory escaped its storage root".into());
+    }
+    Ok(canonical_root)
 }
 
 fn remove_file_if_present(path: &std::path::Path) -> Result<(), String> {
@@ -2331,10 +2384,11 @@ impl NativeScopeHost for KeeperScope {
         let response = serde_json::to_vec(&json!({ "grants": [value["grant"]], "meshWorkspaces": [envelope],
             "snapshot": URL_SAFE_NO_PAD.encode(serde_json::to_vec(&vec![workspace]).map_err(|error| error.to_string())?) }))
             .map_err(|error| error.to_string())?;
-        let directory = registry
+        let config_directory = registry
             .config_path
             .parent()
-            .ok_or("Invalid keeper registry path")?
+            .ok_or("Invalid keeper registry path")?;
+        let directory = ensure_scopes_storage_root(config_directory)?
             .join(format!("scope-{:032x}", rand::random::<u128>()));
         join::create_private_directory(&directory).map_err(|error| error.to_string())?;
         let mut pending = PendingScopeDirectory(Some(directory.clone()));
