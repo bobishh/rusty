@@ -10,3 +10,17 @@ body, button, input, select, textarea {
 h1, h2, h3, h4, h5, h6 {
   font-family: "Caveat", cursive;
 }
+
+.keeper-admin .topbar > .brand > .rusty-mark {
+  flex: 0 0 64px;
+  width: 64px;
+  height: 80px;
+}
+
+@media (max-width: 600px) {
+  .keeper-admin .topbar > .brand > .rusty-mark {
+    flex-basis: 52px;
+    width: 52px;
+    height: 65px;
+  }
+}
