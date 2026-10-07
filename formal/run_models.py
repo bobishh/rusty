@@ -29,6 +29,8 @@ CASES = [
     ("FutureLedgerOmitted", None, "FutureRuntimeAttachedHasLedger", "FutureOfferLifecycle"),
     ("FutureSweepsUnselected", None, "UnselectedIntegrationMemberRequiresInvitationConsent", "FutureOfferLifecycle"),
     ("FutureConsentDisabled", None, None, "FutureOfferLifecycle"),
+    ("DisconnectReplay", "RetryAfterFreshReAddResolves", None, "DisconnectReplay"),
+    ("DisconnectReplayStaleReceipt", None, "RemovedResponseMatchesCurrentScope", "DisconnectReplay"),
 ]
 
 

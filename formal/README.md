@@ -40,6 +40,12 @@ consent config checks that no board can stage when `futureBoards` is false. The
 owner signature itself is abstracted as `OwnerProofValid`; signature
 verification remains covered by Rust tests.
 
+`DisconnectReplay.tla` preserves a completed signed removal receipt as history.
+After a fresh higher-epoch re-add, replay of that old removal operation must
+return conflict instead of presenting the historical receipt as current
+removal confirmation. Its mutant returns the archived receipt while the scope
+is active and violates `RemovedResponseMatchesCurrentScope`.
+
 | Requirement | Check |
 | --- | --- |
 | Editor invitation and signed Editor grant required | `EditorRoleProofs`; `VisitorActivation.cfg` mutant |
@@ -51,6 +57,7 @@ verification remains covered by Rust tests.
 | Tombstoned activation cannot replay; fresh higher-epoch Editor can re-add | `NoStaleActivationResurrection`, `FreshGrantEpoch`; `StaleActivation.cfg` mutant |
 | Concurrent owner revision cannot commit stale stage | `CommitUsesCurrentRevision`; `ConcurrentCAS.cfg` and `StaleCAS.cfg` |
 | Future-board consent applies only to genuinely new boards; Editor invite/grant and registry commit enforced | `FuturePolicyBlocksAutoPairing`; `FutureConsent.cfg` mutant; `FutureOfferLifecycle.tla` configs `FutureEditorOffer.cfg` witness, `FutureVisitorOnlyOfferGate.cfg` liveness mutant, `FutureVisitorGrant.cfg` role mutant, `FutureLedgerOmitted.cfg` registry mutant, `FutureSweepsUnselected.cfg` baseline-consent mutant, `FutureConsentDisabled.cfg` consent check |
+| A completed removal receipt remains historical after fresh re-add; stale replay cannot claim current removal | `RemovedResponseMatchesCurrentScope`; `DisconnectReplayStaleReceipt.cfg` mutant; `DisconnectReplay.cfg` conflict-after-readd witness |
 | Ambiguous JobSearch routing is blocked | `AmbiguousRouteBlocked`; `AmbiguousRouteMutation.cfg` mutant |
 
 Source mapping:

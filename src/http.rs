@@ -571,7 +571,14 @@ pub(crate) async fn integration_disconnect(
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
     let receipt = provisioner
         .disconnect_integration(&verified)
-        .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
+        .map_err(|error| match error {
+            crate::keeper::DisconnectError::Conflict => {
+                PairingResponseError(PairingError::Conflict)
+            }
+            crate::keeper::DisconnectError::Unavailable => {
+                PairingResponseError(PairingError::Unavailable)
+            }
+        })?;
     let signed = pairings
         .sign_disconnect_receipt(receipt)
         .map_err(PairingResponseError)?;

@@ -46,6 +46,24 @@ pub(crate) enum ProvisioningLifecycleStatus {
     Detached,
 }
 
+#[derive(Debug)]
+pub(crate) enum DisconnectError {
+    Conflict,
+    Unavailable,
+}
+
+impl From<String> for DisconnectError {
+    fn from(_: String) -> Self {
+        Self::Unavailable
+    }
+}
+
+impl From<&str> for DisconnectError {
+    fn from(_: &str) -> Self {
+        Self::Unavailable
+    }
+}
+
 fn current_owner(scope: &MatchLighthouseHost) -> Result<String, String> {
     Ok(scope.store.authority()?.expected_current_owner.person_id)
 }
@@ -960,7 +978,7 @@ impl KeeperHost {
     pub(crate) fn disconnect_integration(
         &self,
         request: &VerifiedDisconnectRequest,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, DisconnectError> {
         let mut registry = self
             .registry
             .lock()
@@ -983,7 +1001,15 @@ impl KeeperHost {
             .find(|operation| operation.operation_id == request.operation_id)
         {
             if completed.request_hash != request.request_hash {
-                return Err("Disconnect operation ID was reused with different intent".into());
+                return Err(DisconnectError::Conflict);
+            }
+            if request.scopes.iter().any(|(workspace_id, _)| {
+                current
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.workspace_id == *workspace_id && scope.state == "active")
+            }) {
+                return Err(DisconnectError::Conflict);
             }
             return Ok(disconnect_receipt_value(request, completed, &current));
         }

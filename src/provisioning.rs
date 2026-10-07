@@ -45,7 +45,7 @@ impl ProvisioningService {
     pub(crate) fn disconnect_integration(
         &self,
         request: &VerifiedDisconnectRequest,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, crate::keeper::DisconnectError> {
         self.host.disconnect_integration(request)
     }
 

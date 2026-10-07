@@ -946,6 +946,8 @@ fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
     assert_eq!(receipt["status"], "removed");
     assert_eq!(receipt["scopes"][0]["cleanup"], "complete");
     assert!(!old_path.exists());
+    let idempotent_retry = keeper.host.disconnect_integration(&request).unwrap();
+    assert_eq!(idempotent_retry["status"], "removed");
 
     let readd = ProvisioningCommit {
         pairing_id: "second-pairing".into(),
@@ -966,12 +968,20 @@ fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
             readd.clone(),
         )
         .unwrap();
-    let replay = keeper.host.disconnect_integration(&request).unwrap();
-    assert_eq!(replay["status"], "removed");
+    let revision_before_stale_replay =
+        keeper.host.configuration().unwrap().integrations[0].revision;
+    assert!(matches!(
+        keeper.host.disconnect_integration(&request),
+        Err(crate::keeper::DisconnectError::Conflict)
+    ));
     let active_path = keeper.host.configuration().unwrap().additional_scopes[0]
         .state_path
         .clone();
     assert!(active_path.exists());
+    assert_eq!(
+        keeper.host.configuration().unwrap().integrations[0].revision,
+        revision_before_stale_replay
+    );
     assert_eq!(keeper.host.scopes().unwrap().len(), 2);
 
     let candidate = IntegrationCandidate {
