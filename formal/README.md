@@ -68,6 +68,15 @@ violate `OperatorCookieSlotIsOperatorOnly`. The model does not prove HTTP cookie
 attributes, token entropy, CSRF validation, or browser storage; Rust router and
 Playwright tests cover those behaviors.
 
+`LocalProjectionCleanup.tla` checks the client-side tail after a valid Rusty
+removed receipt: persist that receipt in the integration reference, fail to
+delete the local OwnerKeeper record, restart, and retry the local deletion. The
+normal trace retains enough receipt data for retry. `LocalProjectionCleanupDropsReceipt.cfg`
+models clearing that data too early and must violate cleanup liveness. This is
+a cross-repository state contract, not a proof of Tincanban storage behavior;
+the corresponding implementation is `tincanban/src/sync/deviceSyncKeeper.ts`
+(`persistRemovalReceipt`, `finishAlreadyRemoved`).
+
 | Requirement | Check |
 | --- | --- |
 | Editor invitation and signed Editor grant required | `EditorRoleProofs`; `VisitorActivation.cfg` mutant |
@@ -82,6 +91,7 @@ Playwright tests cover those behaviors.
 | A completed removal receipt remains historical after fresh re-add; stale replay cannot claim current removal | `RemovedResponseMatchesCurrentScope`; `DisconnectReplayStaleReceipt.cfg` mutant; `DisconnectReplay.cfg` conflict-after-readd witness |
 | Legacy offline removal persists local intent, blocks sync/offers, and waits for exact signed remote completion | `LegacyOfflineRemoval.cfg` retry witness; `LegacyOfflineNoDescriptor.cfg` pending witness; `LegacyOfferDuringPending.cfg` mutant |
 | Operator and identity sessions survive independent sign-in and logout | `SessionCookieIsolation.cfg`; `SessionCookieCollision.cfg` models the overwrite defect |
+| Local OwnerKeeper projection cleanup retries after a verified removal receipt and restart | `LocalProjectionCleanup.cfg`; `LocalProjectionCleanupDropsReceipt.cfg` models lost retry evidence |
 | Ambiguous JobSearch routing is blocked | `AmbiguousRouteBlocked`; `AmbiguousRouteMutation.cfg` mutant |
 
 Source mapping:

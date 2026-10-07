@@ -36,6 +36,8 @@ CASES = [
     ("LegacyOfferDuringPending", None, "PendingBlocksNewOwnerOffers", "LegacyOfflineRemoval"),
     ("SessionCookieIsolation", "ApprovalAfterIdentityExchange", None, "SessionCookieIsolation"),
     ("SessionCookieCollision", None, "OperatorCookieSlotIsOperatorOnly", "SessionCookieIsolation"),
+    ("LocalProjectionCleanup", "ProjectionCleanupEventuallyRetryable", None, "LocalProjectionCleanup"),
+    ("LocalProjectionCleanupDropsReceipt", "ProjectionCleanupEventuallyRetryable", "TEMPORAL", "LocalProjectionCleanup"),
 ]
 
 
