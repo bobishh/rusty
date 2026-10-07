@@ -59,6 +59,15 @@ discovery, remote request failure, retry, and receipt. A no-descriptor config
 checks durable pending behavior; a mutant permits new owner offers during that
 pending interval.
 
+`SessionCookieIsolation.tla` abstracts operator and Tincanban identity
+sessions as distinct server-validated tokens in separate cookie slots. The
+normal config checks that identity exchange preserves operator access, each
+logout clears only its own session, and operator approval remains reachable.
+The collision mutant writes the identity token into the operator slot and must
+violate `OperatorCookieSlotIsOperatorOnly`. The model does not prove HTTP cookie
+attributes, token entropy, CSRF validation, or browser storage; Rust router and
+Playwright tests cover those behaviors.
+
 | Requirement | Check |
 | --- | --- |
 | Editor invitation and signed Editor grant required | `EditorRoleProofs`; `VisitorActivation.cfg` mutant |
@@ -72,6 +81,7 @@ pending interval.
 | Future-board consent applies only to genuinely new boards; Editor invite/grant and registry commit enforced | `FuturePolicyBlocksAutoPairing`; `FutureConsent.cfg` mutant; `FutureOfferLifecycle.tla` configs `FutureEditorOffer.cfg` witness, `FutureVisitorOnlyOfferGate.cfg` liveness mutant, `FutureVisitorGrant.cfg` role mutant, `FutureLedgerOmitted.cfg` registry mutant, `FutureSweepsUnselected.cfg` baseline-consent mutant, `FutureConsentDisabled.cfg` consent check |
 | A completed removal receipt remains historical after fresh re-add; stale replay cannot claim current removal | `RemovedResponseMatchesCurrentScope`; `DisconnectReplayStaleReceipt.cfg` mutant; `DisconnectReplay.cfg` conflict-after-readd witness |
 | Legacy offline removal persists local intent, blocks sync/offers, and waits for exact signed remote completion | `LegacyOfflineRemoval.cfg` retry witness; `LegacyOfflineNoDescriptor.cfg` pending witness; `LegacyOfferDuringPending.cfg` mutant |
+| Operator and identity sessions survive independent sign-in and logout | `SessionCookieIsolation.cfg`; `SessionCookieCollision.cfg` models the overwrite defect |
 | Ambiguous JobSearch routing is blocked | `AmbiguousRouteBlocked`; `AmbiguousRouteMutation.cfg` mutant |
 
 Source mapping:

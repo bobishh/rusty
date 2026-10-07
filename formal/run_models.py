@@ -34,6 +34,8 @@ CASES = [
     ("LegacyOfflineRemoval", "RemovalEventuallyAcknowledged", None, "LegacyOfflineRemoval"),
     ("LegacyOfflineNoDescriptor", None, None, "LegacyOfflineRemoval"),
     ("LegacyOfferDuringPending", None, "PendingBlocksNewOwnerOffers", "LegacyOfflineRemoval"),
+    ("SessionCookieIsolation", "ApprovalAfterIdentityExchange", None, "SessionCookieIsolation"),
+    ("SessionCookieCollision", None, "OperatorCookieSlotIsOperatorOnly", "SessionCookieIsolation"),
 ]
 
 

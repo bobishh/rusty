@@ -1881,7 +1881,9 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
         .send()
         .await
         .unwrap();
-    assert_eq!(detached.status(), StatusCode::OK);
+    let detached_status = detached.status();
+    let detached_body = detached.text().await.unwrap();
+    assert_eq!(detached_status, StatusCode::OK, "{detached_body}");
     assert_eq!(keeper.host.scopes().unwrap().len(), 3);
     assert!(
         keeper

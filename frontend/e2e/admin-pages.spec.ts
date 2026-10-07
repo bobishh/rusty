@@ -127,3 +127,56 @@ test("Given a narrow viewport, when keeper navigation loads, then content fits a
   await page.goto("/admin/keepers")
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
 })
+
+test("Given operator and Tincanban sessions, when identity exchange completes, then operator approval remains available and logout is scoped", async ({ page }) => {
+  const observed: Array<{ url: string; cookie: string; method: string }> = []
+  let operatorLoggedOut = false
+  await page.route("**/admin/api/session", async route => {
+    const request = route.request()
+    const cookie = request.headers()["cookie"] ?? ""
+    observed.push({ url: request.url(), cookie, method: request.method() })
+    if (request.method() === "POST") {
+      return route.fulfill({ json: { csrfToken: "operator-csrf", personId: null, displayName: "Operator", operator: true },
+        headers: { "Set-Cookie": "mesh_lighthouse_admin=operator-session; HttpOnly; Path=/admin/api; SameSite=Strict" } })
+    }
+    if (!operatorLoggedOut && cookie.includes("mesh_lighthouse_admin=operator-session")) {
+      return route.fulfill({ json: { csrfToken: "operator-csrf", personId: null, displayName: "Operator", operator: true } })
+    }
+    if (cookie.includes("mesh_lighthouse_identity=owner-session")) {
+      return route.fulfill({ json: { csrfToken: "owner-csrf", personId: "owner-person", displayName: "Owner", operator: false } })
+    }
+    return route.fulfill({ status: 403, json: { message: "Sign in required" } })
+  })
+  await page.route("**/admin/api/login/exchange", route => route.fulfill({ json: { csrfToken: "owner-csrf", personId: "owner-person", displayName: "Owner", operator: false },
+    headers: { "Set-Cookie": "mesh_lighthouse_identity=owner-session; HttpOnly; Path=/admin/api; SameSite=Strict" } }))
+  await page.route("**/admin/api/logout*", async route => {
+    operatorLoggedOut = true
+    return route.fulfill({ status: 204, headers: { "Set-Cookie": "mesh_lighthouse_admin=; HttpOnly; Path=/admin/api; SameSite=Strict; Max-Age=0" } })
+  })
+  await page.route("**/admin/api/overview", route => route.fulfill({ json: { keeper: { displayName: "Rusty", personId: "keeper-person", deviceId: "device-1", boards: [] }, triggers: [], replication: { state: "idle", activePeers: 0 } } }))
+  await page.route("**/admin/api/pairings", route => route.fulfill({ json: { pairings: [{ id: "pending-1", comparisonCode: "123456", controller: { displayName: "Owner" }, controllerFingerprint: "owner", serviceFingerprint: "keeper", scopes: [{ title: "Garden", mode: "replicate" }], futureBoards: false, operatorApproved: null, controllerApproved: true }] } }))
+  await page.route("**/admin/api/settings/cors", route => route.fulfill({ json: { requiredOrigin: "https://match.example", origins: ["https://match.example"] } }))
+  await page.route("**/admin/api/pairings/pending-1/decision", route => {
+    const cookie = route.request().headers()["cookie"] ?? ""
+    return cookie.includes("mesh_lighthouse_admin=operator-session")
+      ? route.fulfill({ json: { status: { status: "pending" } } })
+      : route.fulfill({ status: 403, json: { message: "Operator access required" } })
+  })
+  await page.goto("/admin/approvals")
+  await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible()
+  await page.getByText("Service administration").click()
+  await page.locator("#operator-token").fill("operator-token")
+  await page.getByRole("button", { name: "Sign in as operator" }).click()
+  await expect(page.getByRole("button", { name: "Approve exact boards" })).toBeVisible()
+  await page.evaluate(() => { window.history.replaceState(null, "", "/admin/approvals#login=identity-code") })
+  await page.reload()
+  await expect(page.getByRole("button", { name: "Approve exact boards" })).toBeVisible()
+  await page.getByRole("button", { name: "Approve exact boards" }).click()
+  await expect.poll(() => observed.at(-1)?.cookie ?? "").toContain("mesh_lighthouse_identity=owner-session")
+  await expect.poll(() => observed.at(-1)?.cookie ?? "").toContain("mesh_lighthouse_admin=operator-session")
+  await page.getByRole("button", { name: "Sign out" }).click()
+  await page.reload()
+  await expect(page.getByRole("button", { name: "Approve exact boards" })).toHaveCount(0)
+  await expect.poll(() => observed.at(-1)?.cookie ?? "").toContain("mesh_lighthouse_identity=owner-session")
+  await expect.poll(() => observed.at(-1)?.cookie ?? "").not.toContain("mesh_lighthouse_admin=operator-session")
+})

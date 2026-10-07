@@ -253,7 +253,8 @@ async function saveCorsSettings() {
 async function logout() {
   error.value = ""
   try {
-    await api("/admin/api/logout", { method: "POST", body: JSON.stringify({}) })
+    const context = adminIdentity.value?.operator ? "operator" : "identity"
+    await api(`/admin/api/logout?context=${context}`, { method: "POST", body: JSON.stringify({}) })
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "Could not sign out."
     return
@@ -268,15 +269,11 @@ async function exchangeLoginCode() {
   sessionLoading.value = true
   error.value = ""
   try {
-    const identity = await api<{ csrfToken: string } & AdminIdentity>("/admin/api/login/exchange", {
+    await api<{ csrfToken: string } & AdminIdentity>("/admin/api/login/exchange", {
       method: "POST",
       body: JSON.stringify({ code }),
     })
-    csrf.value = identity.csrfToken
-    adminIdentity.value = identity
-    signedIn.value = true
-    await refresh()
-    await loadCorsSettings()
+    await restoreSession()
   } catch (cause) {
     clearIdentity()
     error.value = cause instanceof Error ? cause.message : "Could not complete Tincanban sign-in."

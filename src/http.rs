@@ -10,6 +10,7 @@ use std::{
 
 use axum::{
     Json,
+    extract::Query,
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -716,7 +717,7 @@ pub(crate) async fn admin_login_exchange(
         .is_some_and(|origin| origin.starts_with("https://"));
     let secure_suffix = if secure { "; Secure" } else { "" };
     let mut response = Json(session).into_response();
-    response.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_admin={cookie}; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=28800{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
+    response.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_identity={cookie}; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=28800{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
     response.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_login_intent=; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=0{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
     response
         .headers_mut()
@@ -727,18 +728,20 @@ pub(crate) async fn admin_login_exchange(
 pub(crate) async fn admin_logout(
     state: AppState,
     headers: axum::http::HeaderMap,
+    Query(query): Query<SessionContextQuery>,
 ) -> Result<Response, PairingResponseError> {
     enforce_same_origin(&state, &headers)?;
     let pairings = state
         .pairings
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
-    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let context = query.context.as_deref();
+    let (cookie, cookie_name) = logout_session_cookie(&pairings, &headers, context)?;
     let csrf = headers
         .get("x-csrf-token")
         .and_then(|value| value.to_str().ok())
         .ok_or(PairingResponseError(PairingError::Forbidden))?;
     pairings
-        .logout(cookie, csrf)
+        .logout(&cookie, csrf)
         .map_err(PairingResponseError)?;
     let secure = state
         .discovery
@@ -747,7 +750,13 @@ pub(crate) async fn admin_logout(
         .is_some_and(|origin| origin.starts_with("https://"));
     let secure_suffix = if secure { "; Secure" } else { "" };
     let mut response = StatusCode::NO_CONTENT.into_response();
-    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_admin=; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=0{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "{cookie_name}=; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=0{secure_suffix}"
+        ))
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?,
+    );
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -790,8 +799,8 @@ pub(crate) async fn admin_list(
     let pairings = state
         .pairings
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
-    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
-    let records = pairings.admin_list(cookie).map_err(PairingResponseError)?;
+    let (cookie, _) = session_cookie(&pairings, &headers, None)?;
+    let records = pairings.admin_list(&cookie).map_err(PairingResponseError)?;
     let rows = records.iter().map(|record| json!({
         "id":record.id,"expiresAt":record.expires_at,"comparisonCode":record.comparison_code,
         "controller":record.controller,"controllerDeviceId":record.controller_device_id,
@@ -812,19 +821,94 @@ pub(crate) async fn admin_list(
 pub(crate) async fn admin_session(
     state: AppState,
     headers: axum::http::HeaderMap,
+    Query(query): Query<SessionContextQuery>,
 ) -> Result<Response, PairingResponseError> {
     let pairings = state
         .pairings
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
-    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
-    let session = pairings
-        .admin_session(cookie)
-        .map_err(PairingResponseError)?;
+    let (_, session) = session_cookie(&pairings, &headers, query.context.as_deref())?;
     let mut response = Json(session).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct SessionContextQuery {
+    pub context: Option<String>,
+}
+
+fn session_cookie(
+    pairings: &PairingService,
+    headers: &axum::http::HeaderMap,
+    requested: Option<&str>,
+) -> Result<(String, SessionResponse), PairingResponseError> {
+    let operator = admin_cookie(headers).map(str::to_owned);
+    let identity = identity_cookie(headers).map(str::to_owned);
+    let candidates = match requested {
+        Some("operator") => operator
+            .into_iter()
+            .map(|cookie| (cookie, "operator"))
+            .collect::<Vec<_>>(),
+        Some("identity") => identity
+            .into_iter()
+            .map(|cookie| (cookie, "identity"))
+            .chain(operator.into_iter().map(|cookie| (cookie, "legacy")))
+            .collect(),
+        Some(_) => {
+            return Err(PairingResponseError(PairingError::Invalid(
+                "Unknown session context",
+            )));
+        }
+        None => operator
+            .into_iter()
+            .map(|cookie| (cookie, "operator"))
+            .chain(identity.into_iter().map(|cookie| (cookie, "identity")))
+            .chain(
+                admin_cookie(headers)
+                    .map(str::to_owned)
+                    .into_iter()
+                    .map(|cookie| (cookie, "legacy")),
+            )
+            .collect(),
+    };
+    for (cookie, source) in candidates {
+        let Ok(session) = pairings.admin_session(&cookie) else {
+            continue;
+        };
+        let allowed = match source {
+            "operator" => session.operator,
+            "identity" | "legacy" => !session.operator && session.person_id.is_some(),
+            _ => false,
+        };
+        if allowed {
+            return Ok((cookie, session));
+        }
+    }
+    Err(PairingResponseError(PairingError::Forbidden))
+}
+
+fn logout_session_cookie(
+    pairings: &PairingService,
+    headers: &axum::http::HeaderMap,
+    requested: Option<&str>,
+) -> Result<(String, &'static str), PairingResponseError> {
+    let (cookie, session) = session_cookie(pairings, headers, requested)?;
+    let name = if identity_cookie(headers) == Some(cookie.as_str()) {
+        "mesh_lighthouse_identity"
+    } else if admin_cookie(headers) == Some(cookie.as_str()) {
+        "mesh_lighthouse_admin"
+    } else {
+        return Err(PairingResponseError(PairingError::Forbidden));
+    };
+    if requested == Some("operator") && name != "mesh_lighthouse_admin" {
+        return Err(PairingResponseError(PairingError::Forbidden));
+    }
+    if requested == Some("identity") && session.operator {
+        return Err(PairingResponseError(PairingError::Forbidden));
+    }
+    Ok((cookie, name))
 }
 
 #[derive(Deserialize)]
@@ -933,17 +1017,18 @@ pub(crate) async fn admin_unsubscribe(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, PairingResponseError> {
     enforce_same_origin(&state, &headers)?;
-    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
-    let csrf = headers
-        .get("x-csrf-token")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(PairingResponseError(PairingError::Forbidden))?;
     let pairings = state
         .pairings
         .as_ref()
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let (cookie, _) = session_cookie(pairings, &headers, Some("identity"))
+        .or_else(|_| session_cookie(pairings, &headers, Some("operator")))?;
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(PairingResponseError(PairingError::Forbidden))?;
     let owner = pairings
-        .mutation_owner(cookie, csrf)
+        .mutation_owner(&cookie, csrf)
         .map_err(PairingResponseError)?;
     let keeper = state
         .keeper
@@ -964,20 +1049,20 @@ pub(crate) async fn admin_overview(
     state: AppState,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, PairingResponseError> {
-    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
     let pairings = state
         .pairings
         .as_ref()
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
-    pairings.admin_list(cookie).map_err(PairingResponseError)?;
+    let (cookie, _) = session_cookie(pairings, &headers, None)?;
+    pairings.admin_list(&cookie).map_err(PairingResponseError)?;
     let keeper = state
         .keeper
         .as_ref()
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
     let owner_id = pairings
-        .session_person_id(cookie)
+        .session_person_id(&cookie)
         .map_err(PairingResponseError)?;
-    let operator = pairings.require_operator(cookie, None).is_ok();
+    let operator = pairings.require_operator(&cookie, None).is_ok();
     if !operator && owner_id.is_none() {
         return Err(PairingResponseError(PairingError::Forbidden));
     }
@@ -1137,12 +1222,20 @@ pub(crate) async fn admin_decision(
 }
 
 fn admin_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
+    cookie(headers, "mesh_lighthouse_admin")
+}
+
+fn identity_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
+    cookie(headers, "mesh_lighthouse_identity")
+}
+
+fn cookie<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get(header::COOKIE)?
         .to_str()
         .ok()?
         .split(';')
-        .find_map(|pair| pair.trim().strip_prefix("mesh_lighthouse_admin="))
+        .find_map(|pair| pair.trim().strip_prefix(&format!("{name}=")))
 }
 
 pub(crate) struct PairingResponseError(pub(crate) PairingError);
@@ -2444,6 +2537,220 @@ mod tests {
             .status(pairing_id, serde_json::from_value(status_request).unwrap())
             .unwrap();
         assert_eq!(restored_status.payload["status"], "approved");
+
+        // A Tincanban identity exchange must set its own cookie and preserve the
+        // already-valid operator session in the same browser cookie jar.
+        let login_challenge = client
+            .post(format!("{test_origin}/admin/api/login/challenge"))
+            .header(header::ORIGIN, origin)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login_challenge.status(), StatusCode::OK);
+        let intent_cookie = login_challenge.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let login_challenge: Value = login_challenge.json().await.unwrap();
+        let challenge_id = login_challenge["challengeId"].as_str().unwrap();
+        let challenge = client
+            .get(format!("{test_origin}/v1/login/challenges/{challenge_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(challenge.status(), StatusCode::OK);
+        let challenge: Value = challenge.json().await.unwrap();
+        let mut login_proof = common_payload(
+            "lighthouse-login-proof",
+            &controller_identity,
+            &controller_device,
+            &service_identity.person_id,
+            origin,
+            "login-proof-0123456789abcdef",
+        );
+        login_proof["challengeId"] = json!(challenge_id);
+        login_proof["challengeNonce"] = challenge["payload"]["nonce"].clone();
+        login_proof["expiresAt"] = challenge["payload"]["expiresAt"].clone();
+        let login_proof = request_bundle(
+            &controller_seed,
+            &controller_identity,
+            &controller_device,
+            &controller_certificates,
+            login_proof,
+        );
+        let proof = client
+            .post(format!("{test_origin}/v1/login/proof"))
+            .json(&login_proof)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(proof.status(), StatusCode::OK);
+        let proof: Value = proof.json().await.unwrap();
+        let exchange = client
+            .post(format!("{test_origin}/admin/api/login/exchange"))
+            .header(header::ORIGIN, origin)
+            .header(header::COOKIE, &intent_cookie)
+            .json(&json!({ "code": proof["code"] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exchange.status(), StatusCode::OK);
+        let set_cookies = exchange
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let identity_cookie = set_cookies
+            .iter()
+            .find(|value| value.starts_with("mesh_lighthouse_identity="))
+            .expect("identity login must use separate cookie")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert!(
+            set_cookies
+                .iter()
+                .all(|value| !value.starts_with("mesh_lighthouse_admin="))
+        );
+        let combined_cookies = format!("{cookie}; {identity_cookie}");
+        let selected_session = client
+            .get(format!("{test_origin}/admin/api/session"))
+            .header(header::COOKIE, &combined_cookies)
+            .send()
+            .await
+            .unwrap();
+        let selected_session: Value = selected_session.json().await.unwrap();
+        assert_eq!(selected_session["operator"], true);
+
+        let identity_session = client
+            .get(format!("{test_origin}/admin/api/session?context=identity"))
+            .header(header::COOKIE, &combined_cookies)
+            .send()
+            .await
+            .unwrap();
+        let identity_session: Value = identity_session.json().await.unwrap();
+        assert_eq!(identity_session["operator"], false);
+        assert_eq!(identity_session["personId"], controller_identity.person_id);
+
+        let identity_in_operator_slot = format!(
+            "mesh_lighthouse_admin={}",
+            identity_cookie.split_once('=').unwrap().1
+        );
+        let forbidden_operator_context = client
+            .get(format!("{test_origin}/admin/api/session?context=operator"))
+            .header(header::COOKIE, identity_in_operator_slot)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forbidden_operator_context.status(), StatusCode::FORBIDDEN);
+
+        let owner_cannot_approve = client
+            .post(&decision_url)
+            .header(header::COOKIE, &identity_cookie)
+            .header(
+                "x-csrf-token",
+                identity_session["csrfToken"].as_str().unwrap(),
+            )
+            .json(&json!({"decision":"approve"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(owner_cannot_approve.status(), StatusCode::FORBIDDEN);
+        let operator_can_approve = client
+            .post(&decision_url)
+            .header(header::COOKIE, &combined_cookies)
+            .header("x-csrf-token", login_body["csrfToken"].as_str().unwrap())
+            .json(&json!({"decision":"approve"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(operator_can_approve.status(), StatusCode::OK);
+
+        let operator_logout = client
+            .post(format!("{test_origin}/admin/api/logout?context=operator"))
+            .header(header::ORIGIN, origin)
+            .header(header::COOKIE, &combined_cookies)
+            .header("x-csrf-token", login_body["csrfToken"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(operator_logout.status(), StatusCode::NO_CONTENT);
+        assert!(
+            operator_logout.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .starts_with("mesh_lighthouse_admin=")
+        );
+        let identity_survives = client
+            .get(format!("{test_origin}/admin/api/session"))
+            .header(header::COOKIE, &identity_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(identity_survives.status(), StatusCode::OK);
+        assert_eq!(
+            identity_survives.json::<Value>().await.unwrap()["operator"],
+            false
+        );
+
+        let second_operator_login = client
+            .post(format!("{test_origin}/admin/api/session"))
+            .header(header::ORIGIN, origin)
+            .json(&json!({"secret":"test-operator-token-that-is-long-enough"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second_operator_login.status(), StatusCode::OK);
+        let second_operator_cookie = second_operator_login.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let second_operator_session: Value = second_operator_login.json().await.unwrap();
+
+        let identity_logout = client
+            .post(format!("{test_origin}/admin/api/logout?context=identity"))
+            .header(header::ORIGIN, origin)
+            .header(
+                header::COOKIE,
+                format!("{second_operator_cookie}; {identity_cookie}"),
+            )
+            .header(
+                "x-csrf-token",
+                identity_session["csrfToken"].as_str().unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(identity_logout.status(), StatusCode::NO_CONTENT);
+        assert!(
+            identity_logout.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .starts_with("mesh_lighthouse_identity=")
+        );
+        let operator_survives_identity_logout = client
+            .get(format!("{test_origin}/admin/api/session"))
+            .header(header::COOKIE, second_operator_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(operator_survives_identity_logout.status(), StatusCode::OK);
+        assert_eq!(
+            operator_survives_identity_logout
+                .json::<Value>()
+                .await
+                .unwrap()["csrfToken"],
+            second_operator_session["csrfToken"]
+        );
         server.abort();
         let _ = fs::remove_dir_all(root);
     }

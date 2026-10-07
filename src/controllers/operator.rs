@@ -5,6 +5,7 @@ use crate::{
 use axum::{
     Json,
     extract::Path,
+    extract::Query,
     http::HeaderMap,
     response::IntoResponse,
     routing::{get, post},
@@ -71,8 +72,9 @@ async fn login_exchange(
 async fn logout(
     SharedStore(state): SharedStore<AppState>,
     headers: HeaderMap,
+    Query(query): Query<http::SessionContextQuery>,
 ) -> impl IntoResponse {
-    http::admin_logout(state, headers).await
+    http::admin_logout(state, headers, Query(query)).await
 }
 async fn pairings(
     SharedStore(state): SharedStore<AppState>,
@@ -83,8 +85,9 @@ async fn pairings(
 async fn session(
     SharedStore(state): SharedStore<AppState>,
     headers: HeaderMap,
+    Query(query): Query<http::SessionContextQuery>,
 ) -> impl IntoResponse {
-    http::admin_session(state, headers).await
+    http::admin_session(state, headers, Query(query)).await
 }
 async fn decision(
     SharedStore(state): SharedStore<AppState>,
