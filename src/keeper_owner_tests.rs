@@ -324,6 +324,97 @@ fn future_board_offer_accepts_owner_signed_editor_grant_only_when_enabled() {
 }
 
 #[test]
+fn future_owner_offer_updates_scope_ledger_atomically_and_replays_idempotently() {
+    let (keeper, _) = two_owner_keeper(true);
+    let peer = keeper.peer(&keeper.owner, "primary-board");
+    let offer = complete_owner_offer(&keeper.owner, &keeper.keeper, "future-ledger-board");
+    let before = keeper.host.configuration().unwrap();
+    let before_record = before.integrations.iter().find(|record| {
+        record.controller_person_id == keeper.owner.person_id
+            && record.service_person_id == keeper.keeper.person_id
+    });
+    let before_revision = before_record.map_or(0, |record| record.revision);
+
+    let mut host = keeper.host.clone();
+    let mut scope = host.open_scope(&peer).unwrap();
+    let encoded = offer.to_string();
+    scope.merge_owner_offer(encoded.as_bytes()).unwrap();
+
+    let activated = keeper.host.configuration().unwrap();
+    let record = activated
+        .integrations
+        .iter()
+        .find(|record| {
+            record.controller_person_id == keeper.owner.person_id
+                && record.service_person_id == keeper.keeper.person_id
+        })
+        .unwrap();
+    let scope_record = record
+        .scopes
+        .iter()
+        .find(|scope| scope.workspace_id == "future-ledger-board")
+        .expect("future scope appears in signed integration ledger");
+    assert_eq!(scope_record.state, "active");
+    assert_eq!(scope_record.grant_epoch, 2);
+    assert!(
+        scope_record
+            .activation_operation_id
+            .starts_with("owner-offer:")
+    );
+    assert_eq!(record.revision, before_revision + 1);
+
+    scope.merge_owner_offer(encoded.as_bytes()).unwrap();
+    let replayed = keeper.host.configuration().unwrap();
+    let record = replayed
+        .integrations
+        .iter()
+        .find(|record| {
+            record.controller_person_id == keeper.owner.person_id
+                && record.service_person_id == keeper.keeper.person_id
+        })
+        .unwrap();
+    assert_eq!(record.revision, before_revision + 1);
+    assert_eq!(
+        record
+            .scopes
+            .iter()
+            .filter(|scope| scope.workspace_id == "future-ledger-board" && scope.state == "active")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn legacy_future_consent_migration_requires_current_owner_signed_editor_grant() {
+    let (keeper, _) = two_owner_keeper(true);
+    let config = keeper.host.configuration().unwrap();
+    let registry = keeper.host.registry.lock().unwrap();
+    let persisted_scope = registry.scopes.get("primary-board").unwrap();
+
+    assert_eq!(
+        crate::keeper::verified_editor_grant_epoch(
+            &config,
+            &persisted_scope,
+            &keeper.keeper.person_id,
+        )
+        .unwrap(),
+        2
+    );
+
+    let mut forged = config;
+    forged.local_handshake.peer["grant"]["payload"]["role"] = json!("visitor");
+    assert!(
+        crate::keeper::verified_editor_grant_epoch(
+            &forged,
+            &persisted_scope,
+            &keeper.keeper.person_id,
+        )
+        .is_err(),
+        "runtime scope and old future consent cannot replace a signed Editor grant"
+    );
+}
+
+#[test]
 fn mixed_owner_activation_is_rejected_without_config_or_scope_changes() {
     let keeper = TestKeeper::new();
     let owner_b = Identity::new(41, 42, 43);

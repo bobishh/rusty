@@ -10,8 +10,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use match_lighthouse::{MatchLighthouseHost, MatchScopeStore};
 use meta_mesh_core::{
     DeviceCertificate, MeshHandshake, MeshPeerAdmission, PublicIdentity,
-    VerifyWorkspaceMemberOptions, WorkspaceItem, WorkspaceJoinInvitation, WorkspaceRole,
-    WorkspaceWriteAuthorizationSnapshot, public_key_id, verify_workspace_grant,
+    VerifyWorkspaceMemberOptions, WorkspaceGrant, WorkspaceItem, WorkspaceJoinInvitation,
+    WorkspaceRole, WorkspaceWriteAuthorizationSnapshot, public_key_id, verify_workspace_grant,
     verify_workspace_member_bundle,
 };
 use meta_mesh_native::{
@@ -68,6 +68,50 @@ fn scope_grant_epoch(config: &Config) -> Result<u64, String> {
     Ok(epoch)
 }
 
+fn scope_grant_id(config: &Config) -> Result<&str, String> {
+    config
+        .local_handshake
+        .peer
+        .pointer("/grant/payload/grantId")
+        .and_then(Value::as_str)
+        .filter(|grant_id| !grant_id.is_empty())
+        .ok_or_else(|| "Missing signed integration grant id".into())
+}
+
+fn verified_editor_grant_epoch(
+    config: &Config,
+    host: &MatchLighthouseHost,
+    service_person_id: &str,
+) -> Result<u64, String> {
+    let authority = host.store.authority()?;
+    let owner = authority.expected_current_owner;
+    let peer = &config.local_handshake.peer;
+    if peer.get("ownerPublicKey").and_then(Value::as_str) != Some(owner.public_key.as_str()) {
+        return Err("Persisted integration owner differs from current workspace owner".into());
+    }
+    let grant: WorkspaceGrant = serde_json::from_value(
+        peer.get("grant")
+            .cloned()
+            .ok_or("Missing persisted signed integration grant")?,
+    )
+    .map_err(|_| "Invalid persisted signed integration grant")?;
+    if verify_workspace_grant(
+        &grant,
+        &config.workspace_id,
+        service_person_id,
+        &PublicIdentity {
+            person_id: owner.person_id,
+            public_key: owner.public_key,
+            display_name: String::new(),
+        },
+        &owner.certificates,
+    )? != WorkspaceRole::Editor
+    {
+        return Err("Persisted keeper scope lacks a signed editor grant".into());
+    }
+    Ok(grant.payload.effective_access_epoch())
+}
+
 fn scope_epoch_for_legacy_removal(config: &Config) -> u64 {
     config
         .local_handshake
@@ -102,33 +146,153 @@ fn owner_workspace_ids(registry: &Registry, owner_person_id: &str) -> Result<Vec
     Ok(workspace_ids)
 }
 
-fn owner_follows_future_boards(registry: &Registry, owner_person_id: &str) -> Result<bool, String> {
-    let has_current_board = registry.scopes.iter().try_fold(
-        false,
-        |found, (workspace_id, scope)| -> Result<bool, String> {
-            if found || current_owner(scope)? != owner_person_id {
-                return Ok(found);
-            }
-            let original_owner = std::iter::once(&registry.config)
-                .chain(registry.config.additional_scopes.iter())
-                .find(|config| config.workspace_id == *workspace_id)
-                .and_then(|config| config.controller_person_id.as_deref());
-            Ok(original_owner == Some(owner_person_id))
-        },
-    )?;
-    if let Some(integration) = registry
+fn owner_follows_future_boards(
+    registry: &Registry,
+    owner_person_id: &str,
+    route_workspace_id: &str,
+) -> Result<bool, String> {
+    let configured_owner = std::iter::once(&registry.config)
+        .chain(registry.config.additional_scopes.iter())
+        .find(|config| config.workspace_id == route_workspace_id)
+        .and_then(|config| config.controller_person_id.as_deref());
+    let service_id = service_person_id(&registry.config)?;
+    let has_current_board = if let Some(scope) = registry.scopes.get(route_workspace_id) {
+        let config = configured_scope(&registry.config, route_workspace_id);
+        current_owner(scope)? == owner_person_id
+            && configured_owner == Some(owner_person_id)
+            && config.is_some_and(|config| {
+                verified_editor_grant_epoch(config, scope, &service_id).is_ok()
+            })
+    } else {
+        false
+    };
+    let matching_integrations = registry
         .config
         .integrations
         .iter()
-        .find(|integration| integration.controller_person_id == owner_person_id)
-    {
-        return Ok(has_current_board && integration.future_boards);
+        .filter(|integration| {
+            integration.controller_person_id == owner_person_id
+                && integration.service_person_id == service_id
+                && integration.future_boards
+                && integration.pending_disconnect.is_none()
+                && integration.scopes.iter().any(|scope| {
+                    scope.workspace_id == route_workspace_id && scope.state == "active"
+                })
+        })
+        .count();
+    if registry.config.integrations.iter().any(|integration| {
+        integration.controller_person_id == owner_person_id
+            && integration.service_person_id == service_id
+    }) {
+        return Ok(has_current_board && matching_integrations == 1);
     }
     Ok(future_policy_matches_owner(
         owner_person_id,
         has_current_board,
         &registry.config.provisioning_commits,
     ))
+}
+
+fn future_integration_index(
+    config: &mut Config,
+    registry: &Registry,
+    owner_person_id: &str,
+    route_workspace_id: &str,
+) -> Result<usize, String> {
+    let service_id = service_person_id(config)?;
+    let matching = config
+        .integrations
+        .iter()
+        .enumerate()
+        .filter(|(_, integration)| {
+            integration.controller_person_id == owner_person_id
+                && integration.service_person_id == service_id
+                && integration.future_boards
+                && integration.pending_disconnect.is_none()
+                && integration.scopes.iter().any(|scope| {
+                    scope.workspace_id == route_workspace_id && scope.state == "active"
+                })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [index] => return Ok(*index),
+        [] => {}
+        _ => return Err("Keeper future-board policy has ambiguous active integrations".into()),
+    }
+    if config.integrations.iter().any(|integration| {
+        integration.controller_person_id == owner_person_id
+            && integration.service_person_id == service_id
+    }) {
+        return Err("Keeper future-board integration is inactive or pending removal".into());
+    }
+    let legacy_commit = config
+        .provisioning_commits
+        .iter()
+        .rev()
+        .find(|commit| {
+            commit.future_boards
+                && commit.controller_person_id.as_deref() == Some(owner_person_id)
+                && commit
+                    .workspace_ids
+                    .iter()
+                    .any(|id| id == route_workspace_id)
+        })
+        .ok_or("Keeper future-board consent is not recorded")?;
+    let integration_id = if legacy_commit.integration_id.is_empty() {
+        crate::integration_id(owner_person_id, &service_id)
+    } else {
+        legacy_commit.integration_id.clone()
+    };
+    let mut scopes = Vec::new();
+    for (workspace_id, host) in &registry.scopes {
+        if current_owner(host)? != owner_person_id {
+            continue;
+        }
+        let Some(scope) = configured_scope(config, workspace_id) else {
+            continue;
+        };
+        if scope.controller_person_id.as_deref() != Some(owner_person_id) {
+            continue;
+        }
+        let grant_id = scope_grant_id(scope)?;
+        let grant_epoch = verified_editor_grant_epoch(scope, host, &service_id)?;
+        let activation_operation_id = config
+            .provisioning_commits
+            .iter()
+            .rev()
+            .find(|commit| {
+                commit.controller_person_id.as_deref() == Some(owner_person_id)
+                    && commit.workspace_ids.iter().any(|id| id == workspace_id)
+            })
+            .map(|commit| commit.operation_id.clone())
+            .unwrap_or_else(|| format!("legacy-owner-scope:{grant_id}"));
+        scopes.push(IntegrationScope {
+            workspace_id: workspace_id.clone(),
+            grant_epoch,
+            state: "active".into(),
+            activation_operation_id,
+        });
+    }
+    if !scopes
+        .iter()
+        .any(|scope| scope.workspace_id == route_workspace_id)
+    {
+        return Err("Keeper future-board route is not in the owner's active scopes".into());
+    }
+    scopes.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+    config.integrations.push(IntegrationRecord {
+        integration_id,
+        controller_person_id: owner_person_id.to_owned(),
+        service_person_id: service_id,
+        revision: 0,
+        future_boards: true,
+        scopes,
+        tombstones: Vec::new(),
+        pending_disconnect: None,
+        disconnect_history: Vec::new(),
+    });
+    Ok(config.integrations.len() - 1)
 }
 
 fn future_policy_matches_owner(
@@ -1794,7 +1958,7 @@ impl NativeScopeHost for KeeperScope {
         let authorized = if let Some(owner) = known_owner {
             owner == controller
         } else {
-            owner_follows_future_boards(&registry, controller)?
+            owner_follows_future_boards(&registry, controller, &self.peer.workspace_id)?
         };
         if !authorized {
             return Err("Keeper owner offer is not authorized by this owner's policy".into());
@@ -1959,6 +2123,12 @@ impl NativeScopeHost for KeeperScope {
         {
             return Err("Keeper offer targets another owner's scope".into());
         }
+        let is_new_scope = !registry.scopes.contains_key(workspace_id);
+        if is_new_scope
+            && !owner_follows_future_boards(&registry, controller, &self.peer.workspace_id)?
+        {
+            return Err("Keeper owner offer is not authorized by this owner's policy".into());
+        }
         let envelope = &value["envelope"];
         let workspace = &value["workspace"];
         if envelope["workspaceId"] != workspace_id
@@ -2080,6 +2250,8 @@ impl NativeScopeHost for KeeperScope {
         )
         .map_err(|error| error.to_string())?;
         scope.controller_person_id = Some(controller.to_owned());
+        let offered_scope_epoch = scope_grant_epoch(&scope)?;
+        let offered_scope_operation = format!("owner-offer:{}", scope_grant_id(&scope)?);
         if let Some(existing) = registry.scopes.get(workspace_id) {
             let mut store = existing.store.clone();
             let state = &scope.initial_state;
@@ -2105,6 +2277,36 @@ impl NativeScopeHost for KeeperScope {
         }
         let host = scope_host(&scope)?;
         let mut next = registry.config.clone();
+        let integration_index =
+            future_integration_index(&mut next, &registry, controller, &self.peer.workspace_id)?;
+        let integration = &mut next.integrations[integration_index];
+        if integration
+            .tombstones
+            .iter()
+            .filter(|tombstone| tombstone.workspace_id == workspace_id)
+            .map(|tombstone| tombstone.grant_epoch)
+            .max()
+            .is_some_and(|epoch| offered_scope_epoch <= epoch)
+        {
+            return Err("Re-added future scope requires a newer signed owner grant".into());
+        }
+        if integration
+            .scopes
+            .iter()
+            .any(|existing| existing.workspace_id == workspace_id && existing.state == "active")
+        {
+            return Err("Future scope is already active in its integration".into());
+        }
+        integration.scopes.push(IntegrationScope {
+            workspace_id: workspace_id.to_owned(),
+            grant_epoch: offered_scope_epoch,
+            state: "active".into(),
+            activation_operation_id: offered_scope_operation,
+        });
+        integration
+            .scopes
+            .sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+        integration.revision = integration.revision.saturating_add(1);
         next.additional_scopes.push(scope);
         FileScopeStore::new(&registry.config_path).write_validated(
             &serde_json::to_vec(&next).map_err(|error| error.to_string())?,

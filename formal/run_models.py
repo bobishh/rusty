@@ -26,6 +26,7 @@ CASES = [
     ("FutureEditorOffer", "AuthorizedFutureOfferCompletes", None, "FutureOfferLifecycle"),
     ("FutureVisitorOnlyOfferGate", "AuthorizedFutureOfferCompletes", "TEMPORAL", "FutureOfferLifecycle"),
     ("FutureVisitorGrant", None, "FutureScopeRequiresEditorRoles", "FutureOfferLifecycle"),
+    ("FutureLedgerOmitted", None, "RuntimeAttachedHasLedger", "FutureOfferLifecycle"),
     ("FutureConsentDisabled", None, None, "FutureOfferLifecycle"),
 ]
 

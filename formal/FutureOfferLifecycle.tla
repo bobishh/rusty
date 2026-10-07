@@ -2,18 +2,21 @@
 EXTENDS Naturals, TLC
 
 CONSTANTS InitialFutureBoards, RequireVisitorOnlyGate,
-          IgnoreEditorGrantCheck, InviteRole, GrantRole, OwnerProofValid
+          IgnoreEditorGrantCheck, OmitFutureLedgerCommit,
+          InviteRole, GrantRole, OwnerProofValid
 
 Roles == {"editor", "visitor"}
 ScopeStates == {"absent", "staged", "active"}
 
 VARIABLES baseActive, baseRole, futureBoards, newScope,
           stagedInviteRole, stagedGrantRole, activeInviteRole,
-          activeGrantRole, stagedEpoch, grantEpoch
+          activeGrantRole, stagedEpoch, grantEpoch,
+          runtimeAttached, ledgerActive
 
 vars == <<baseActive, baseRole, futureBoards, newScope,
          stagedInviteRole, stagedGrantRole, activeInviteRole,
-         activeGrantRole, stagedEpoch, grantEpoch>>
+         activeGrantRole, stagedEpoch, grantEpoch,
+         runtimeAttached, ledgerActive>>
 
 Init ==
   /\ baseActive = TRUE
@@ -26,6 +29,8 @@ Init ==
   /\ activeGrantRole = "visitor"
   /\ stagedEpoch = 1
   /\ grantEpoch = 0
+  /\ runtimeAttached = FALSE
+  /\ ledgerActive = FALSE
 
 AcceptOwnerOffer ==
   /\ baseActive
@@ -41,7 +46,7 @@ AcceptOwnerOffer ==
   /\ stagedGrantRole' = GrantRole
   /\ stagedEpoch' = 1
   /\ UNCHANGED <<baseActive, baseRole, futureBoards, activeInviteRole,
-                  activeGrantRole, grantEpoch>>
+                  activeGrantRole, grantEpoch, runtimeAttached, ledgerActive>>
 
 CommitScope ==
   /\ newScope = "staged"
@@ -56,6 +61,8 @@ CommitScope ==
   /\ activeInviteRole' = stagedInviteRole
   /\ activeGrantRole' = stagedGrantRole
   /\ grantEpoch' = stagedEpoch
+  /\ runtimeAttached' = TRUE
+  /\ ledgerActive' = ~OmitFutureLedgerCommit
   /\ UNCHANGED <<baseActive, baseRole, futureBoards, stagedInviteRole,
                   stagedGrantRole, stagedEpoch>>
 
@@ -67,6 +74,7 @@ OwnerProofRequired == newScope \in {"staged", "active"} => OwnerProofValid
 FutureScopeRequiresEditorRoles == newScope = "active" =>
   activeInviteRole = "editor" /\ activeGrantRole = "editor"
 FutureScopeUsesSignedGrantEpoch == newScope = "active" => grantEpoch > 0
+RuntimeAttachedHasLedger == runtimeAttached => ledgerActive
 TypeOK ==
   /\ baseActive \in BOOLEAN
   /\ baseRole \in Roles
@@ -76,6 +84,8 @@ TypeOK ==
   /\ stagedGrantRole \in Roles
   /\ activeInviteRole \in Roles
   /\ activeGrantRole \in Roles
+  /\ runtimeAttached \in BOOLEAN
+  /\ ledgerActive \in BOOLEAN
   /\ stagedEpoch \in 1..2
   /\ grantEpoch \in 0..2
 
