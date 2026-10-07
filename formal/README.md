@@ -46,6 +46,19 @@ return conflict instead of presenting the historical receipt as current
 removal confirmation. Its mutant returns the archived receipt while the scope
 is active and violates `RemovedResponseMatchesCurrentScope`.
 
+`LegacyOfflineRemoval.tla` covers older keeper records that identify the keeper
+and owner-selected boards but have no Rusty integration descriptor. Owner
+authorization and current ownership of selected boards permit persisting a
+pending removal intent before local sync revocation. Without a descriptor, no
+remote request or completion is possible; a later supplied address is usable
+only after matching the known keeper device and validating signed status. Local
+and remote failures retain pending state for retry. Removal clears only after
+cleanup and exact signed receipt, while board data and unrelated scopes remain.
+The normal trace includes local revoke failure, retry, later descriptor
+discovery, remote request failure, retry, and receipt. A no-descriptor config
+checks durable pending behavior; a mutant permits new owner offers during that
+pending interval.
+
 | Requirement | Check |
 | --- | --- |
 | Editor invitation and signed Editor grant required | `EditorRoleProofs`; `VisitorActivation.cfg` mutant |
@@ -58,6 +71,7 @@ is active and violates `RemovedResponseMatchesCurrentScope`.
 | Concurrent owner revision cannot commit stale stage | `CommitUsesCurrentRevision`; `ConcurrentCAS.cfg` and `StaleCAS.cfg` |
 | Future-board consent applies only to genuinely new boards; Editor invite/grant and registry commit enforced | `FuturePolicyBlocksAutoPairing`; `FutureConsent.cfg` mutant; `FutureOfferLifecycle.tla` configs `FutureEditorOffer.cfg` witness, `FutureVisitorOnlyOfferGate.cfg` liveness mutant, `FutureVisitorGrant.cfg` role mutant, `FutureLedgerOmitted.cfg` registry mutant, `FutureSweepsUnselected.cfg` baseline-consent mutant, `FutureConsentDisabled.cfg` consent check |
 | A completed removal receipt remains historical after fresh re-add; stale replay cannot claim current removal | `RemovedResponseMatchesCurrentScope`; `DisconnectReplayStaleReceipt.cfg` mutant; `DisconnectReplay.cfg` conflict-after-readd witness |
+| Legacy offline removal persists local intent, blocks sync/offers, and waits for exact signed remote completion | `LegacyOfflineRemoval.cfg` retry witness; `LegacyOfflineNoDescriptor.cfg` pending witness; `LegacyOfferDuringPending.cfg` mutant |
 | Ambiguous JobSearch routing is blocked | `AmbiguousRouteBlocked`; `AmbiguousRouteMutation.cfg` mutant |
 
 Source mapping:

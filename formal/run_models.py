@@ -31,6 +31,9 @@ CASES = [
     ("FutureConsentDisabled", None, None, "FutureOfferLifecycle"),
     ("DisconnectReplay", "RetryAfterFreshReAddResolves", None, "DisconnectReplay"),
     ("DisconnectReplayStaleReceipt", None, "RemovedResponseMatchesCurrentScope", "DisconnectReplay"),
+    ("LegacyOfflineRemoval", "RemovalEventuallyAcknowledged", None, "LegacyOfflineRemoval"),
+    ("LegacyOfflineNoDescriptor", None, None, "LegacyOfflineRemoval"),
+    ("LegacyOfferDuringPending", None, "PendingBlocksNewOwnerOffers", "LegacyOfflineRemoval"),
 ]
 
 
