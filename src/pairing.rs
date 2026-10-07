@@ -28,6 +28,7 @@ const MAX_AGE_SECONDS: u64 = 600;
 const LOGIN_TTL_SECONDS: u64 = 5 * 60;
 const MAX_PENDING_LOGINS: usize = 128;
 const MAX_SCOPES: usize = 16;
+const MAX_BASELINE_WORKSPACES: usize = 4096;
 
 #[derive(Clone)]
 pub struct PairingService {
@@ -101,6 +102,7 @@ pub struct ProvisionRequest {
     pub operation_id: String,
     pub transcript_hash: String,
     pub future_boards: bool,
+    pub baseline_workspace_ids: Vec<String>,
     pub should_run: bool,
 }
 
@@ -129,6 +131,53 @@ fn provisioning_future_boards(record: &PairingRecord) -> bool {
         .pointer("/body/policy/futureBoards")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        && pairing_baseline(record).is_ok_and(|baseline| !baseline.is_empty())
+}
+
+fn parse_baseline_workspace_ids(
+    value: Option<&Value>,
+    approved: &[String],
+    required: bool,
+) -> Result<Vec<String>, ()> {
+    let Some(value) = value else {
+        return if required {
+            Err(())
+        } else {
+            Ok(approved.to_vec())
+        };
+    };
+    let values = value.as_array().ok_or(())?;
+    if values.is_empty() || values.len() > MAX_BASELINE_WORKSPACES {
+        return Err(());
+    }
+    let ids = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 256)
+                .map(str::to_owned)
+                .ok_or(())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if ids.windows(2).any(|pair| pair[0] >= pair[1])
+        || approved.iter().any(|id| ids.binary_search(id).is_err())
+    {
+        return Err(());
+    }
+    Ok(ids)
+}
+
+fn pairing_baseline(record: &PairingRecord) -> Result<Vec<String>, ()> {
+    let approved = record.offer["body"]["scopes"]
+        .as_array()
+        .ok_or(())?
+        .iter()
+        .map(|scope| scope["workspaceId"].as_str().map(str::to_owned).ok_or(()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy = &record.offer["body"]["policy"];
+    let future_boards = policy["futureBoards"].as_bool().unwrap_or(false);
+    parse_baseline_workspace_ids(policy.get("baselineWorkspaceIds"), &approved, future_boards)
 }
 
 #[derive(Clone)]
@@ -284,13 +333,10 @@ impl PairingService {
         let body = payload
             .get("body")
             .ok_or(PairingError::Invalid("Missing offer body"))?;
-        if body
+        let future_boards = body
             .pointer("/policy/futureBoards")
             .and_then(Value::as_bool)
-            .is_none()
-        {
-            return Err(PairingError::Invalid("Missing future-board policy"));
-        }
+            .ok_or(PairingError::Invalid("Missing future-board policy"))?;
         let scopes = body
             .get("scopes")
             .and_then(Value::as_array)
@@ -326,6 +372,16 @@ impl PairingService {
                 ));
             }
         }
+        let approved_ids = scopes
+            .iter()
+            .map(|scope| scope["workspaceId"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        parse_baseline_workspace_ids(
+            body.pointer("/policy/baselineWorkspaceIds"),
+            &approved_ids,
+            future_boards,
+        )
+        .map_err(|_| PairingError::Invalid("Missing or invalid signed workspace baseline"))?;
         let canonical = canonicalize_json(payload)
             .map_err(|_| PairingError::Invalid("Invalid signed offer"))?;
         let transcript_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
@@ -561,6 +617,30 @@ impl PairingService {
                 "Provision future-board policy differs from signed offer",
             ));
         }
+        let approved_baseline_ids = record.offer["body"]["scopes"]
+            .as_array()
+            .ok_or(PairingError::Invalid("Pairing has no approved scopes"))?
+            .iter()
+            .map(|scope| {
+                scope["workspaceId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or(PairingError::Invalid("Invalid approved scope"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let approved_baseline = pairing_baseline(record)
+            .map_err(|_| PairingError::Invalid("Pairing has no signed workspace baseline"))?;
+        let requested_baseline = parse_baseline_workspace_ids(
+            body.get("baselineWorkspaceIds"),
+            &approved_baseline_ids,
+            future_boards,
+        )
+        .map_err(|_| PairingError::Invalid("Missing or invalid provisioning workspace baseline"))?;
+        if requested_baseline != approved_baseline {
+            return Err(PairingError::Invalid(
+                "Provision workspace baseline differs from signed offer",
+            ));
+        }
         let transcript_hash = record.transcript_hash.clone();
         let invitation: WorkspaceJoinInvitation = serde_json::from_value(
             body.get("invitation")
@@ -646,6 +726,7 @@ impl PairingService {
                     operation_id,
                     transcript_hash,
                     future_boards,
+                    baseline_workspace_ids: approved_baseline,
                     should_run: false,
                 });
             }
@@ -684,6 +765,7 @@ impl PairingService {
             operation_id,
             transcript_hash,
             future_boards,
+            baseline_workspace_ids: approved_baseline,
             should_run,
         })
     }
@@ -740,15 +822,17 @@ impl PairingService {
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         let mut next = state.clone();
         let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
-        let provisioning = record.provisioning.as_mut().ok_or(PairingError::Conflict)?;
         let approved_future_boards = record
             .offer
             .pointer("/body/policy/futureBoards")
             .and_then(Value::as_bool);
+        let approved_baseline = pairing_baseline(record).ok();
+        let provisioning = record.provisioning.as_mut().ok_or(PairingError::Conflict)?;
         if commit.pairing_id != id
             || commit.operation_id != provisioning.operation_id
             || commit.transcript_hash != record.transcript_hash
             || commit.future_boards != approved_future_boards.unwrap_or(false)
+            || Some(commit.baseline_workspace_ids.as_slice()) != approved_baseline.as_deref()
             || commit.snapshot_hash.is_empty()
             || commit.workspace_ids
                 != provisioning

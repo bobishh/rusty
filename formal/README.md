@@ -29,9 +29,16 @@ board offer; it does not require a second pairing approval. Its normal config
 checks Editor invitation and grant independently, its Visitor-only gate mutant
 checks offer liveness, its Visitor grant mutant checks role safety, and its
 omitted-ledger mutant checks that a runtime-attached scope also enters the
-canonical registry. The disabled-consent config checks that no board can stage
-when `futureBoards` is false. The owner signature itself is abstracted as
-`OwnerProofValid`; signature verification remains covered by Rust tests.
+canonical registry. It also starts with an existing owned board in the captured
+inventory but outside the explicitly approved initial scope list; the sweep
+mutant demonstrates that future-board consent cannot add that unselected board
+to this integration. Its preexisting standalone runtime attachment remains
+active and outside the integration ledger; the model does not require every
+local scope to belong to an integration. A subsequently created board is absent
+from that captured inventory and may be offered under consent. The disabled-
+consent config checks that no board can stage when `futureBoards` is false. The
+owner signature itself is abstracted as `OwnerProofValid`; signature
+verification remains covered by Rust tests.
 
 | Requirement | Check |
 | --- | --- |
@@ -43,7 +50,7 @@ when `futureBoards` is false. The owner signature itself is abstracted as
 | Partial selected-scope cleanup retries across restart | `FullRetryReAdd`; `FailureRestartReAdd.cfg` witness |
 | Tombstoned activation cannot replay; fresh higher-epoch Editor can re-add | `NoStaleActivationResurrection`, `FreshGrantEpoch`; `StaleActivation.cfg` mutant |
 | Concurrent owner revision cannot commit stale stage | `CommitUsesCurrentRevision`; `ConcurrentCAS.cfg` and `StaleCAS.cfg` |
-| Future-board consent, Editor invite/grant, and registry commit enforced | `FuturePolicyBlocksAutoPairing`; `FutureConsent.cfg` mutant; `FutureOfferLifecycle.tla` configs `FutureEditorOffer.cfg` witness, `FutureVisitorOnlyOfferGate.cfg` liveness mutant, `FutureVisitorGrant.cfg` role mutant, `FutureLedgerOmitted.cfg` registry mutant, `FutureConsentDisabled.cfg` consent check |
+| Future-board consent applies only to genuinely new boards; Editor invite/grant and registry commit enforced | `FuturePolicyBlocksAutoPairing`; `FutureConsent.cfg` mutant; `FutureOfferLifecycle.tla` configs `FutureEditorOffer.cfg` witness, `FutureVisitorOnlyOfferGate.cfg` liveness mutant, `FutureVisitorGrant.cfg` role mutant, `FutureLedgerOmitted.cfg` registry mutant, `FutureSweepsUnselected.cfg` baseline-consent mutant, `FutureConsentDisabled.cfg` consent check |
 | Ambiguous JobSearch routing is blocked | `AmbiguousRouteBlocked`; `AmbiguousRouteMutation.cfg` mutant |
 
 Source mapping:
@@ -57,7 +64,9 @@ Source mapping:
   `src/keeper.rs` (`activate_provisioned_scopes`,
   `disconnect_integration`, `unsubscribe`).
 - Future-board import must update runtime scopes and the Config-backed
-  integration registry: `src/keeper.rs` (`merge_owner_offer`).
+  integration registry and must exclude boards outside pairing baseline:
+  `src/keeper.rs` (`merge_owner_offer`, `record_activated_integration`) and
+  Tincanban's captured owner workspace baseline.
 - JobSearch target selection and ambiguity rejection: `src/keeper.rs`.
 
 Run `python3 formal/run_models.py --jar /path/to/tla2tools.jar`. TLC logs and

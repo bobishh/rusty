@@ -206,6 +206,7 @@ pub async fn provision_existing_identity(
     operation_id: &str,
     transcript_hash: &str,
     future_boards: bool,
+    baseline_workspace_ids: &[String],
     base: &Config,
     node: &NativeNode,
     service_directory: &Path,
@@ -218,6 +219,16 @@ pub async fn provision_existing_identity(
         .collect::<Vec<_>>();
     if scope_ids.is_empty() || scope_ids != approved_scopes {
         return Err("Invitation scope set differs from dual-approved scopes".into());
+    }
+    if baseline_workspace_ids.is_empty()
+        || baseline_workspace_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || scope_ids
+            .iter()
+            .any(|workspace_id| baseline_workspace_ids.binary_search(workspace_id).is_err())
+    {
+        return Err("Signed workspace baseline differs from approved scopes".into());
     }
     if invite.role != "editor" {
         return Err("Keeper integration requires an editor grant".into());
@@ -422,6 +433,7 @@ pub async fn provision_existing_identity(
             workspace_ids: scope_ids.clone(),
             snapshot_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(&original_snapshot_bytes)),
             future_boards,
+            baseline_workspace_ids: baseline_workspace_ids.to_vec(),
             controller_person_id: None,
         };
         if let Err(error) = activate(staged, commit) {

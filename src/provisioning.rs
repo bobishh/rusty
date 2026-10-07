@@ -58,6 +58,7 @@ impl ProvisioningService {
         invitation: meta_mesh_core::WorkspaceJoinInvitation,
         workspace_ids: Vec<String>,
         future_boards: bool,
+        baseline_workspace_ids: Vec<String>,
     ) -> Result<Vec<ProvisionedScope>, String> {
         let invitation_id = invitation.invitation_id.clone();
         let controller_person_id = invitation.issuer_person_id.clone();
@@ -70,6 +71,7 @@ impl ProvisioningService {
             workspace_ids: workspace_ids.clone(),
             snapshot_hash: String::new(),
             future_boards,
+            baseline_workspace_ids: baseline_workspace_ids.clone(),
             controller_person_id: Some(controller_person_id.clone()),
         };
         if let Some(previous) = self.host.provisioning_commit(pairing_id)? {
@@ -80,6 +82,7 @@ impl ProvisioningService {
                 || previous.invitation_id != expected_commit.invitation_id
                 || previous.workspace_ids != expected_commit.workspace_ids
                 || previous.future_boards != expected_commit.future_boards
+                || previous.baseline_workspace_ids != expected_commit.baseline_workspace_ids
                 || previous
                     .controller_person_id
                     .as_deref()
@@ -105,6 +108,7 @@ impl ProvisioningService {
             operation_id,
             transcript_hash,
             future_boards,
+            &baseline_workspace_ids,
             &config,
             &self.node,
             &service_directory,

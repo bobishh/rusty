@@ -15,6 +15,7 @@ fn provision_commit(
         workspace_ids: workspace_ids.iter().map(|id| (*id).into()).collect(),
         snapshot_hash: "snapshot".into(),
         future_boards,
+        baseline_workspace_ids: workspace_ids.iter().map(|id| (*id).into()).collect(),
         controller_person_id: Some(owner.person_id.clone()),
     }
 }
@@ -293,6 +294,15 @@ fn future_board_offer_accepts_owner_signed_editor_grant_only_when_enabled() {
     let mut host = keeper.host.clone();
     let mut scope = host.open_scope(&peer).unwrap();
 
+    let preexisting = complete_owner_offer(&keeper.owner, &keeper.keeper, "primary-board");
+    assert!(
+        scope
+            .prepare_owner_offer(preexisting.to_string().as_bytes())
+            .err()
+            .expect("baseline workspace is rejected")
+            .contains("Pre-existing board")
+    );
+
     assert!(
         scope
             .prepare_owner_offer(&offer.to_string().into_bytes())
@@ -325,10 +335,15 @@ fn future_board_offer_accepts_owner_signed_editor_grant_only_when_enabled() {
 
 #[test]
 fn future_owner_offer_updates_scope_ledger_atomically_and_replays_idempotently() {
-    let (keeper, _) = two_owner_keeper(true);
+    let (mut keeper, _) = two_owner_keeper(true);
     let peer = keeper.peer(&keeper.owner, "primary-board");
     let offer = complete_owner_offer(&keeper.owner, &keeper.keeper, "future-ledger-board");
-    let before = keeper.host.configuration().unwrap();
+    let mut before = keeper.host.configuration().unwrap();
+    let mut preexisting_unselected = keeper.staged_scope("unselected-owner-board");
+    preexisting_unselected.controller_person_id = Some(keeper.owner.person_id.clone());
+    before.additional_scopes.push(preexisting_unselected);
+    fs::write(&keeper.config_path, serde_json::to_vec(&before).unwrap()).unwrap();
+    keeper.host = KeeperHost::open(before.clone(), keeper.config_path.clone()).unwrap();
     let before_record = before.integrations.iter().find(|record| {
         record.controller_person_id == keeper.owner.person_id
             && record.service_person_id == keeper.keeper.person_id
@@ -357,11 +372,34 @@ fn future_owner_offer_updates_scope_ledger_atomically_and_replays_idempotently()
     assert_eq!(scope_record.state, "active");
     assert_eq!(scope_record.grant_epoch, 2);
     assert!(
+        record
+            .baseline_workspace_ids
+            .contains(&"primary-board".into())
+    );
+    assert!(
+        !record
+            .baseline_workspace_ids
+            .contains(&"future-ledger-board".into())
+    );
+    assert!(
         scope_record
             .activation_operation_id
             .starts_with("owner-offer:")
     );
     assert_eq!(record.revision, before_revision + 1);
+    assert!(
+        record
+            .scopes
+            .iter()
+            .all(|scope| scope.workspace_id != "unselected-owner-board"),
+        "future consent cannot widen legacy admission to a preexisting unselected scope"
+    );
+    assert!(
+        activated
+            .additional_scopes
+            .iter()
+            .any(|scope| scope.workspace_id == "unselected-owner-board")
+    );
 
     scope.merge_owner_offer(encoded.as_bytes()).unwrap();
     let replayed = keeper.host.configuration().unwrap();
@@ -443,6 +481,7 @@ fn mixed_owner_activation_is_rejected_without_config_or_scope_changes() {
         workspace_ids: vec!["a-staged".into(), "b-staged".into()],
         snapshot_hash: "mixed-owner-snapshot".into(),
         future_boards: true,
+        baseline_workspace_ids: vec!["a-staged".into(), "b-staged".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     assert!(
@@ -464,9 +503,27 @@ fn mixed_owner_activation_is_rejected_without_config_or_scope_changes() {
 #[test]
 fn transferred_board_does_not_transfer_future_policy_to_new_owner() {
     let commits = vec![provision_commit_from_ids(&["a-one", "a-two"], true)];
-    assert!(!future_policy_matches_owner("owner-b", true, &commits));
-    assert!(future_policy_matches_owner("owner-a", true, &commits));
-    assert!(!future_policy_matches_owner("owner-a", false, &commits));
+    assert!(!future_policy_matches_owner(
+        "owner-b",
+        true,
+        "new-board",
+        &commits
+    ));
+    assert!(future_policy_matches_owner(
+        "owner-a",
+        true,
+        "new-board",
+        &commits
+    ));
+    assert!(!future_policy_matches_owner(
+        "owner-a", true, "a-one", &commits
+    ));
+    assert!(!future_policy_matches_owner(
+        "owner-a",
+        false,
+        "new-board",
+        &commits
+    ));
 }
 
 fn match_certificate(identity: &Identity) -> DeviceCertificate {
@@ -740,6 +797,7 @@ fn provision_commit_from_ids(workspace_ids: &[&str], future_boards: bool) -> Pro
         workspace_ids: workspace_ids.iter().map(|id| (*id).into()).collect(),
         snapshot_hash: "snapshot".into(),
         future_boards,
+        baseline_workspace_ids: workspace_ids.iter().map(|id| (*id).into()).collect(),
         controller_person_id: Some("owner-a".into()),
     }
 }

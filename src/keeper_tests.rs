@@ -548,6 +548,7 @@ fn approved_active_pairing(
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "http-contract-snapshot".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -767,6 +768,7 @@ fn unsubscribed_primary_can_be_added_again_by_fresh_provisioning() {
         workspace_ids: vec!["primary-board".into()],
         snapshot_hash: "new-snapshot".into(),
         future_boards: true,
+        baseline_workspace_ids: vec!["primary-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -799,6 +801,7 @@ fn unsubscribed_additional_board_can_receive_a_fresh_grant() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -843,6 +846,7 @@ fn unsubscribe_removes_only_the_owned_scope_files() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -896,6 +900,7 @@ fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: true,
+        baseline_workspace_ids: vec!["second-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -931,6 +936,7 @@ fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "new-snapshot".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -983,6 +989,7 @@ fn disconnect_cleanup_failure_stays_pending_and_retries_after_restart() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1062,6 +1069,7 @@ fn local_unsubscribe_retries_the_same_scope_cleanup_without_restart() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1138,6 +1146,7 @@ fn local_unsubscribe_cannot_drop_another_scope_during_pending_cleanup() {
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "snapshot-b".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1153,6 +1162,7 @@ fn local_unsubscribe_cannot_drop_another_scope_during_pending_cleanup() {
         workspace_ids: vec!["third-board".into()],
         snapshot_hash: "snapshot-c".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1630,6 +1640,7 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
                 workspace_ids: vec!["second-board".into()],
                 snapshot_hash: "overview-snapshot".into(),
                 future_boards: false,
+                baseline_workspace_ids: Vec::new(),
                 controller_person_id: Some(keeper.owner.person_id.clone()),
             },
         )
@@ -2111,6 +2122,7 @@ fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
         workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
         snapshot_hash: "snapshot-test".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     let mut orphaned = vec![keeper.staged_scope("selected-board-a")];
@@ -2190,6 +2202,7 @@ fn failed_scope_validation_never_activates_a_subset_of_provisioned_scopes() {
         workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
         snapshot_hash: "snapshot-test".into(),
         future_boards: false,
+        baseline_workspace_ids: Vec::new(),
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
 

@@ -440,6 +440,7 @@ pub(crate) async fn pairing_provision(
                     provision.invitation,
                     provision.scopes.clone(),
                     provision.future_boards,
+                    provision.baseline_workspace_ids.clone(),
                 )
                 .await
             {

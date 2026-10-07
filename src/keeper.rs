@@ -150,6 +150,7 @@ fn owner_follows_future_boards(
     registry: &Registry,
     owner_person_id: &str,
     route_workspace_id: &str,
+    offered_workspace_id: &str,
 ) -> Result<bool, String> {
     let configured_owner = std::iter::once(&registry.config)
         .chain(registry.config.additional_scopes.iter())
@@ -174,6 +175,11 @@ fn owner_follows_future_boards(
             integration.controller_person_id == owner_person_id
                 && integration.service_person_id == service_id
                 && integration.future_boards
+                && !integration.baseline_workspace_ids.is_empty()
+                && !integration
+                    .baseline_workspace_ids
+                    .iter()
+                    .any(|id| id == offered_workspace_id)
                 && integration.pending_disconnect.is_none()
                 && integration.scopes.iter().any(|scope| {
                     scope.workspace_id == route_workspace_id && scope.state == "active"
@@ -189,6 +195,7 @@ fn owner_follows_future_boards(
     Ok(future_policy_matches_owner(
         owner_person_id,
         has_current_board,
+        offered_workspace_id,
         &registry.config.provisioning_commits,
     ))
 }
@@ -198,6 +205,7 @@ fn future_integration_index(
     registry: &Registry,
     owner_person_id: &str,
     route_workspace_id: &str,
+    offered_workspace_id: &str,
 ) -> Result<usize, String> {
     let service_id = service_person_id(config)?;
     let matching = config
@@ -208,6 +216,11 @@ fn future_integration_index(
             integration.controller_person_id == owner_person_id
                 && integration.service_person_id == service_id
                 && integration.future_boards
+                && !integration.baseline_workspace_ids.is_empty()
+                && !integration
+                    .baseline_workspace_ids
+                    .iter()
+                    .any(|id| id == offered_workspace_id)
                 && integration.pending_disconnect.is_none()
                 && integration.scopes.iter().any(|scope| {
                     scope.workspace_id == route_workspace_id && scope.state == "active"
@@ -232,6 +245,11 @@ fn future_integration_index(
         .rev()
         .find(|commit| {
             commit.future_boards
+                && !commit.baseline_workspace_ids.is_empty()
+                && !commit
+                    .baseline_workspace_ids
+                    .iter()
+                    .any(|id| id == offered_workspace_id)
                 && commit.controller_person_id.as_deref() == Some(owner_person_id)
                 && commit
                     .workspace_ids
@@ -246,7 +264,12 @@ fn future_integration_index(
     };
     let mut scopes = Vec::new();
     for (workspace_id, host) in &registry.scopes {
-        if current_owner(host)? != owner_person_id {
+        if !legacy_commit
+            .workspace_ids
+            .iter()
+            .any(|committed_id| committed_id == workspace_id)
+            || current_owner(host)? != owner_person_id
+        {
             continue;
         }
         let Some(scope) = configured_scope(config, workspace_id) else {
@@ -286,7 +309,8 @@ fn future_integration_index(
         controller_person_id: owner_person_id.to_owned(),
         service_person_id: service_id,
         revision: 0,
-        future_boards: true,
+        future_boards: legacy_commit.future_boards,
+        baseline_workspace_ids: legacy_commit.baseline_workspace_ids.clone(),
         scopes,
         tombstones: Vec::new(),
         pending_disconnect: None,
@@ -298,12 +322,35 @@ fn future_integration_index(
 fn future_policy_matches_owner(
     owner_person_id: &str,
     has_current_board: bool,
+    offered_workspace_id: &str,
     commits: &[ProvisioningCommit],
 ) -> bool {
     has_current_board
         && commits.iter().any(|commit| {
-            commit.future_boards && commit.controller_person_id.as_deref() == Some(owner_person_id)
+            commit.future_boards
+                && !commit.baseline_workspace_ids.is_empty()
+                && !commit
+                    .baseline_workspace_ids
+                    .iter()
+                    .any(|id| id == offered_workspace_id)
+                && commit.controller_person_id.as_deref() == Some(owner_person_id)
         })
+}
+
+fn owner_baseline_contains(
+    registry: &Registry,
+    owner_person_id: &str,
+    service_person_id: &str,
+    workspace_id: &str,
+) -> bool {
+    registry.config.integrations.iter().any(|integration| {
+        integration.controller_person_id == owner_person_id
+            && integration.service_person_id == service_person_id
+            && integration
+                .baseline_workspace_ids
+                .iter()
+                .any(|id| id == workspace_id)
+    })
 }
 
 fn scope_host(config: &Config) -> Result<MatchLighthouseHost, String> {
@@ -365,6 +412,10 @@ impl KeeperHost {
             if scope.primary_detached || scope_has_pending_removal(&config, &scope.workspace_id) {
                 continue;
             }
+            if scope_has_superseding_tombstone(&config, scope) {
+                continue;
+            }
+            let host = scope_host(scope)?;
             if scope.device_id != config.device_id
                 || scope.iroh_secret != config.iroh_secret
                 || scope.device_seed != config.device_seed
@@ -378,10 +429,7 @@ impl KeeperHost {
             {
                 return Err("Keeper scope secrets must be distinct".into());
             }
-            if scopes
-                .insert(scope.workspace_id.clone(), scope_host(scope)?)
-                .is_some()
-            {
+            if scopes.insert(scope.workspace_id.clone(), host).is_some() {
                 return Err("Duplicate keeper scope".into());
             }
         }
@@ -550,6 +598,7 @@ impl KeeperHost {
                     service_person_id: service_id,
                     revision: 0,
                     future_boards: false,
+                    baseline_workspace_ids: Vec::new(),
                     scopes: Vec::new(),
                     tombstones: Vec::new(),
                     pending_disconnect: None,
@@ -869,14 +918,17 @@ impl KeeperHost {
                     });
                 }
             }
-            let future_boards =
-                candidate.future_boards && commit.future_boards && !scopes.is_empty();
+            let future_boards = candidate.future_boards
+                && commit.future_boards
+                && !commit.baseline_workspace_ids.is_empty()
+                && !scopes.is_empty();
             registry.config.integrations.push(IntegrationRecord {
                 integration_id: canonical_integration_id.clone(),
                 controller_person_id: controller_person_id.to_owned(),
                 service_person_id: service_id.clone(),
                 revision: 1,
                 future_boards,
+                baseline_workspace_ids: commit.baseline_workspace_ids.clone(),
                 scopes,
                 tombstones,
                 pending_disconnect: None,
@@ -1282,6 +1334,7 @@ fn record_activated_integration(next: &mut Config, staged: &[Config]) -> Result<
                 service_person_id: service_id,
                 revision: 0,
                 future_boards: commit.future_boards,
+                baseline_workspace_ids: commit.baseline_workspace_ids.clone(),
                 scopes: Vec::new(),
                 tombstones: Vec::new(),
                 pending_disconnect: None,
@@ -1329,7 +1382,8 @@ fn record_activated_integration(next: &mut Config, staged: &[Config]) -> Result<
     record
         .scopes
         .sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
-    record.future_boards = commit.future_boards;
+    record.future_boards = commit.future_boards && !commit.baseline_workspace_ids.is_empty();
+    record.baseline_workspace_ids = commit.baseline_workspace_ids.clone();
     record.revision = record.revision.saturating_add(1);
     if record
         .pending_disconnect
@@ -1357,6 +1411,38 @@ fn scope_has_pending_removal(config: &Config, workspace_id: &str) -> bool {
                     && operation.workspace_ids.iter().any(|id| id == workspace_id)
             })
     })
+}
+
+fn scope_has_superseding_tombstone(config: &Config, scope: &Config) -> bool {
+    let Some(controller) = scope.controller_person_id.as_deref() else {
+        return false;
+    };
+    let Ok(service_id) = service_person_id(config) else {
+        return false;
+    };
+    let integration_id = crate::integration_id(controller, &service_id);
+    let Some(integration) = config
+        .integrations
+        .iter()
+        .find(|record| record.integration_id == integration_id)
+    else {
+        return false;
+    };
+    let tombstone_epoch = integration
+        .tombstones
+        .iter()
+        .filter(|tombstone| tombstone.workspace_id == scope.workspace_id)
+        .map(|tombstone| tombstone.grant_epoch)
+        .max();
+    let Some(tombstone_epoch) = tombstone_epoch else {
+        return false;
+    };
+    scope_epoch_for_legacy_removal(scope) <= tombstone_epoch
+        || !integration.scopes.iter().any(|active| {
+            active.workspace_id == scope.workspace_id
+                && active.state == "active"
+                && active.grant_epoch > tombstone_epoch
+        })
 }
 
 fn random_operation_id() -> String {
@@ -1456,7 +1542,8 @@ fn integration_status_value(record: &IntegrationRecord) -> Value {
         "controllerPersonId":record.controller_person_id,
         "servicePersonId":record.service_person_id,
         "revision":record.revision,
-        "policy":{"futureBoards":record.future_boards},
+        "policy":{"futureBoards":record.future_boards && !record.baseline_workspace_ids.is_empty(),
+            "baselineWorkspaceIds":record.baseline_workspace_ids},
         "scopes":scopes,
         "tombstones":tombstones,
         "pendingOperation":pending_operation,
@@ -1950,6 +2037,10 @@ impl NativeScopeHost for KeeperScope {
         if value["controllerPersonId"].as_str() != Some(controller) || value["version"] != 1 {
             return Err("Keeper owner offer does not match authenticated owner".into());
         }
+        let service_id = service_person_id(&registry.config)?;
+        if owner_baseline_contains(&registry, controller, &service_id, workspace_id) {
+            return Err("Pre-existing board is outside future-board consent".into());
+        }
         let known_owner = registry
             .scopes
             .get(workspace_id)
@@ -1958,7 +2049,12 @@ impl NativeScopeHost for KeeperScope {
         let authorized = if let Some(owner) = known_owner {
             owner == controller
         } else {
-            owner_follows_future_boards(&registry, controller, &self.peer.workspace_id)?
+            owner_follows_future_boards(
+                &registry,
+                controller,
+                &self.peer.workspace_id,
+                workspace_id,
+            )?
         };
         if !authorized {
             return Err("Keeper owner offer is not authorized by this owner's policy".into());
@@ -2125,7 +2221,12 @@ impl NativeScopeHost for KeeperScope {
         }
         let is_new_scope = !registry.scopes.contains_key(workspace_id);
         if is_new_scope
-            && !owner_follows_future_boards(&registry, controller, &self.peer.workspace_id)?
+            && !owner_follows_future_boards(
+                &registry,
+                controller,
+                &self.peer.workspace_id,
+                workspace_id,
+            )?
         {
             return Err("Keeper owner offer is not authorized by this owner's policy".into());
         }
@@ -2277,8 +2378,13 @@ impl NativeScopeHost for KeeperScope {
         }
         let host = scope_host(&scope)?;
         let mut next = registry.config.clone();
-        let integration_index =
-            future_integration_index(&mut next, &registry, controller, &self.peer.workspace_id)?;
+        let integration_index = future_integration_index(
+            &mut next,
+            &registry,
+            controller,
+            &self.peer.workspace_id,
+            workspace_id,
+        )?;
         let integration = &mut next.integrations[integration_index];
         if integration
             .tombstones

@@ -4,6 +4,26 @@ use serde_json::json;
 
 const OPERATOR_SECRET: &str = "owner-auth-test-operator-token-long-enough";
 
+#[test]
+fn signed_future_policy_requires_sorted_complete_approval_baseline() {
+    let approved = vec!["board-b".to_owned()];
+    let baseline = json!(["board-a", "board-b"]);
+    assert_eq!(
+        parse_baseline_workspace_ids(Some(&baseline), &approved, true).unwrap(),
+        vec!["board-a", "board-b"]
+    );
+    assert!(parse_baseline_workspace_ids(None, &approved, true).is_err());
+    assert!(
+        parse_baseline_workspace_ids(Some(&json!(["board-b", "board-a"])), &approved, true)
+            .is_err()
+    );
+    assert!(parse_baseline_workspace_ids(Some(&json!(["board-a"])), &approved, true).is_err());
+    assert_eq!(
+        parse_baseline_workspace_ids(None, &approved, false).unwrap(),
+        approved
+    );
+}
+
 fn test_peer(
     name: &str,
     identity_seed: [u8; 32],

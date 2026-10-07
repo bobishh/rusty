@@ -67,6 +67,8 @@ pub(crate) struct IntegrationRecord {
     pub(crate) service_person_id: String,
     pub(crate) revision: u64,
     pub(crate) future_boards: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) baseline_workspace_ids: Vec<String>,
     pub(crate) scopes: Vec<IntegrationScope>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) tombstones: Vec<ScopeTombstone>,
@@ -117,6 +119,8 @@ pub(crate) struct ProvisioningCommit {
     pub(crate) snapshot_hash: String,
     #[serde(default)]
     pub(crate) future_boards: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) baseline_workspace_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) controller_person_id: Option<String>,
 }

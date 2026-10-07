@@ -3,6 +3,7 @@ EXTENDS Naturals, TLC
 
 CONSTANTS InitialFutureBoards, RequireVisitorOnlyGate,
           IgnoreEditorGrantCheck, OmitFutureLedgerCommit,
+          ScanAllOwnedScopes,
           InviteRole, GrantRole, OwnerProofValid
 
 Roles == {"editor", "visitor"}
@@ -11,12 +12,18 @@ ScopeStates == {"absent", "staged", "active"}
 VARIABLES baseActive, baseRole, futureBoards, newScope,
           stagedInviteRole, stagedGrantRole, activeInviteRole,
           activeGrantRole, stagedEpoch, grantEpoch,
-          runtimeAttached, ledgerActive
+          runtimeAttached, ledgerActive, unselectedOwned,
+          unselectedInCapturedBaseline, unselectedSelectedAtPairing,
+          preexistingStandaloneActive, unselectedIntegrationMember,
+          unselectedLedgerActive
 
 vars == <<baseActive, baseRole, futureBoards, newScope,
          stagedInviteRole, stagedGrantRole, activeInviteRole,
          activeGrantRole, stagedEpoch, grantEpoch,
-         runtimeAttached, ledgerActive>>
+         runtimeAttached, ledgerActive, unselectedOwned,
+         unselectedInCapturedBaseline, unselectedSelectedAtPairing,
+         preexistingStandaloneActive, unselectedIntegrationMember,
+         unselectedLedgerActive>>
 
 Init ==
   /\ baseActive = TRUE
@@ -31,6 +38,12 @@ Init ==
   /\ grantEpoch = 0
   /\ runtimeAttached = FALSE
   /\ ledgerActive = FALSE
+  /\ unselectedOwned = TRUE
+  /\ unselectedInCapturedBaseline = TRUE
+  /\ unselectedSelectedAtPairing = FALSE
+  /\ preexistingStandaloneActive = TRUE
+  /\ unselectedIntegrationMember = FALSE
+  /\ unselectedLedgerActive = FALSE
 
 AcceptOwnerOffer ==
   /\ baseActive
@@ -46,7 +59,10 @@ AcceptOwnerOffer ==
   /\ stagedGrantRole' = GrantRole
   /\ stagedEpoch' = 1
   /\ UNCHANGED <<baseActive, baseRole, futureBoards, activeInviteRole,
-                  activeGrantRole, grantEpoch, runtimeAttached, ledgerActive>>
+                  activeGrantRole, grantEpoch, runtimeAttached, ledgerActive,
+                  unselectedOwned, unselectedInCapturedBaseline,
+                  unselectedSelectedAtPairing, preexistingStandaloneActive,
+                  unselectedIntegrationMember, unselectedLedgerActive>>
 
 CommitScope ==
   /\ newScope = "staged"
@@ -64,9 +80,30 @@ CommitScope ==
   /\ runtimeAttached' = TRUE
   /\ ledgerActive' = ~OmitFutureLedgerCommit
   /\ UNCHANGED <<baseActive, baseRole, futureBoards, stagedInviteRole,
-                  stagedGrantRole, stagedEpoch>>
+                  stagedGrantRole, stagedEpoch, unselectedOwned,
+                  unselectedInCapturedBaseline, unselectedSelectedAtPairing,
+                  preexistingStandaloneActive, unselectedIntegrationMember,
+                  unselectedLedgerActive>>
 
-Next == AcceptOwnerOffer \/ CommitScope \/ UNCHANGED vars
+AutoAddUnselectedOwnedScope ==
+  /\ ScanAllOwnedScopes
+  /\ baseActive
+  /\ baseRole = "editor"
+  /\ futureBoards
+  /\ OwnerProofValid
+  /\ unselectedOwned
+  /\ unselectedInCapturedBaseline
+  /\ ~unselectedSelectedAtPairing
+  /\ ~unselectedIntegrationMember
+  /\ unselectedIntegrationMember' = TRUE
+  /\ unselectedLedgerActive' = TRUE
+  /\ UNCHANGED <<baseActive, baseRole, futureBoards, newScope,
+                  stagedInviteRole, stagedGrantRole, activeInviteRole,
+                  activeGrantRole, stagedEpoch, grantEpoch, runtimeAttached,
+                  ledgerActive, unselectedOwned, unselectedInCapturedBaseline,
+                  unselectedSelectedAtPairing, preexistingStandaloneActive>>
+
+Next == AcceptOwnerOffer \/ CommitScope \/ AutoAddUnselectedOwnedScope \/ UNCHANGED vars
 
 BaseEditorScopePreserved == baseActive /\ baseRole = "editor"
 FutureConsentRequired == newScope \in {"staged", "active"} => futureBoards
@@ -74,7 +111,13 @@ OwnerProofRequired == newScope \in {"staged", "active"} => OwnerProofValid
 FutureScopeRequiresEditorRoles == newScope = "active" =>
   activeInviteRole = "editor" /\ activeGrantRole = "editor"
 FutureScopeUsesSignedGrantEpoch == newScope = "active" => grantEpoch > 0
-RuntimeAttachedHasLedger == runtimeAttached => ledgerActive
+FutureRuntimeAttachedHasLedger == runtimeAttached => ledgerActive
+UnselectedIntegrationMemberRequiresInvitationConsent ==
+  unselectedIntegrationMember =>
+    (~unselectedInCapturedBaseline \/ unselectedSelectedAtPairing)
+UnselectedStandalonePreserved == preexistingStandaloneActive
+UnselectedIntegrationMemberHasLedger ==
+  unselectedIntegrationMember => unselectedLedgerActive
 TypeOK ==
   /\ baseActive \in BOOLEAN
   /\ baseRole \in Roles
@@ -86,6 +129,12 @@ TypeOK ==
   /\ activeGrantRole \in Roles
   /\ runtimeAttached \in BOOLEAN
   /\ ledgerActive \in BOOLEAN
+  /\ unselectedOwned \in BOOLEAN
+  /\ unselectedInCapturedBaseline \in BOOLEAN
+  /\ unselectedSelectedAtPairing \in BOOLEAN
+  /\ preexistingStandaloneActive \in BOOLEAN
+  /\ unselectedIntegrationMember \in BOOLEAN
+  /\ unselectedLedgerActive \in BOOLEAN
   /\ stagedEpoch \in 1..2
   /\ grantEpoch \in 0..2
 
