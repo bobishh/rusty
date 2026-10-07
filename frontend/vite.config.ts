@@ -9,6 +9,6 @@ const matchSource = process.env.MATCH_UI_SOURCE
 export default defineConfig({
   base: "/admin/",
   plugins: [vue()],
-  resolve: { alias: { "@match": matchSource }, dedupe: ["vue"] },
+  resolve: { alias: { "@tincanban": matchSource }, dedupe: ["vue"] },
   build: { outDir: "dist", emptyOutDir: true },
 })

@@ -6,15 +6,16 @@ use std::{
 };
 
 use automerge::{
-    ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ROOT, ReadDoc,
+    ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ROOT, ReadDoc, ScalarValue,
     transaction::{CommitOptions, Transactable},
 };
 use match_authority::{admit_match_candidate, prepare_match_write_authority};
 use meta_mesh_core::{
-    DEFAULT_SIGNATURE_DOMAIN, MeshHandshake, MeshPeerAdmission, VerifyWorkspaceMemberOptions,
-    WorkspaceChangeAuthorizationPayload, WorkspaceWriteAuthorizationSnapshot,
-    authorization_admission_bundle, authorization_records, merge_verified_peer_catalog,
-    sign_json_envelope, validate_mesh_catalog, verify_workspace_member_bundle,
+    DEFAULT_SIGNATURE_DOMAIN, MeshCatalog, MeshHandshake, MeshPeerAdmission, SignedDeparture,
+    SignedDeviceRevocation, VerifyWorkspaceMemberOptions, WorkspaceChangeAuthorizationPayload,
+    WorkspaceWriteAuthorizationSnapshot, authorization_admission_bundle, authorization_records,
+    merge_verified_peer_catalog, sign_json_envelope, validate_mesh_catalog,
+    verify_workspace_member_bundle,
 };
 use meta_mesh_native::{
     FileScopeStore, NativeScopeCredential, NativeScopeHost, NativeScopeServiceHost,
@@ -177,6 +178,24 @@ impl MatchScopeStore {
         ))
     }
 
+    pub fn has_board_preset(&self, preset: &str) -> Result<bool, String> {
+        let bytes = self
+            .inner
+            .lock()
+            .map_err(|_| "Lighthouse state lock poisoned")?
+            .state
+            .document
+            .clone();
+        let document =
+            AutoCommit::load(&bytes).map_err(|error| format!("Invalid Match document: {error}"))?;
+        let view =
+            serde_json::to_value(AutoSerde::from(&document)).map_err(|error| error.to_string())?;
+        Ok(view
+            .get("entities")
+            .and_then(Value::as_object)
+            .is_some_and(|entities| board_with_preset(entities, preset).is_some()))
+    }
+
     pub fn authorized_peer_endpoints(&self) -> Result<Vec<String>, String> {
         let mut guard = self
             .inner
@@ -249,13 +268,8 @@ impl MatchScopeStore {
         if entities.contains_key(lead_id) {
             return Ok(lead_id.to_owned());
         }
-        let board = entities
-            .values()
-            .find(|entity| {
-                entity.get("kind").and_then(Value::as_str) == Some("board")
-                    && entity.pointer("/preset/key").and_then(Value::as_str) == Some("job-search")
-            })
-            .ok_or("No job-search board in workspace")?;
+        let board =
+            board_with_preset(entities, "job-search").ok_or("No job-search board in workspace")?;
         let bindings = board
             .pointer("/preset/bindings")
             .and_then(Value::as_object)
@@ -301,7 +315,7 @@ impl MatchScopeStore {
         )?;
         put_text(&mut document, &item, "body", body)?;
         document
-            .put(&item, "deleted", false)
+            .put(&item, "archivedAt", ScalarValue::Null)
             .map_err(|error| error.to_string())?;
         put_text(&mut document, &item, "createdAt", &now)?;
         put_text(&mut document, &item, "updatedAt", &now)?;
@@ -616,7 +630,7 @@ impl NativeScopeHost for MatchScopeStore {
         Ok(NativeScopeSnapshot {
             document: guard.state.document.clone(),
             authorization: Some(guard.state.authorization.clone()),
-            chat: Some(guard.state.chat.clone()),
+            chat: Some(contextual_chat_wire(&guard.state.chat)),
             mesh: Some(verified_mesh_for(&guard.state, &authority)?),
         })
     }
@@ -715,30 +729,12 @@ impl NativeScopeHost for MatchScopeStore {
 
     fn merge_mesh(&mut self, incoming: &Value) -> Result<(), String> {
         let catalog = validate_mesh_catalog(incoming.clone())?;
-        if !catalog.device_revocations.is_empty()
-            || !catalog.departures.is_empty()
-            || !catalog.revocations.is_empty()
-            || catalog
-                .ownership_transfers
-                .as_ref()
-                .is_some_and(|records| !records.is_empty())
-            || catalog.succession_policy.is_some()
-            || catalog
-                .succession_votes
-                .as_ref()
-                .is_some_and(|records| !records.is_empty())
-            || catalog
-                .succession_claims
-                .as_ref()
-                .is_some_and(|records| !records.is_empty())
-        {
-            return Err("Lighthouse cannot apply mesh authority changes yet".into());
-        }
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
         let authority = self.authority_cached(&mut guard)?;
+        catalog_authority_is_admitted(&catalog, &authority)?;
         let existing = guard
             .state
             .mesh
@@ -844,8 +840,91 @@ fn merge_records(existing: Option<&Vec<Value>>, incoming: &[Value]) -> Vec<Value
         .collect()
 }
 
+fn board_with_preset<'a>(
+    entities: &'a serde_json::Map<String, Value>,
+    preset: &str,
+) -> Option<&'a Value> {
+    entities.values().find(|entity| {
+        entity.get("kind").and_then(Value::as_str) == Some("board")
+            && entity.pointer("/preset/key").and_then(Value::as_str) == Some(preset)
+    })
+}
+
+/// Authorization control is admitted before mesh control. Accept redundant
+/// catalog authority only when every signed record is already in that verified
+/// authorization snapshot. An unknown record must wait for its proof frame.
+fn catalog_authority_is_admitted(
+    catalog: &MeshCatalog,
+    authority: &WorkspaceWriteAuthorizationSnapshot,
+) -> Result<(), String> {
+    let known =
+        |incoming: &[Value], saved: &[Value]| incoming.iter().all(|record| saved.contains(record));
+    let revocations = authority
+        .revocations
+        .iter()
+        .map(|record| serde_json::to_value(record).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let transfers = authority
+        .ownership_transfers
+        .iter()
+        .map(|record| serde_json::to_value(record).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let claims = authority
+        .succession_claims
+        .iter()
+        .map(|record| serde_json::to_value(record).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let devices_known = catalog.device_revocations.iter().all(|raw| {
+        serde_json::from_value::<SignedDeviceRevocation>(raw.clone()).is_ok_and(|incoming| {
+            authority
+                .device_revocations
+                .iter()
+                .any(|saved| saved.record == incoming.record)
+        })
+    });
+    let departures_known = catalog.departures.iter().all(|raw| {
+        serde_json::from_value::<SignedDeparture>(raw.clone()).is_ok_and(|incoming| {
+            authority
+                .departures
+                .iter()
+                .any(|saved| saved.record == incoming.record)
+        })
+    });
+    if !known(&catalog.revocations, &revocations)
+        || !known(
+            catalog.ownership_transfers.as_deref().unwrap_or_default(),
+            &transfers,
+        )
+        || !known(
+            catalog.succession_claims.as_deref().unwrap_or_default(),
+            &claims,
+        )
+        || !devices_known
+        || !departures_known
+        || catalog.succession_policy.is_some()
+        || catalog
+            .succession_votes
+            .as_ref()
+            .is_some_and(|votes| !votes.is_empty())
+    {
+        return Err("Mesh authority has not been admitted by signed authorization".into());
+    }
+    Ok(())
+}
+
 fn merge_chat(current: &Value, incoming: &Value) -> Result<Value, String> {
-    if incoming.get("version").and_then(Value::as_u64) != Some(1) {
+    let version = incoming.get("version").and_then(Value::as_u64);
+    if !matches!(version, Some(1) | Some(2))
+        || (version == Some(2)
+            && !incoming
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .is_some_and(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == Some("contextual-v2"))
+                }))
+    {
         return Err("Invalid chat batch".into());
     }
     if serde_json::to_vec(incoming)
@@ -894,8 +973,32 @@ fn merge_chat(current: &Value, incoming: &Value) -> Result<Value, String> {
         result.insert(field.into(), Value::Array(values));
     }
     result.insert("version".into(), json!(1));
+    result.insert("capabilities".into(), json!(["contextual-v2"]));
     result.insert("typing".into(), json!([]));
     Ok(Value::Object(result))
+}
+
+fn contextual_chat_wire(chat: &Value) -> Value {
+    let mut wire = chat.clone();
+    if let Some(object) = wire.as_object_mut() {
+        let has_contextual_record = object
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|record| {
+                    record
+                        .pointer("/signed/payload/version")
+                        .and_then(Value::as_u64)
+                        == Some(2)
+                })
+            });
+        object.insert(
+            "version".into(),
+            json!(if has_contextual_record { 2 } else { 1 }),
+        );
+        object.insert("capabilities".into(), json!(["contextual-v2"]));
+    }
+    wire
 }
 
 pub fn now_ms() -> Result<i128, String> {
@@ -914,6 +1017,87 @@ mod tests {
         WorkspaceChangeAuthorizationPayload, public_key_from_seed, public_key_id,
         sign_device_certificate, sign_json_envelope,
     };
+
+    #[test]
+    fn contextual_chat_wire_preserves_signed_context_and_advertises_support() {
+        let public_key = public_key_from_seed(&[1; 32]).unwrap();
+        let person_id = public_key_id(&public_key).unwrap();
+        let device_public_key = public_key_from_seed(&[2; 32]).unwrap();
+        let device_id = public_key_id(&device_public_key).unwrap();
+        let certificate = sign_device_certificate(
+            &[1; 32],
+            DeviceCertificatePayload {
+                kind: "device-certificate".into(),
+                version: 1,
+                person_id: person_id.clone(),
+                device_id: device_id.clone(),
+                device_public_key: device_public_key.clone(),
+                issuer_certificate_hash: None,
+                can_enroll_devices: true,
+            },
+            &person_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let signed_record = |version, id: &str, context: Option<Value>| {
+            let mut payload = json!({"kind":"chat-message", "version":version,
+                "workspaceId":"board", "personId":person_id, "deviceId":device_id,
+                "id":id, "createdAt":"2026-10-06T00:00:00.000Z", "text":"hello",
+                "revision":0});
+            if let Some(context) = context {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("context".into(), context);
+            }
+            json!({"signed": sign_json_envelope(&[2; 32], payload, &device_id,
+                DEFAULT_SIGNATURE_DOMAIN).unwrap(), "publicKey":public_key,
+                "certificates":[certificate], "authority":{"publicKey":public_key,
+                    "certificates":[certificate]}})
+        };
+        let contextual = signed_record(
+            2,
+            "message-2",
+            Some(json!({
+                "replyTo":"message-1", "references":[{"scopeId":"board", "recordId":"item-1"}]
+            })),
+        );
+        let plain = signed_record(1, "message-1", None);
+        let incoming = json!({"version": 2, "capabilities": ["contextual-v2"],
+            "messages": [plain, contextual], "profiles": [], "typing": []});
+        let merged = merge_chat(&empty_chat(), &incoming).unwrap();
+        assert_eq!(merged["messages"][0], plain);
+        assert_eq!(merged["messages"][1], contextual);
+        for record in merged["messages"].as_array().unwrap() {
+            let envelope: meta_mesh_core::SignedEnvelope<Value> =
+                serde_json::from_value(record["signed"].clone()).unwrap();
+            assert!(
+                meta_mesh_core::verify_signed_envelope(
+                    &envelope,
+                    &device_public_key,
+                    DEFAULT_SIGNATURE_DOMAIN
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(merged["capabilities"], json!(["contextual-v2"]));
+        let wire = contextual_chat_wire(&merged);
+        assert_eq!(wire["version"], 2);
+        assert_eq!(wire["messages"][1], contextual);
+        let legacy = merge_chat(
+            &empty_chat(),
+            &json!({"version": 1, "messages": [], "profiles": [], "typing": []}),
+        )
+        .unwrap();
+        assert_eq!(contextual_chat_wire(&legacy)["version"], 1);
+        assert!(
+            merge_chat(
+                &empty_chat(),
+                &json!({"version":2, "messages":[], "profiles":[], "typing":[]})
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn signed_document_survives_restart_but_unsigned_change_never_replaces_it() {
@@ -1144,6 +1328,48 @@ mod tests {
                 .merge_mesh(&json!({"version":1,"peers":[],"revocations":[{}]}))
                 .is_err()
         );
+        let revoked_at = time::OffsetDateTime::now_utc()
+            .format(
+                &time::format_description::parse_borrowed::<2>(
+                    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let heads = vec![document.get_heads()[0].to_string()];
+        let revocation = sign_json_envelope(
+            &[2; 32],
+            json!({"kind":"workspace-revocation","version":1,"workspaceId":"board",
+                "ownerPersonId":person_id,"personId":"former-member","epoch":2,
+                "workspaceHeads":heads,"revokedAt":revoked_at}),
+            &device_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let device_revocation = sign_json_envelope(
+            &[2; 32],
+            json!({"kind":"workspace-device-revocation","version":1,"workspaceId":"board",
+                "personId":"former-member","deviceId":"old-device",
+                "workspaceHeads":heads,"revokedAt":revoked_at}),
+            &device_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let mut updated_authority = evidence.clone();
+        updated_authority["revocations"] = json!([revocation]);
+        updated_authority["deviceRevocations"] = json!([{
+            "record": device_revocation, "signer": evidence["genesisOwner"]
+        }]);
+        store
+            .merge_authorization(&json!({"version":1,"records":[],"authority":updated_authority}))
+            .unwrap();
+        let admitted_catalog = json!({"version":1,"peers":[],"revocations":[revocation],
+            "deviceRevocations":[{"record":device_revocation,
+                "authority":evidence["genesisOwner"]}]});
+        store.merge_mesh(&admitted_catalog).unwrap();
+        let mut unseen = admitted_catalog;
+        unseen["revocations"][0]["signature"] = json!("unknown-signature");
+        assert!(store.merge_mesh(&unseen).is_err());
         let mut reopened =
             MatchScopeStore::open("board".into(), person_id, path.clone(), initial).unwrap();
         assert_eq!(reopened.snapshot().unwrap().document, candidate);

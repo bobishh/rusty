@@ -110,7 +110,8 @@ fn owner_views_and_handshakes_only_include_current_owners_boards() {
     let request_a: MeshHandshake = serde_json::from_value(json!({
         "workspaceId":"primary-board", "peer":keeper.owner.bundle("primary-board"),
         "revocations":[], "deviceRevocations":[], "departures":[],
-        "ownershipTransfers":[], "successionVotes":[], "successionClaims":[], "capabilities":[],
+        "ownershipTransfers":[], "successionVotes":[], "successionClaims":[],
+        "capabilities":["causal-write-admission-v1"],
     }))
     .unwrap();
     let (_, response_a) = host.prepare_handshake("primary-board", &request_a).unwrap();
@@ -119,7 +120,8 @@ fn owner_views_and_handshakes_only_include_current_owners_boards() {
     let request_b: MeshHandshake = serde_json::from_value(json!({
         "workspaceId":"b-board", "peer":owner_b.bundle("b-board"),
         "revocations":[], "deviceRevocations":[], "departures":[],
-        "ownershipTransfers":[], "successionVotes":[], "successionClaims":[], "capabilities":[],
+        "ownershipTransfers":[], "successionVotes":[], "successionClaims":[],
+        "capabilities":["causal-write-admission-v1"],
     }))
     .unwrap();
     let (_, response_b) = host.prepare_handshake("b-board", &request_b).unwrap();

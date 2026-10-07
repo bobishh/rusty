@@ -13,12 +13,21 @@ use tokio::sync::Mutex;
 
 mod app;
 mod controllers;
+mod cors_settings;
 mod http;
 mod join;
 mod keeper;
 mod pairing;
 mod provisioning;
 mod replication;
+mod reset;
+
+fn keeper_display_name(name: Option<&str>) -> &str {
+    match name {
+        None | Some("Lighthouse" | "mesh-lighthouse") => "Rusty",
+        Some(name) => name,
+    }
+}
 
 #[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +47,8 @@ pub(crate) struct Config {
     pub(crate) device_seed: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) additional_scopes: Vec<Config>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) primary_detached: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) controller_person_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -100,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.next().is_some() {
         return Err("Too many arguments".into());
     }
+    reset::apply_pending(std::path::Path::new(&path))?;
     let config: Config = serde_json::from_slice(&fs::read(&path)?)?;
     let discovery = match std::env::var("LIGHTHOUSE_PUBLIC_ORIGIN") {
         Ok(origin) => {
@@ -157,6 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let service = Arc::new(Mutex::new(NativeScopeService::new(host.clone())));
     let runtime_overview = replication::RuntimeOverview::default();
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let mut lead_worker = None;
+    let mut http_worker = None;
     if let Ok(bind) = std::env::var("LIGHTHOUSE_HTTP_BIND") {
         let directory = config
             .state_path
@@ -165,43 +179,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .to_path_buf();
         let address: SocketAddr = bind.parse()?;
         let (lead_sender, mut lead_receiver) = tokio::sync::mpsc::channel::<http::LeadRequest>(16);
-        let (mut lead_store, lead_peer) = host.primary_store()?;
+        let intake_host = host.clone();
         let lead_seed = device_seed;
-        tokio::spawn(async move {
+        lead_worker = Some(tokio::spawn(async move {
             while let Some(request) = lead_receiver.recv().await {
-                let store = &mut lead_store;
-                let result = store
-                    .create_chat_message(
-                        &lead_peer,
-                        &lead_seed,
-                        &request.lead_id,
-                        &format!("New lead\n\n{}\n\n{}", request.body, request.verdict),
-                    )
-                    .and_then(|_| {
-                        if request.create_card {
-                            store
-                                .create_lead(
-                                    &lead_peer,
-                                    &lead_seed,
-                                    LeadDraft {
-                                        id: &request.lead_id,
-                                        company: &request.company,
-                                        role: &request.role,
-                                        job_url: &request.job_url,
-                                        body: &request.body,
-                                    },
-                                )
-                                .map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    });
+                let result = intake_host.intake_store().and_then(|target| {
+                    let (_, mut store, lead_peer) =
+                        target.ok_or("No job-search board in keeper scopes")?;
+                    store
+                        .create_chat_message(
+                            &lead_peer,
+                            &lead_seed,
+                            &request.lead_id,
+                            &format!("New lead\n\n{}\n\n{}", request.body, request.verdict),
+                        )
+                        .and_then(|_| {
+                            if request.create_card {
+                                store
+                                    .create_lead(
+                                        &lead_peer,
+                                        &lead_seed,
+                                        LeadDraft {
+                                            id: &request.lead_id,
+                                            company: &request.company,
+                                            role: &request.role,
+                                            job_url: &request.job_url,
+                                            body: &request.body,
+                                        },
+                                    )
+                                    .map(Some)
+                            } else {
+                                Ok(None)
+                            }
+                        })
+                });
                 let _ = request.response.send(result);
             }
-        });
+        }));
         let http_host = host.clone();
         let http_runtime = runtime_overview.clone();
-        tokio::spawn(async move {
+        http_worker = Some(tokio::spawn(async move {
             match http::serve(
                 directory,
                 address,
@@ -218,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 Err(error) => eprintln!("Lighthouse HTTP: {error}"),
             }
-        });
+        }));
     } else {
         drop(discovery);
         drop(shutdown_sender);
@@ -262,6 +279,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shutdown_receiver,
     )
     .await;
+    // HTTP owns discovery/provisioning (and its Node Arc). Join it before
+    // closing the node so SIGTERM cannot race the server task's final drops.
+    if let Some(worker) = http_worker {
+        let _ = worker.await;
+    }
+    // HTTP shutdown aborts its inbox processor, which drops the sender and
+    // lets this worker finish any in-flight durable write before node close.
+    if let Some(worker) = lead_worker {
+        let _ = worker.await;
+    }
     incoming.abort();
     let _ = incoming.await;
     // Worker cancellation finishes synchronous atomic store writes before releasing the node.
@@ -321,7 +348,7 @@ fn refresh_route(
         .map_err(|error| error.to_string())?;
     payload["issuedAt"] = Value::String(issued_at);
     payload["routeSequence"] = Value::from(sequence);
-    payload["deviceName"] = Value::String("Lighthouse".into());
+    payload["deviceName"] = Value::String("Rusty".into());
     payload["userAgent"] =
         Value::String(concat!("mesh-lighthouse/", env!("CARGO_PKG_VERSION")).into());
     let signed = serde_json::to_value(sign_json_envelope(

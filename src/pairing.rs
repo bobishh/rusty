@@ -90,6 +90,8 @@ pub struct ProvisionedScope {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
 }
 
 pub struct ProvisionRequest {
@@ -624,6 +626,7 @@ impl PairingService {
                         workspace_id: workspace_id.clone(),
                         status: "pending".into(),
                         error: None,
+                        error_detail: None,
                     })
                     .collect(),
             });
@@ -721,6 +724,7 @@ impl PairingService {
         for scope in &mut provisioning.scopes {
             scope.status = "active".into();
             scope.error = None;
+            scope.error_detail = None;
         }
         self.persist(&next)?;
         *state = next;
@@ -804,6 +808,19 @@ impl PairingService {
             "controllerApproved":record.controller_approved, "status":status,
             "provisioning":provisioning, "issuedAt":now,
         }), &self.service_device_id, CONTROL_DOMAIN).map_err(|_| PairingError::Unavailable)
+    }
+
+    pub fn authorize_reset(
+        &self,
+        cookie: &str,
+        csrf: &str,
+        secret: &str,
+    ) -> Result<(), PairingError> {
+        self.require_operator(cookie, Some(csrf))?;
+        if !constant_time_eq(secret.as_bytes(), self.admin_secret.as_bytes()) {
+            return Err(PairingError::Forbidden);
+        }
+        Ok(())
     }
 
     pub fn login(&self, secret: &str) -> Result<(String, String), PairingError> {
@@ -1047,6 +1064,20 @@ impl PairingService {
             return Err(PairingError::Forbidden);
         }
         Ok(())
+    }
+
+    pub fn mutation_owner(&self, cookie: &str, csrf: &str) -> Result<Option<String>, PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        self.require_session(&mut state, cookie, Some(csrf))?;
+        let session = state.sessions.get(cookie).ok_or(PairingError::Forbidden)?;
+        if session.operator {
+            return Ok(None);
+        }
+        session
+            .person_id
+            .clone()
+            .map(Some)
+            .ok_or(PairingError::Forbidden)
     }
 
     pub fn fingerprint(public_key: &str) -> String {

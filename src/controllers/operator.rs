@@ -24,7 +24,29 @@ pub(crate) fn routes() -> Routes {
         .add("/logout", post(logout))
         .add("/pairings", get(pairings))
         .add("/overview", get(overview))
+        .add("/reset", post(reset))
+        .add(
+            "/settings/cors",
+            get(cors_settings).post(update_cors_settings),
+        )
         .add("/pairings/{id}/decision", post(decision))
+        .add("/boards/{id}/unsubscribe", post(unsubscribe))
+}
+
+async fn reset(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<LoginRequest>,
+) -> impl IntoResponse {
+    http::admin_reset(state, headers, input).await
+}
+
+async fn unsubscribe(
+    SharedStore(state): SharedStore<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    http::admin_unsubscribe(state, id, headers).await
 }
 
 async fn login(
@@ -83,4 +105,19 @@ async fn overview(
             ErrorDetail::new(error.code(), error.message()),
         )
     })
+}
+
+async fn cors_settings(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    http::admin_cors_settings(state, headers).await
+}
+
+async fn update_cors_settings(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<http::CorsSettingsInput>,
+) -> impl IntoResponse {
+    http::update_admin_cors_settings(state, headers, input).await
 }

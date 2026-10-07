@@ -102,6 +102,7 @@ fn active_scopes(workspace_ids: Vec<String>) -> Vec<ProvisionedScope> {
             workspace_id,
             status: "active".into(),
             error: None,
+            error_detail: None,
         })
         .collect()
 }

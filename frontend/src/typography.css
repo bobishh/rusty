@@ -1,0 +1,26 @@
+/* Rusty font overrides. Components and primitive paint remain shared. */
+:root {
+  --site-font-sans: "Fira Code", ui-monospace, monospace;
+}
+
+body, button, input, select, textarea {
+  font-family: "Fira Code", ui-monospace, monospace;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: "Caveat", cursive;
+}
+
+.keeper-admin .topbar > .brand > .rusty-mark {
+  flex: 0 0 64px;
+  width: 64px;
+  height: 80px;
+}
+
+@media (max-width: 600px) {
+  .keeper-admin .topbar > .brand > .rusty-mark {
+    flex-basis: 52px;
+    width: 52px;
+    height: 65px;
+  }
+}
