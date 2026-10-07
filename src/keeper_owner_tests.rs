@@ -8,6 +8,7 @@ fn provision_commit(
 ) -> ProvisioningCommit {
     ProvisioningCommit {
         pairing_id: format!("pairing-{}", owner.person_id),
+        integration_id: format!("test-integration-{}", owner.person_id),
         operation_id: format!("operation-{}", owner.person_id),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),
@@ -31,6 +32,18 @@ fn owner_offer(owner: &Identity, workspace_id: &str) -> Value {
             "peers": [],
         },
         "workspace": {"id": workspace_id},
+    })
+}
+
+fn complete_owner_offer(owner: &Identity, keeper: &Identity, workspace_id: &str) -> Value {
+    let fixture = super::fixture(owner, keeper, workspace_id);
+    json!({
+        "version": 1,
+        "controllerPersonId": owner.person_id,
+        "workspaceId": fixture.invitation.workspace_id,
+        "grant": fixture.grant,
+        "envelope": fixture.envelope,
+        "workspace": fixture.entry,
     })
 }
 
@@ -268,6 +281,49 @@ fn future_policy_off_isolated_to_owner_b() {
 }
 
 #[test]
+fn future_board_offer_accepts_owner_signed_editor_grant_only_when_enabled() {
+    let (keeper, _) = two_owner_keeper(true);
+    let peer = keeper.peer(&keeper.owner, "primary-board");
+    let mut offer = complete_owner_offer(&keeper.owner, &keeper.keeper, "future-board");
+    offer["workspace"]["authorization"] = json!({
+        "kind": "workspace-authorization-manifest",
+        "version": 2,
+        "workspaceId": "future-board",
+    });
+    let mut host = keeper.host.clone();
+    let mut scope = host.open_scope(&peer).unwrap();
+
+    assert!(
+        scope
+            .prepare_owner_offer(&offer.to_string().into_bytes())
+            .unwrap()
+            .is_some()
+    );
+
+    let (disabled_keeper, disabled_owner) = two_owner_keeper(false);
+    let disabled_peer = disabled_keeper.peer(&disabled_owner, "b-board");
+    let mut disabled_offer = complete_owner_offer(
+        &disabled_owner,
+        &disabled_keeper.keeper,
+        "future-board-disabled",
+    );
+    disabled_offer["workspace"]["authorization"] = json!({
+        "kind": "workspace-authorization-manifest",
+        "version": 2,
+        "workspaceId": "future-board-disabled",
+    });
+    let mut disabled_host = disabled_keeper.host.clone();
+    let mut disabled_scope = disabled_host.open_scope(&disabled_peer).unwrap();
+    assert!(
+        disabled_scope
+            .prepare_owner_offer(&disabled_offer.to_string().into_bytes())
+            .err()
+            .expect("disabled future policy must reject offer")
+            .contains("not authorized")
+    );
+}
+
+#[test]
 fn mixed_owner_activation_is_rejected_without_config_or_scope_changes() {
     let keeper = TestKeeper::new();
     let owner_b = Identity::new(41, 42, 43);
@@ -289,6 +345,7 @@ fn mixed_owner_activation_is_rejected_without_config_or_scope_changes() {
     let before = keeper.host.configuration().unwrap();
     let commit = ProvisioningCommit {
         pairing_id: "mixed-owner-pairing".into(),
+        integration_id: "test-integration".into(),
         operation_id: "mixed-owner-operation".into(),
         transcript_hash: "mixed-owner-transcript".into(),
         invitation_id: "mixed-owner-invitation".into(),
@@ -585,6 +642,7 @@ async fn real_http_owner_sessions_filter_pairings_boards_replication_and_trigger
 fn provision_commit_from_ids(workspace_ids: &[&str], future_boards: bool) -> ProvisioningCommit {
     ProvisioningCommit {
         pairing_id: "pairing-owner-a".into(),
+        integration_id: "test-integration".into(),
         operation_id: "operation-owner-a".into(),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),

@@ -2,7 +2,11 @@ use std::sync::Arc;
 
 use meta_mesh_native::NativeNode;
 
-use crate::{Config, ProvisioningCommit, join, keeper::KeeperHost, pairing::ProvisionedScope};
+use crate::{
+    Config, ProvisioningCommit, join,
+    keeper::{KeeperHost, ProvisioningLifecycleStatus},
+    pairing::{IntegrationCandidate, ProvisionedScope, VerifiedDisconnectRequest},
+};
 
 #[derive(Clone)]
 pub(crate) struct ProvisioningService {
@@ -22,8 +26,32 @@ impl ProvisioningService {
         self.host.provisioning_commit(pairing_id)
     }
 
+    pub(crate) fn durable_lifecycle_status(
+        &self,
+        pairing_id: &str,
+    ) -> Result<Option<ProvisioningLifecycleStatus>, String> {
+        self.host.provisioning_lifecycle_status(pairing_id)
+    }
+
+    pub(crate) fn integration_status(
+        &self,
+        candidates: &[IntegrationCandidate],
+        controller_person_id: &str,
+    ) -> Result<(u64, Vec<serde_json::Value>), String> {
+        self.host
+            .integration_status(candidates, controller_person_id)
+    }
+
+    pub(crate) fn disconnect_integration(
+        &self,
+        request: &VerifiedDisconnectRequest,
+    ) -> Result<serde_json::Value, String> {
+        self.host.disconnect_integration(request)
+    }
+
     pub(crate) async fn provision(
         &self,
+        integration_id: &str,
         pairing_id: &str,
         operation_id: &str,
         transcript_hash: &str,
@@ -35,6 +63,7 @@ impl ProvisioningService {
         let controller_person_id = invitation.issuer_person_id.clone();
         let expected_commit = ProvisioningCommit {
             pairing_id: pairing_id.into(),
+            integration_id: integration_id.into(),
             operation_id: operation_id.into(),
             transcript_hash: transcript_hash.into(),
             invitation_id: invitation_id.clone(),
@@ -45,6 +74,7 @@ impl ProvisioningService {
         };
         if let Some(previous) = self.host.provisioning_commit(pairing_id)? {
             if previous.pairing_id != expected_commit.pairing_id
+                || previous.integration_id != expected_commit.integration_id
                 || previous.operation_id != expected_commit.operation_id
                 || previous.transcript_hash != expected_commit.transcript_hash
                 || previous.invitation_id != expected_commit.invitation_id
@@ -70,6 +100,7 @@ impl ProvisioningService {
         let result = join::provision_existing_identity(
             invitation,
             &workspace_ids,
+            integration_id,
             pairing_id,
             operation_id,
             transcript_hash,

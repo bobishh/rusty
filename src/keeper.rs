@@ -21,7 +21,11 @@ use meta_mesh_native::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{Config, ProvisioningCommit, join};
+use crate::{
+    Config, DisconnectOperation, IntegrationRecord, IntegrationScope, ProvisioningCommit,
+    ScopeTombstone, join,
+    pairing::{IntegrationCandidate, VerifiedDisconnectRequest},
+};
 
 pub(crate) struct Registry {
     config: Config,
@@ -35,8 +39,53 @@ pub(crate) struct KeeperHost {
     registry: Arc<Mutex<Registry>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProvisioningLifecycleStatus {
+    Active,
+    PendingCleanup,
+    Detached,
+}
+
 fn current_owner(scope: &MatchLighthouseHost) -> Result<String, String> {
     Ok(scope.store.authority()?.expected_current_owner.person_id)
+}
+
+fn scope_grant_epoch(config: &Config) -> Result<u64, String> {
+    let peer = &config.local_handshake.peer;
+    let grant = peer
+        .get("grant")
+        .ok_or("Missing signed integration workspace grant")?;
+    if grant.pointer("/payload/role").and_then(Value::as_str) != Some("editor") {
+        return Err("Keeper integration requires a signed editor grant".into());
+    }
+    let epoch = grant
+        .pointer("/payload/accessEpoch")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    if epoch == 0 {
+        return Err("Invalid integration grant epoch".into());
+    }
+    Ok(epoch)
+}
+
+fn scope_epoch_for_legacy_removal(config: &Config) -> u64 {
+    config
+        .local_handshake
+        .peer
+        .pointer("/grant/payload/accessEpoch")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn service_person_id(config: &Config) -> Result<String, String> {
+    config
+        .local_handshake
+        .peer
+        .pointer("/advertisement/payload/personId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "Missing configured service person".into())
 }
 
 fn owner_workspace_ids(registry: &Registry, owner_person_id: &str) -> Result<Vec<String>, String> {
@@ -67,6 +116,14 @@ fn owner_follows_future_boards(registry: &Registry, owner_person_id: &str) -> Re
             Ok(original_owner == Some(owner_person_id))
         },
     )?;
+    if let Some(integration) = registry
+        .config
+        .integrations
+        .iter()
+        .find(|integration| integration.controller_person_id == owner_person_id)
+    {
+        return Ok(has_current_board && integration.future_boards);
+    }
     Ok(future_policy_matches_owner(
         owner_person_id,
         has_current_board,
@@ -141,7 +198,7 @@ impl KeeperHost {
         }
         let mut scopes = BTreeMap::new();
         for scope in std::iter::once(&config).chain(config.additional_scopes.iter()) {
-            if scope.primary_detached {
+            if scope.primary_detached || scope_has_pending_removal(&config, &scope.workspace_id) {
                 continue;
             }
             if scope.device_id != config.device_id
@@ -164,14 +221,38 @@ impl KeeperHost {
                 return Err("Duplicate keeper scope".into());
             }
         }
-        Ok(Self {
+        let host = Self {
             device_id: config.device_id.clone(),
             registry: Arc::new(Mutex::new(Registry {
                 config,
                 config_path,
                 scopes,
             })),
-        })
+        };
+        host.retry_pending_disconnects();
+        Ok(host)
+    }
+
+    fn retry_pending_disconnects(&self) {
+        let Ok(mut registry) = self.registry.lock() else {
+            return;
+        };
+        let pending = registry
+            .config
+            .integrations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                record
+                    .pending_disconnect
+                    .as_ref()
+                    .is_some_and(|operation| operation.status == "pending")
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in pending {
+            let _ = finish_disconnect_cleanup(&mut registry, index);
+        }
     }
 
     pub(crate) fn scopes(&self) -> Result<Vec<(String, String, Vec<String>)>, String> {
@@ -244,8 +325,7 @@ impl KeeperHost {
         crate::reset::request(&registry.config_path)
     }
 
-    /// Persist subscription removal before exposing it to the replication scheduler.
-    /// Keep service keys and the disconnected files for operator recovery.
+    /// Persist a scope tombstone before detaching routes and removing its stored replica.
     pub(crate) fn unsubscribe(
         &self,
         workspace_id: &str,
@@ -255,38 +335,116 @@ impl KeeperHost {
             .registry
             .lock()
             .map_err(|_| "Keeper registry lock poisoned")?;
-        let scope = registry
-            .scopes
-            .get(workspace_id)
-            .ok_or("Board is not attached")?;
+        let Some(scope) = registry.scopes.get(workspace_id) else {
+            let pending = registry
+                .config
+                .integrations
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| {
+                    owner.is_none_or(|owner| record.controller_person_id == owner)
+                })
+                .filter(|(_, record)| {
+                    record.pending_disconnect.as_ref().is_some_and(|operation| {
+                        operation.status == "pending"
+                            && operation.operation_id.starts_with("local-")
+                            && operation.workspace_ids == [workspace_id]
+                            && record.tombstones.iter().any(|tombstone| {
+                                tombstone.workspace_id == workspace_id
+                                    && tombstone.operation_id == operation.operation_id
+                            })
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            return match pending.as_slice() {
+                [index] => finish_disconnect_cleanup(&mut registry, *index),
+                [] => Err("Board is not attached".into()),
+                _ => Err("Multiple local removals are pending for this board".into()),
+            };
+        };
         let scope_owner = current_owner(scope)?;
         if owner.is_some_and(|owner| owner != scope_owner) {
             return Err("Board belongs to another owner".into());
         }
+        let service_id = service_person_id(&registry.config)?;
+        let integration_id = crate::integration_id(&scope_owner, &service_id);
+        let scope_config = configured_scope(&registry.config, workspace_id)
+            .cloned()
+            .ok_or("Missing configured board")?;
         let mut next = registry.config.clone();
-        next.additional_scopes
-            .retain(|scope| scope.workspace_id != workspace_id);
-        if next.workspace_id == workspace_id {
-            next.primary_detached = true;
-            next.initial_state.document.clear();
-            next.initial_state.authorization = Value::Null;
-            next.initial_state.chat =
-                json!({"version": 1, "messages": [], "profiles": [], "typing": []});
-            next.initial_state.mesh = None;
-            next.transport_secret.clear();
-            next.controller_person_id = None;
+        let index = match next
+            .integrations
+            .iter()
+            .position(|record| record.integration_id == integration_id)
+        {
+            Some(index) => index,
+            None => {
+                next.integrations.push(IntegrationRecord {
+                    integration_id: integration_id.clone(),
+                    controller_person_id: scope_owner.clone(),
+                    service_person_id: service_id,
+                    revision: 0,
+                    future_boards: false,
+                    scopes: Vec::new(),
+                    tombstones: Vec::new(),
+                    pending_disconnect: None,
+                    disconnect_history: Vec::new(),
+                });
+                next.integrations.len() - 1
+            }
+        };
+        let record = &mut next.integrations[index];
+        if record.controller_person_id != scope_owner {
+            return Err("Integration belongs to another owner".into());
         }
-        // Removing one board also ends the prior owner's future-board subscription.
-        // A fresh dual approval is required to enable that policy again.
-        next.provisioning_commits.retain(|commit| {
-            !commit.workspace_ids.iter().any(|id| id == workspace_id)
-                && commit.controller_person_id.as_deref() != Some(scope_owner.as_str())
-        });
-        let bytes = serde_json::to_vec(&next).map_err(|error| error.to_string())?;
-        FileScopeStore::new(&registry.config_path).write_validated(&bytes, None, |_, _| Ok(()))?;
+        if record.pending_disconnect.as_ref().is_some_and(|operation| {
+            operation.status == "pending"
+                && !operation.workspace_ids.iter().any(|id| id == workspace_id)
+        }) {
+            return Err("Another scope removal is pending for this integration".into());
+        }
+        if record.pending_disconnect.is_none() {
+            let expected_revision = record.revision;
+            let operation_id = format!("local-{}", random_operation_id());
+            let request_hash = disconnect_request_hash(
+                &integration_id,
+                &operation_id,
+                expected_revision,
+                &[workspace_id.to_owned()],
+                &[scope_epoch_for_legacy_removal(&scope_config)],
+            );
+            record
+                .scopes
+                .retain(|item| item.workspace_id != workspace_id);
+            record
+                .tombstones
+                .retain(|item| item.workspace_id != workspace_id);
+            record.tombstones.push(ScopeTombstone {
+                workspace_id: workspace_id.to_owned(),
+                grant_epoch: scope_epoch_for_legacy_removal(&scope_config),
+                operation_id: operation_id.clone(),
+            });
+            record.pending_disconnect = Some(DisconnectOperation {
+                operation_id,
+                request_hash,
+                expected_revision,
+                workspace_ids: vec![workspace_id.to_owned()],
+                status: "pending".into(),
+            });
+            record.future_boards = false;
+            record.revision = record.revision.saturating_add(1);
+        }
+        persist_config(&registry.config_path, &next)?;
         registry.config = next;
         registry.scopes.remove(workspace_id);
-        Ok(())
+        let integration_index = registry
+            .config
+            .integrations
+            .iter()
+            .position(|record| record.integration_id == integration_id)
+            .ok_or("Missing integration lifecycle")?;
+        finish_disconnect_cleanup(&mut registry, integration_index)
     }
 
     pub(crate) fn admin_overview(&self) -> Result<Value, String> {
@@ -364,6 +522,341 @@ impl KeeperHost {
             .iter()
             .find(|commit| commit.pairing_id == pairing_id)
             .cloned())
+    }
+
+    pub(crate) fn provisioning_lifecycle_status(
+        &self,
+        pairing_id: &str,
+    ) -> Result<Option<ProvisioningLifecycleStatus>, String> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        let Some(commit) = registry
+            .config
+            .provisioning_commits
+            .iter()
+            .find(|commit| commit.pairing_id == pairing_id)
+        else {
+            return Ok(None);
+        };
+        if commit.workspace_ids.is_empty() {
+            return Ok(Some(ProvisioningLifecycleStatus::Detached));
+        }
+        let controller = commit
+            .controller_person_id
+            .as_deref()
+            .or(registry.config.controller_person_id.as_deref());
+        let service = service_person_id(&registry.config)?;
+        let integration_id = if commit.integration_id.is_empty() {
+            controller.map(|owner| crate::integration_id(owner, &service))
+        } else {
+            Some(commit.integration_id.clone())
+        };
+        let Some(integration) = integration_id.and_then(|id| {
+            registry
+                .config
+                .integrations
+                .iter()
+                .find(|record| record.integration_id == id)
+        }) else {
+            return Ok(Some(ProvisioningLifecycleStatus::Detached));
+        };
+        let mut pending_cleanup = false;
+        for workspace_id in &commit.workspace_ids {
+            let active = integration.scopes.iter().any(|scope| {
+                scope.workspace_id == *workspace_id
+                    && scope.state == "active"
+                    && scope.activation_operation_id == commit.operation_id
+            }) && registry
+                .scopes
+                .get(workspace_id)
+                .is_some_and(|scope| current_owner(scope).ok().as_deref() == controller);
+            if active {
+                continue;
+            }
+            let pending = integration
+                .pending_disconnect
+                .as_ref()
+                .is_some_and(|operation| {
+                    operation.status == "pending"
+                        && operation.workspace_ids.iter().any(|id| id == workspace_id)
+                        && integration.tombstones.iter().any(|tombstone| {
+                            tombstone.workspace_id == *workspace_id
+                                && tombstone.operation_id == operation.operation_id
+                        })
+                });
+            if pending {
+                pending_cleanup = true;
+            } else {
+                return Ok(Some(ProvisioningLifecycleStatus::Detached));
+            }
+        }
+        Ok(Some(if pending_cleanup {
+            ProvisioningLifecycleStatus::PendingCleanup
+        } else {
+            ProvisioningLifecycleStatus::Active
+        }))
+    }
+
+    pub(crate) fn integration_status(
+        &self,
+        candidates: &[IntegrationCandidate],
+        controller_person_id: &str,
+    ) -> Result<(u64, Vec<Value>), String> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        let service_id = service_person_id(&registry.config)?;
+        let pending_for_owner = registry
+            .config
+            .integrations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                (record.controller_person_id == controller_person_id
+                    && record
+                        .pending_disconnect
+                        .as_ref()
+                        .is_some_and(|operation| operation.status == "pending"))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in pending_for_owner {
+            let _ = finish_disconnect_cleanup(&mut registry, index);
+        }
+        let canonical_integration_id = crate::integration_id(controller_person_id, &service_id);
+        let mut changed = false;
+        for candidate in candidates {
+            if candidate.controller_person_id != controller_person_id {
+                continue;
+            }
+            if registry
+                .config
+                .integrations
+                .iter()
+                .any(|record| record.integration_id == canonical_integration_id)
+            {
+                continue;
+            }
+            let commit = registry
+                .config
+                .provisioning_commits
+                .iter()
+                .find(|commit| commit.pairing_id == candidate.pairing_id)
+                .cloned()
+                .ok_or("Pairing has no verified durable scope activation")?;
+            if commit
+                .controller_person_id
+                .as_deref()
+                .is_some_and(|owner| owner != controller_person_id)
+                || commit.workspace_ids.is_empty()
+            {
+                return Err("Pairing activation does not match the requested owner".into());
+            }
+            let legacy_record_index = registry.config.integrations.iter().position(|record| {
+                record.controller_person_id == controller_person_id
+                    && record.service_person_id == service_id
+                    && (record.scopes.iter().any(|scope| {
+                        commit
+                            .workspace_ids
+                            .iter()
+                            .any(|id| id == &scope.workspace_id)
+                    }) || record.tombstones.iter().any(|tombstone| {
+                        commit
+                            .workspace_ids
+                            .iter()
+                            .any(|id| id == &tombstone.workspace_id)
+                    }))
+            });
+            if let Some(index) = legacy_record_index {
+                let record = &mut registry.config.integrations[index];
+                if record.integration_id != canonical_integration_id {
+                    record.integration_id = canonical_integration_id.clone();
+                    changed = true;
+                }
+                continue;
+            }
+            let mut scopes = Vec::new();
+            let mut tombstones = Vec::new();
+            for workspace_id in &commit.workspace_ids {
+                let configured = configured_scope(&registry.config, workspace_id);
+                if let Some(configured) = configured.filter(|scope| !scope.primary_detached) {
+                    let host = scope_host(configured)?;
+                    if current_owner(&host)? != controller_person_id {
+                        return Err(
+                            "Pairing activation scope is not owned by the controller".into()
+                        );
+                    }
+                    scopes.push(IntegrationScope {
+                        workspace_id: workspace_id.clone(),
+                        grant_epoch: scope_epoch_for_legacy_removal(configured),
+                        state: "active".into(),
+                        activation_operation_id: commit.operation_id.clone(),
+                    });
+                } else {
+                    // A historical durable activation with no configured scope is detached,
+                    // never an instruction to scan storage or reconstruct its old authority.
+                    tombstones.push(ScopeTombstone {
+                        workspace_id: workspace_id.clone(),
+                        grant_epoch: 1,
+                        operation_id: format!("legacy-{}", commit.operation_id),
+                    });
+                }
+            }
+            let future_boards =
+                candidate.future_boards && commit.future_boards && !scopes.is_empty();
+            registry.config.integrations.push(IntegrationRecord {
+                integration_id: canonical_integration_id.clone(),
+                controller_person_id: controller_person_id.to_owned(),
+                service_person_id: service_id.clone(),
+                revision: 1,
+                future_boards,
+                scopes,
+                tombstones,
+                pending_disconnect: None,
+                disconnect_history: Vec::new(),
+            });
+            changed = true;
+        }
+        if changed {
+            persist_config(&registry.config_path, &registry.config)?;
+        }
+        let values = registry
+            .config
+            .integrations
+            .iter()
+            .filter(|record| {
+                record.controller_person_id == controller_person_id
+                    && record.service_person_id == service_id
+            })
+            .map(integration_status_value)
+            .collect::<Vec<_>>();
+        let revision = values
+            .iter()
+            .filter_map(|value| value["revision"].as_u64())
+            .max()
+            .unwrap_or(0);
+        Ok((revision, values))
+    }
+
+    pub(crate) fn disconnect_integration(
+        &self,
+        request: &VerifiedDisconnectRequest,
+    ) -> Result<Value, String> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        let index = registry
+            .config
+            .integrations
+            .iter()
+            .position(|record| record.integration_id == request.integration_id)
+            .ok_or("Unknown integration")?;
+        let current = registry.config.integrations[index].clone();
+        if current.controller_person_id != request.controller_person_id
+            || current.service_person_id != service_person_id(&registry.config)?
+        {
+            return Err("Integration owner or service binding mismatch".into());
+        }
+        if let Some(completed) = current
+            .disconnect_history
+            .iter()
+            .find(|operation| operation.operation_id == request.operation_id)
+        {
+            if completed.request_hash != request.request_hash {
+                return Err("Disconnect operation ID was reused with different intent".into());
+            }
+            return Ok(disconnect_receipt_value(request, completed, &current));
+        }
+        if let Some(pending) = &current.pending_disconnect {
+            if pending.operation_id != request.operation_id
+                || pending.request_hash != request.request_hash
+            {
+                return Err("Another disconnect operation is pending".into());
+            }
+        } else {
+            if current.revision != request.expected_revision {
+                return Err("Integration revision changed".into());
+            }
+            let requested_ids = request
+                .scopes
+                .iter()
+                .map(|(workspace_id, _)| workspace_id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            for (workspace_id, expected_epoch) in &request.scopes {
+                let active = current
+                    .scopes
+                    .iter()
+                    .find(|scope| scope.workspace_id == *workspace_id && scope.state == "active")
+                    .ok_or("Disconnect scope is not active")?;
+                if active.grant_epoch != *expected_epoch {
+                    return Err("Disconnect grant epoch changed".into());
+                }
+                if configured_scope(&registry.config, workspace_id).is_none() {
+                    return Err("Disconnect scope is not configured".into());
+                }
+                let host = registry
+                    .scopes
+                    .get(workspace_id)
+                    .ok_or("Disconnect scope is not currently routable")?;
+                if current_owner(host)? != request.controller_person_id {
+                    return Err(
+                        "Disconnect scope is not owned by the authenticated controller".into(),
+                    );
+                }
+            }
+            if requested_ids.len() != request.scopes.len() {
+                return Err("Duplicate disconnect scope".into());
+            }
+            let record = &mut registry.config.integrations[index];
+            for (workspace_id, grant_epoch) in &request.scopes {
+                record
+                    .scopes
+                    .retain(|scope| scope.workspace_id != *workspace_id);
+                record
+                    .tombstones
+                    .retain(|scope| scope.workspace_id != *workspace_id);
+                record.tombstones.push(ScopeTombstone {
+                    workspace_id: workspace_id.clone(),
+                    grant_epoch: *grant_epoch,
+                    operation_id: request.operation_id.clone(),
+                });
+            }
+            record.pending_disconnect = Some(DisconnectOperation {
+                operation_id: request.operation_id.clone(),
+                request_hash: request.request_hash.clone(),
+                expected_revision: request.expected_revision,
+                workspace_ids: requested_ids.into_iter().map(str::to_owned).collect(),
+                status: "pending".into(),
+            });
+            record.future_boards = false;
+            record.revision = record.revision.saturating_add(1);
+            let next = registry.config.clone();
+            persist_config(&registry.config_path, &next)?;
+            registry.config = next;
+            for (workspace_id, _) in &request.scopes {
+                registry.scopes.remove(workspace_id);
+            }
+        }
+        let cleanup = finish_disconnect_cleanup(&mut registry, index);
+        let record = &registry.config.integrations[index];
+        let operation = record
+            .pending_disconnect
+            .as_ref()
+            .or_else(|| {
+                record
+                    .disconnect_history
+                    .iter()
+                    .find(|item| item.operation_id == request.operation_id)
+            })
+            .ok_or("Disconnect operation was not recorded")?;
+        if cleanup.is_err() && operation.status != "pending" {
+            return Err("Disconnect cleanup state is inconsistent".into());
+        }
+        Ok(disconnect_receipt_value(request, operation, record))
     }
 
     /// Make fully staged scopes visible in one durable config replacement.
@@ -475,14 +968,20 @@ impl KeeperHost {
             if next.primary_detached && scope.workspace_id == next.workspace_id {
                 let additional = std::mem::take(&mut next.additional_scopes);
                 let commits = std::mem::take(&mut next.provisioning_commits);
+                let integrations = std::mem::take(&mut next.integrations);
                 next = scope.clone();
                 next.additional_scopes = additional;
                 next.provisioning_commits = commits;
+                next.integrations = integrations;
             } else {
                 next.additional_scopes.push(scope.clone());
             }
         }
         next.provisioning_commits.push(commit);
+        if let Err(error) = record_activated_integration(&mut next, &staged) {
+            rollback_provisioned_scope_dirs(&moved);
+            return Err(error);
+        }
         let bytes = match serde_json::to_vec(&next) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -575,6 +1074,418 @@ impl KeeperHost {
             crate::refresh_route(&mut scope.local_handshake, &seed, sequence)?;
         }
         Ok(())
+    }
+}
+
+fn record_activated_integration(next: &mut Config, staged: &[Config]) -> Result<(), String> {
+    let Some(commit) = next.provisioning_commits.last() else {
+        return Err("Missing durable integration activation record".into());
+    };
+    let service_id = service_person_id(next)?;
+    let integration_id = if commit.integration_id.is_empty() {
+        crate::integration_id(
+            commit
+                .controller_person_id
+                .as_deref()
+                .ok_or("Missing integration owner")?,
+            &service_id,
+        )
+    } else {
+        commit.integration_id.clone()
+    };
+    let controller = commit
+        .controller_person_id
+        .as_deref()
+        .ok_or("Missing integration owner")?;
+    let record_index = next
+        .integrations
+        .iter()
+        .position(|record| record.integration_id == integration_id);
+    let index = match record_index {
+        Some(index) => {
+            let record = &next.integrations[index];
+            if record.controller_person_id != controller || record.service_person_id != service_id {
+                return Err(
+                    "Integration identity conflicts with its recorded owner or service".into(),
+                );
+            }
+            index
+        }
+        None => {
+            next.integrations.push(IntegrationRecord {
+                integration_id: integration_id.clone(),
+                controller_person_id: controller.to_owned(),
+                service_person_id: service_id,
+                revision: 0,
+                future_boards: commit.future_boards,
+                scopes: Vec::new(),
+                tombstones: Vec::new(),
+                pending_disconnect: None,
+                disconnect_history: Vec::new(),
+            });
+            next.integrations.len() - 1
+        }
+    };
+    let record = &mut next.integrations[index];
+    if record.pending_disconnect.is_some() {
+        return Err("Integration has a pending disconnect operation".into());
+    }
+    for scope in staged {
+        let grant_epoch = scope_grant_epoch(scope)?;
+        if let Some(tombstone_epoch) = record
+            .tombstones
+            .iter()
+            .filter(|tombstone| tombstone.workspace_id == scope.workspace_id)
+            .map(|tombstone| tombstone.grant_epoch)
+            .max()
+        {
+            if grant_epoch <= tombstone_epoch {
+                return Err("Re-added scope requires a newer signed owner grant".into());
+            }
+        }
+        let active = IntegrationScope {
+            workspace_id: scope.workspace_id.clone(),
+            grant_epoch,
+            state: "active".into(),
+            activation_operation_id: commit.operation_id.clone(),
+        };
+        if let Some(existing) = record
+            .scopes
+            .iter_mut()
+            .find(|existing| existing.workspace_id == scope.workspace_id)
+        {
+            if existing.state == "active" {
+                return Err("Integration scope is already active".into());
+            }
+            *existing = active;
+        } else {
+            record.scopes.push(active);
+        }
+    }
+    record
+        .scopes
+        .sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+    record.future_boards = commit.future_boards;
+    record.revision = record.revision.saturating_add(1);
+    if record
+        .pending_disconnect
+        .as_ref()
+        .is_some_and(|operation| operation.status == "removed")
+    {
+        record.pending_disconnect = None;
+    }
+    Ok(())
+}
+
+fn configured_scope<'a>(config: &'a Config, workspace_id: &str) -> Option<&'a Config> {
+    std::iter::once(config)
+        .chain(config.additional_scopes.iter())
+        .find(|scope| scope.workspace_id == workspace_id)
+}
+
+fn scope_has_pending_removal(config: &Config, workspace_id: &str) -> bool {
+    config.integrations.iter().any(|integration| {
+        integration
+            .pending_disconnect
+            .as_ref()
+            .is_some_and(|operation| {
+                operation.status == "pending"
+                    && operation.workspace_ids.iter().any(|id| id == workspace_id)
+            })
+    })
+}
+
+fn random_operation_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+fn disconnect_request_hash(
+    integration_id: &str,
+    operation_id: &str,
+    expected_revision: u64,
+    workspace_ids: &[String],
+    grant_epochs: &[u64],
+) -> String {
+    let bytes = serde_json::to_vec(&json!({
+        "integrationId": integration_id,
+        "operationId": operation_id,
+        "expectedRevision": expected_revision,
+        "workspaceIds": workspace_ids,
+        "grantEpochs": grant_epochs,
+    }))
+    .unwrap_or_default();
+    URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
+}
+
+fn persist_config(path: &PathBuf, config: &Config) -> Result<(), String> {
+    let bytes = serde_json::to_vec(config).map_err(|error| error.to_string())?;
+    FileScopeStore::new(path).write_validated(&bytes, None, |_, _| Ok(()))
+}
+
+fn integration_status_value(record: &IntegrationRecord) -> Value {
+    let mut scopes = record
+        .scopes
+        .iter()
+        .map(|scope| {
+            json!({
+                "workspaceId":scope.workspace_id,
+                "grantEpoch":scope.grant_epoch,
+                "state":scope.state,
+                "activationOperationId":scope.activation_operation_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut tombstones = record
+        .tombstones
+        .iter()
+        .map(|tombstone| {
+            let pending = record.pending_disconnect.as_ref().is_some_and(|operation| {
+                operation.status == "pending" && operation.operation_id == tombstone.operation_id
+            });
+            json!({
+                "workspaceId":tombstone.workspace_id,
+                "grantEpoch":tombstone.grant_epoch,
+                "state":if pending { "pending" } else { "removed" },
+                "cleanup":if pending { "pending" } else { "complete" },
+                "operationId":tombstone.operation_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_by(|left, right| {
+        left["workspaceId"]
+            .as_str()
+            .cmp(&right["workspaceId"].as_str())
+    });
+    tombstones.sort_by(|left, right| {
+        left["workspaceId"]
+            .as_str()
+            .cmp(&right["workspaceId"].as_str())
+    });
+    let pending_operation = record
+        .pending_disconnect
+        .as_ref()
+        .filter(|operation| {
+            operation.status == "pending" && !operation.operation_id.starts_with("local-")
+        })
+        .map(|operation| {
+            let operation_scopes = record
+                .tombstones
+                .iter()
+                .filter(|tombstone| tombstone.operation_id == operation.operation_id)
+                .map(|tombstone| {
+                    json!({
+                        "workspaceId": tombstone.workspace_id,
+                        "expectedGrantEpoch": tombstone.grant_epoch,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "operationId": operation.operation_id,
+                "requestHash": operation.request_hash,
+                "expectedRevision": operation.expected_revision,
+                "scopes": operation_scopes,
+                "status": operation.status,
+            })
+        });
+    json!({
+        "integrationId":record.integration_id,
+        "controllerPersonId":record.controller_person_id,
+        "servicePersonId":record.service_person_id,
+        "revision":record.revision,
+        "policy":{"futureBoards":record.future_boards},
+        "scopes":scopes,
+        "tombstones":tombstones,
+        "pendingOperation":pending_operation,
+    })
+}
+
+fn disconnect_receipt_value(
+    request: &VerifiedDisconnectRequest,
+    operation: &DisconnectOperation,
+    record: &IntegrationRecord,
+) -> Value {
+    let removed = operation.status == "removed";
+    let scopes = request
+        .scopes
+        .iter()
+        .map(|(workspace_id, epoch)| {
+            json!({
+                "workspaceId":workspace_id,
+                "grantEpoch":epoch,
+                "state":if removed { "removed" } else { "pending" },
+                "cleanup":if removed { "complete" } else { "pending" },
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "kind":"lighthouse-integration-disconnect-receipt",
+        "version":1,
+        "integrationId":request.integration_id,
+        "operationId":request.operation_id,
+        "requestHash":request.request_hash,
+        "controllerPersonId":request.controller_person_id,
+        "controllerDeviceId":request.controller_device_id,
+        "revision":record.revision,
+        "status":if removed { "removed" } else { "pending" },
+        "scopes":scopes,
+    })
+}
+
+fn finish_disconnect_cleanup(
+    registry: &mut Registry,
+    integration_index: usize,
+) -> Result<(), String> {
+    let operation = registry.config.integrations[integration_index]
+        .pending_disconnect
+        .clone()
+        .ok_or("No disconnect cleanup is pending")?;
+    if operation.status == "removed" {
+        return Ok(());
+    }
+    let config_directory = registry
+        .config_path
+        .parent()
+        .ok_or("Invalid keeper registry path")?
+        .to_path_buf();
+    let scope_configs = operation
+        .workspace_ids
+        .iter()
+        .map(|id| {
+            configured_scope(&registry.config, id)
+                .cloned()
+                .ok_or_else(|| format!("Missing configured scope for pending removal: {id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for scope in &scope_configs {
+        cleanup_scope_storage(
+            &config_directory,
+            scope,
+            scope.workspace_id == registry.config.workspace_id,
+        )?;
+    }
+    let mut next = registry.config.clone();
+    for scope in &scope_configs {
+        if scope.workspace_id == next.workspace_id {
+            next.primary_detached = true;
+            next.initial_state.document.clear();
+            next.initial_state.authorization = Value::Null;
+            next.initial_state.chat =
+                json!({"version": 1, "messages": [], "profiles": [], "typing": []});
+            next.initial_state.mesh = None;
+            next.transport_secret.clear();
+            next.controller_person_id = None;
+            clear_primary_workspace_credential(&mut next);
+        } else {
+            next.additional_scopes
+                .retain(|configured| configured.workspace_id != scope.workspace_id);
+        }
+    }
+    let record = next
+        .integrations
+        .get_mut(integration_index)
+        .ok_or("Missing integration lifecycle")?;
+    let mut completed = record
+        .pending_disconnect
+        .take()
+        .ok_or("No disconnect cleanup is pending")?;
+    completed.status = "removed".into();
+    record.disconnect_history.push(completed);
+    record.future_boards = false;
+    record.revision = record.revision.saturating_add(1);
+    persist_config(&registry.config_path, &next)?;
+    registry.config = next;
+    Ok(())
+}
+
+fn cleanup_scope_storage(
+    config_directory: &std::path::Path,
+    scope: &Config,
+    primary: bool,
+) -> Result<(), String> {
+    let state_path = &scope.state_path;
+    if state_path.file_name().and_then(|name| name.to_str()) != Some("state.json") {
+        return Err("Refusing to remove an unrecognized scope state path".into());
+    }
+    let parent = state_path.parent().ok_or("Invalid scope state path")?;
+    let expected_parent = if primary {
+        config_directory.to_path_buf()
+    } else {
+        config_directory.join("scopes")
+    };
+    let valid_parent = if primary {
+        parent == expected_parent
+    } else {
+        parent != expected_parent && parent.parent() == Some(expected_parent.as_path())
+    };
+    if !valid_parent {
+        return Err("Refusing to remove scope data outside its configured storage root".into());
+    }
+    if !primary {
+        if parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| name.is_empty())
+        {
+            return Err("Invalid configured scope directory".into());
+        }
+        if let Ok(metadata) = fs::symlink_metadata(parent)
+            && !metadata.file_type().is_dir()
+        {
+            return Err("Configured scope directory is not a real directory".into());
+        }
+        if parent.exists() {
+            let expected_root = config_directory.join("scopes");
+            let canonical_root =
+                fs::canonicalize(expected_root).map_err(|error| error.to_string())?;
+            let canonical_parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+            if canonical_parent.parent() != Some(canonical_root.as_path()) {
+                return Err("Configured scope directory escaped its storage root".into());
+            }
+            fs::remove_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    } else {
+        remove_file_if_present(state_path)?;
+        let cache = state_path.with_file_name(format!(
+            "{}.proof-staging",
+            state_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("state.json")
+        ));
+        remove_dir_if_present(&cache)?;
+    }
+    let sync_directory = if primary {
+        config_directory.to_path_buf()
+    } else {
+        config_directory.join("scopes")
+    };
+    fs::File::open(sync_directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn remove_file_if_present(path: &std::path::Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn remove_dir_if_present(path: &std::path::Path) -> Result<(), String> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn clear_primary_workspace_credential(config: &mut Config) {
+    if let Some(peer) = config.local_handshake.peer.as_object_mut() {
+        peer.remove("grant");
+        peer.remove("ownerPublicKey");
+        peer.remove("ownerCertificates");
     }
 }
 
@@ -679,6 +1590,7 @@ fn relocate_provisioned_scope_dirs(
 #[serde(rename_all = "camelCase")]
 struct ScopeActivationMarker {
     pairing_id: String,
+    integration_id: String,
     operation_id: String,
     transcript_hash: String,
     invitation_id: String,
@@ -691,6 +1603,7 @@ impl ScopeActivationMarker {
     fn new(commit: &ProvisioningCommit, workspace_id: &str) -> Self {
         Self {
             pairing_id: commit.pairing_id.clone(),
+            integration_id: commit.integration_id.clone(),
             operation_id: commit.operation_id.clone(),
             transcript_hash: commit.transcript_hash.clone(),
             invitation_id: commit.invitation_id.clone(),
@@ -957,9 +1870,9 @@ impl NativeScopeHost for KeeperScope {
             &service_person_id,
             &owner,
             &owner_certificates,
-        )? != WorkspaceRole::Visitor
+        )? != WorkspaceRole::Editor
         {
-            return Err("Keeper offer grant does not authorize visitor access".into());
+            return Err("Keeper offer grant does not authorize editor access".into());
         }
         let manifest = workspace
             .get("authorization")

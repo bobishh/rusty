@@ -1,20 +1,28 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use automerge::{AutoCommit, ROOT, transaction::Transactable};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use iroh::RelayMode;
 use match_lighthouse::MatchLighthouseState;
 use meta_mesh_core::{
     DEFAULT_SIGNATURE_DOMAIN, DeviceCertificate, DeviceCertificatePayload, MeshHandshake,
-    MeshPeerAdmission, WorkspaceAuthority, WorkspaceChangeAuthorizationPayload,
-    WorkspaceGrantPayload, WorkspaceItem, WorkspaceJoinInvitation, WorkspaceRole,
-    WorkspaceSetEntry, public_key_from_seed, public_key_id, sign_device_certificate,
-    sign_json_envelope,
+    MeshPeerAdmission, PublicIdentity, SignedEnvelope, WorkspaceAuthority,
+    WorkspaceChangeAuthorizationPayload, WorkspaceGrantPayload, WorkspaceItem,
+    WorkspaceJoinInvitation, WorkspaceRole, WorkspaceSetEntry, public_key_from_seed, public_key_id,
+    sign_device_certificate, sign_json_envelope, verify_signed_envelope,
 };
-use meta_mesh_native::{NativeScopeHost, NativeScopeServiceHost};
+use meta_mesh_native::{NativeNode, NativeNodeOptions, NativeScopeHost, NativeScopeServiceHost};
 use serde_json::{Value, json};
 
 use super::KeeperHost;
-use crate::{Config, ProvisioningCommit, join};
+use crate::{
+    Config, ProvisioningCommit, join,
+    pairing::{
+        CONTROL_DOMAIN, ControllerRequest, IntegrationCandidate, PairingService,
+        VerifiedDisconnectRequest,
+    },
+    provisioning::ProvisioningService,
+};
 
 struct Identity {
     identity_seed: [u8; 32],
@@ -83,6 +91,37 @@ impl Identity {
             certificates: vec![self.certificate.clone()],
         }
     }
+
+    fn additional_device(&self, device_seed: u8) -> Self {
+        let device_seed = [device_seed; 32];
+        let device_public_key = public_key_from_seed(&device_seed).unwrap();
+        let device_id = public_key_id(&device_public_key).unwrap();
+        let certificate = sign_device_certificate(
+            &self.identity_seed,
+            DeviceCertificatePayload {
+                kind: "device-certificate".into(),
+                version: 1,
+                person_id: self.person_id.clone(),
+                device_id: device_id.clone(),
+                device_public_key,
+                issuer_certificate_hash: None,
+                can_enroll_devices: false,
+            },
+            &self.person_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        Self {
+            identity_seed: self.identity_seed,
+            device_seed,
+            person_id: self.person_id.clone(),
+            device_id,
+            public_key: self.public_key.clone(),
+            endpoint_secret: self.endpoint_secret,
+            endpoint: self.endpoint.clone(),
+            certificate,
+        }
+    }
 }
 
 struct ScopeFixture {
@@ -93,7 +132,7 @@ struct ScopeFixture {
     entry: Value,
 }
 
-fn signed_grant(owner: &Identity, person_id: &str, workspace_id: &str) -> Value {
+fn signed_grant(owner: &Identity, person_id: &str, workspace_id: &str, epoch: u64) -> Value {
     serde_json::to_value(
         sign_json_envelope(
             &owner.identity_seed,
@@ -104,7 +143,7 @@ fn signed_grant(owner: &Identity, person_id: &str, workspace_id: &str) -> Value 
                 workspace_id: workspace_id.into(),
                 person_id: person_id.into(),
                 role: WorkspaceRole::Editor,
-                access_epoch: None,
+                access_epoch: Some(epoch),
             }),
             &owner.person_id,
             DEFAULT_SIGNATURE_DOMAIN,
@@ -198,8 +237,18 @@ fn fixture_with_preset(
     workspace_id: &str,
     preset: Option<&str>,
 ) -> ScopeFixture {
+    fixture_with_preset_at_epoch(owner, keeper, workspace_id, preset, 2)
+}
+
+fn fixture_with_preset_at_epoch(
+    owner: &Identity,
+    keeper: &Identity,
+    workspace_id: &str,
+    preset: Option<&str>,
+    epoch: u64,
+) -> ScopeFixture {
     let state = signed_state_with_preset(owner, workspace_id, preset);
-    let grant = signed_grant(owner, &keeper.person_id, workspace_id);
+    let grant = signed_grant(owner, &keeper.person_id, workspace_id, epoch);
     let owner_bundle = owner.bundle(workspace_id);
     let owner_peer = {
         let mut peer = owner_bundle.clone();
@@ -330,7 +379,12 @@ impl TestKeeper {
     }
 
     fn staged_scope(&self, workspace_id: &str) -> Config {
-        let fixture = fixture(&self.owner, &self.keeper, workspace_id);
+        self.staged_scope_at_epoch(workspace_id, 2)
+    }
+
+    fn staged_scope_at_epoch(&self, workspace_id: &str, epoch: u64) -> Config {
+        let fixture =
+            fixture_with_preset_at_epoch(&self.owner, &self.keeper, workspace_id, None, epoch);
         let directory = self.directory.join(format!(".provisioning-{workspace_id}"));
         let mut config = join::prepare_config(
             &fixture.invitation,
@@ -347,6 +401,298 @@ impl TestKeeper {
         config.controller_person_id = Some(self.owner.person_id.clone());
         config
     }
+}
+
+fn controller_request(
+    controller: &Identity,
+    service: &Identity,
+    service_origin: &str,
+    mut payload: Value,
+) -> ControllerRequest {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+    let object = payload.as_object_mut().unwrap();
+    object.insert("version".into(), json!(1));
+    object.insert("protocolVersion".into(), json!(1));
+    object.insert("servicePersonId".into(), json!(service.person_id));
+    object.insert("serviceOrigin".into(), json!(service_origin));
+    object.insert("controllerPersonId".into(), json!(controller.person_id));
+    object.insert("controllerDeviceId".into(), json!(controller.device_id));
+    object.insert("issuedAt".into(), json!(now));
+    object.insert("expiresAt".into(), json!(now + 300));
+    let identity = PublicIdentity {
+        person_id: controller.person_id.clone(),
+        public_key: controller.public_key.clone(),
+        display_name: "Test owner".into(),
+    };
+    ControllerRequest {
+        identity,
+        device_id: controller.device_id.clone(),
+        certificates: vec![controller.certificate.clone()],
+        signed: sign_json_envelope(
+            &controller.device_seed,
+            payload,
+            &controller.device_id,
+            CONTROL_DOMAIN,
+        )
+        .unwrap(),
+    }
+}
+
+fn operation_id(byte: u8) -> String {
+    URL_SAFE_NO_PAD.encode([byte; 16])
+}
+
+fn approved_active_pairing(
+    keeper: &TestKeeper,
+    service_origin: &str,
+    grant_epoch: u64,
+) -> (
+    PairingService,
+    String,
+    String,
+    String,
+    String,
+    ControllerRequest,
+) {
+    let pairings = PairingService::open(
+        keeper.directory.join("pairings"),
+        &keeper.keeper.bundle("primary-board"),
+        service_origin.into(),
+        keeper.keeper.device_seed,
+        "test-operator-token-that-is-long-enough".into(),
+    )
+    .unwrap();
+    let offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind": "lighthouse-pairing-offer",
+            "operationId": operation_id(rand::random()),
+            "body": {
+                "policy": {"futureBoards": false},
+                "scopes": [{
+                    "workspaceId": "second-board",
+                    "title": "Second board",
+                    "genesisAnchor": "second-board-genesis",
+                    "mode": "replicate"
+                }]
+            }
+        }),
+    );
+    let record = pairings.create(offer).unwrap();
+    let (cookie, csrf) = pairings
+        .login("test-operator-token-that-is-long-enough")
+        .unwrap();
+    pairings
+        .admin_decision(&record.id, &cookie, &csrf, true)
+        .unwrap();
+    let approve = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind": "lighthouse-pairing-decision",
+            "operationId": operation_id(rand::random()),
+            "pairingId": record.id,
+            "transcriptHash": record.transcript_hash,
+            "challengeNonce": record.challenge.payload["nonce"],
+            "decision": "approve"
+        }),
+    );
+    pairings.controller_decision(&record.id, approve).unwrap();
+
+    let mut invitation = fixture_with_preset_at_epoch(
+        &keeper.owner,
+        &keeper.keeper,
+        "second-board",
+        None,
+        grant_epoch,
+    )
+    .invitation;
+    let created = time::OffsetDateTime::now_utc();
+    invitation.created_at = created
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    invitation.expires_at = (created + time::Duration::minutes(5))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    invitation.secret = "invite-secret-that-is-long-enough-123".into();
+    let provision_operation = operation_id(rand::random());
+    let provision = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind": "lighthouse-pairing-provision",
+            "operationId": provision_operation,
+            "body": {
+                "pairingId": record.id,
+                "transcriptHash": record.transcript_hash,
+                "servicePersonId": keeper.keeper.person_id,
+                "futureBoards": false,
+                "approvedScopes": [{"workspaceId":"second-board", "mode":"replicate"}],
+                "invitation": invitation
+            }
+        }),
+    );
+    let provision_request = pairings
+        .begin_provision(&record.id, provision.clone())
+        .unwrap();
+    let commit = ProvisioningCommit {
+        pairing_id: record.id.clone(),
+        integration_id: provision_request.integration_id.clone(),
+        operation_id: provision_operation,
+        transcript_hash: record.transcript_hash.clone(),
+        invitation_id: provision_request.invitation.invitation_id.clone(),
+        workspace_ids: vec!["second-board".into()],
+        snapshot_hash: "http-contract-snapshot".into(),
+        future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(
+            vec![keeper.staged_scope_at_epoch("second-board", grant_epoch)],
+            commit.clone(),
+        )
+        .unwrap();
+    pairings
+        .complete_from_durable_activation(&record.id, &commit)
+        .unwrap();
+    (
+        pairings,
+        record.id,
+        provision_request.integration_id,
+        commit.operation_id,
+        record.transcript_hash,
+        provision,
+    )
+}
+
+fn controller_request_json(request: &ControllerRequest) -> Value {
+    json!({
+        "identity": request.identity,
+        "deviceId": request.device_id,
+        "certificates": request.certificates,
+        "signed": request.signed,
+    })
+}
+
+fn status_request(
+    controller: &Identity,
+    service: &Identity,
+    service_origin: &str,
+    operation_id: &str,
+) -> ControllerRequest {
+    controller_request(
+        controller,
+        service,
+        service_origin,
+        json!({
+            "kind": "lighthouse-integration-status-request",
+            "serviceDeviceId": service.device_id,
+            "operationId": operation_id,
+        }),
+    )
+}
+
+fn pairing_status_request(
+    controller: &Identity,
+    service: &Identity,
+    service_origin: &str,
+    pairing_id: &str,
+    transcript_hash: &str,
+    operation_id: &str,
+) -> ControllerRequest {
+    controller_request(
+        controller,
+        service,
+        service_origin,
+        json!({
+            "kind": "lighthouse-pairing-status",
+            "pairingId": pairing_id,
+            "transcriptHash": transcript_hash,
+            "operationId": operation_id,
+        }),
+    )
+}
+
+fn disconnect_request(
+    controller: &Identity,
+    service: &Identity,
+    service_origin: &str,
+    integration_id: &str,
+    operation_id: &str,
+    expected_revision: u64,
+    expected_epoch: u64,
+) -> ControllerRequest {
+    controller_request(
+        controller,
+        service,
+        service_origin,
+        json!({
+            "kind": "lighthouse-integration-disconnect",
+            "serviceDeviceId": service.device_id,
+            "integrationId": integration_id,
+            "operationId": operation_id,
+            "expectedRevision": expected_revision,
+            "scopes": [{"workspaceId":"second-board", "expectedGrantEpoch":expected_epoch}],
+        }),
+    )
+}
+
+async fn start_integration_http(
+    directory: &std::path::Path,
+    host: KeeperHost,
+    service: &Identity,
+    service_origin: &str,
+    pairings: PairingService,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let node = Arc::new(
+        NativeNode::start_with_options(NativeNodeOptions {
+            relay_mode: RelayMode::Disabled,
+            ..NativeNodeOptions::default()
+        })
+        .await
+        .unwrap(),
+    );
+    let discovery =
+        crate::http::Discovery::from_peer(&service.bundle("primary-board"), service_origin)
+            .unwrap()
+            .with_pairings(pairings)
+            .with_provisioner(ProvisioningService::new(host.clone(), node));
+    let app = crate::http::operator_test_router(directory, discovery, host).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (address, server)
+}
+
+fn verify_service_response(value: Value, service: &Identity) -> Value {
+    let envelope: SignedEnvelope<Value> = serde_json::from_value(value).unwrap();
+    let public_key = public_key_from_seed(&service.device_seed).unwrap();
+    verify_signed_envelope(&envelope, &public_key, CONTROL_DOMAIN).unwrap();
+    assert_eq!(envelope.signer_key_id, service.device_id);
+    envelope.payload
+}
+
+async fn post_controller_request(
+    client: &reqwest::Client,
+    url: &str,
+    request: &ControllerRequest,
+) -> (reqwest::StatusCode, Value) {
+    let response = client
+        .post(url)
+        .json(&controller_request_json(request))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.json().await.unwrap();
+    (status, body)
 }
 
 impl Drop for TestKeeper {
@@ -411,9 +757,10 @@ fn unsubscribe_cannot_hide_board_when_registry_write_fails() {
 fn unsubscribed_primary_can_be_added_again_by_fresh_provisioning() {
     let keeper = TestKeeper::new();
     keeper.host.unsubscribe("primary-board", None).unwrap();
-    let scope = keeper.staged_scope("primary-board");
+    let scope = keeper.staged_scope_at_epoch("primary-board", 3);
     let commit = ProvisioningCommit {
         pairing_id: "new-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
         operation_id: "new-operation".into(),
         transcript_hash: "new-transcript".into(),
         invitation_id: "new-invitation".into(),
@@ -445,6 +792,7 @@ fn unsubscribed_additional_board_can_receive_a_fresh_grant() {
     let keeper = TestKeeper::new();
     let mut commit = ProvisioningCommit {
         pairing_id: "first-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
         operation_id: "first-operation".into(),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),
@@ -461,12 +809,15 @@ fn unsubscribed_additional_board_can_receive_a_fresh_grant() {
         .state_path
         .clone();
     keeper.host.unsubscribe("second-board", None).unwrap();
-    assert!(old_path.is_file());
+    assert!(!old_path.exists());
     commit.pairing_id = "fresh-pairing".into();
     commit.operation_id = "fresh-operation".into();
     keeper
         .host
-        .activate_provisioned_scopes(vec![keeper.staged_scope("second-board")], commit)
+        .activate_provisioned_scopes(
+            vec![keeper.staged_scope_at_epoch("second-board", 3)],
+            commit,
+        )
         .unwrap();
     let config = keeper.host.configuration().unwrap();
     assert_ne!(config.additional_scopes[0].state_path, old_path);
@@ -477,6 +828,758 @@ fn unsubscribed_additional_board_can_receive_a_fresh_grant() {
             .unwrap()
             .len(),
         2
+    );
+}
+
+#[test]
+fn unsubscribe_removes_only_the_owned_scope_files() {
+    let keeper = TestKeeper::new();
+    let commit = ProvisioningCommit {
+        pairing_id: "first-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        operation_id: "first-operation".into(),
+        transcript_hash: "transcript".into(),
+        invitation_id: "invitation".into(),
+        workspace_ids: vec!["second-board".into()],
+        snapshot_hash: "snapshot".into(),
+        future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![keeper.staged_scope("second-board")], commit.clone())
+        .unwrap();
+    let config = keeper.host.configuration().unwrap();
+    let owned_scope = config
+        .additional_scopes
+        .iter()
+        .find(|scope| scope.workspace_id == "second-board")
+        .unwrap();
+    let owned_state_path = owned_scope.state_path.clone();
+    let owned_directory = owned_state_path.parent().unwrap().to_path_buf();
+    let proof_cache = owned_directory.join("state.json.proof-staging");
+    fs::create_dir_all(&proof_cache).unwrap();
+    fs::write(proof_cache.join("page.bin"), b"owned proof cache").unwrap();
+    let unrelated_state = config.state_path.clone();
+    let unrelated_bytes = fs::read(&unrelated_state).unwrap();
+
+    keeper
+        .host
+        .unsubscribe("second-board", Some(&keeper.owner.person_id))
+        .unwrap();
+
+    assert!(!owned_state_path.exists());
+    assert!(!proof_cache.exists());
+    assert_eq!(fs::read(&unrelated_state).unwrap(), unrelated_bytes);
+    assert_eq!(
+        keeper
+            .host
+            .configuration()
+            .unwrap()
+            .provisioning_commits
+            .len(),
+        1
+    );
+    assert!(!owned_directory.exists());
+}
+
+#[test]
+fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
+    let keeper = TestKeeper::new();
+    let integration_id = crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id);
+    let commit = ProvisioningCommit {
+        pairing_id: "first-pairing".into(),
+        integration_id: integration_id.clone(),
+        operation_id: "first-operation".into(),
+        transcript_hash: "transcript".into(),
+        invitation_id: "invitation".into(),
+        workspace_ids: vec!["second-board".into()],
+        snapshot_hash: "snapshot".into(),
+        future_boards: true,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(
+            vec![keeper.staged_scope_at_epoch("second-board", 2)],
+            commit,
+        )
+        .unwrap();
+    let old_path = keeper.host.configuration().unwrap().additional_scopes[0]
+        .state_path
+        .clone();
+    let request = VerifiedDisconnectRequest {
+        integration_id: integration_id.clone(),
+        operation_id: URL_SAFE_NO_PAD.encode([7_u8; 16]),
+        controller_person_id: keeper.owner.person_id.clone(),
+        controller_device_id: keeper.owner.device_id.clone(),
+        expected_revision: 1,
+        scopes: vec![("second-board".into(), 2)],
+        request_hash: "first-intent".into(),
+    };
+    let receipt = keeper.host.disconnect_integration(&request).unwrap();
+    assert_eq!(receipt["status"], "removed");
+    assert_eq!(receipt["scopes"][0]["cleanup"], "complete");
+    assert!(!old_path.exists());
+
+    let readd = ProvisioningCommit {
+        pairing_id: "second-pairing".into(),
+        integration_id: integration_id.clone(),
+        operation_id: "second-operation".into(),
+        transcript_hash: "new-transcript".into(),
+        invitation_id: "new-invitation".into(),
+        workspace_ids: vec!["second-board".into()],
+        snapshot_hash: "new-snapshot".into(),
+        future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(
+            vec![keeper.staged_scope_at_epoch("second-board", 3)],
+            readd.clone(),
+        )
+        .unwrap();
+    let replay = keeper.host.disconnect_integration(&request).unwrap();
+    assert_eq!(replay["status"], "removed");
+    let active_path = keeper.host.configuration().unwrap().additional_scopes[0]
+        .state_path
+        .clone();
+    assert!(active_path.exists());
+    assert_eq!(keeper.host.scopes().unwrap().len(), 2);
+
+    let candidate = IntegrationCandidate {
+        integration_id,
+        pairing_id: "second-pairing".into(),
+        controller_person_id: keeper.owner.person_id.clone(),
+        future_boards: false,
+    };
+    let (_, status) = keeper
+        .host
+        .integration_status(&[candidate], &keeper.owner.person_id)
+        .unwrap();
+    let current = status
+        .iter()
+        .find(|entry| entry["integrationId"] == request.integration_id)
+        .unwrap();
+    assert_eq!(current["scopes"][0]["state"], "active");
+    assert_eq!(current["scopes"][0]["grantEpoch"], 3);
+    assert_eq!(current["tombstones"][0]["state"], "removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn disconnect_cleanup_failure_stays_pending_and_retries_after_restart() {
+    use std::os::unix::fs::symlink;
+
+    let keeper = TestKeeper::new();
+    let integration_id = crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id);
+    let commit = ProvisioningCommit {
+        pairing_id: "pending-pairing".into(),
+        integration_id: integration_id.clone(),
+        operation_id: "pending-activation".into(),
+        transcript_hash: "transcript".into(),
+        invitation_id: "invitation".into(),
+        workspace_ids: vec!["second-board".into()],
+        snapshot_hash: "snapshot".into(),
+        future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(
+            vec![keeper.staged_scope_at_epoch("second-board", 2)],
+            commit,
+        )
+        .unwrap();
+    let config = keeper.host.configuration().unwrap();
+    let owned_dir = config.additional_scopes[0]
+        .state_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let detached_dir = keeper.directory.join("detached-scope");
+    fs::rename(&owned_dir, &detached_dir).unwrap();
+    symlink(&detached_dir, &owned_dir).unwrap();
+    let external_bytes = fs::read(detached_dir.join("state.json")).unwrap();
+
+    let request = VerifiedDisconnectRequest {
+        integration_id: integration_id.clone(),
+        operation_id: URL_SAFE_NO_PAD.encode([8_u8; 16]),
+        controller_person_id: keeper.owner.person_id.clone(),
+        controller_device_id: keeper.owner.device_id.clone(),
+        expected_revision: 1,
+        scopes: vec![("second-board".into(), 2)],
+        request_hash: "pending-intent".into(),
+    };
+    let receipt = keeper.host.disconnect_integration(&request).unwrap();
+    assert_eq!(receipt["status"], "pending");
+    assert_eq!(receipt["scopes"][0]["cleanup"], "pending");
+    assert_eq!(
+        fs::read(detached_dir.join("state.json")).unwrap(),
+        external_bytes
+    );
+    assert!(
+        keeper
+            .host
+            .scopes()
+            .unwrap()
+            .iter()
+            .all(|scope| scope.0 != "second-board")
+    );
+
+    fs::remove_file(&owned_dir).unwrap();
+    fs::rename(&detached_dir, &owned_dir).unwrap();
+    let persisted = keeper.host.configuration().unwrap();
+    let restarted = KeeperHost::open(persisted, keeper.config_path.clone()).unwrap();
+    assert!(!owned_dir.exists());
+    assert_eq!(restarted.scopes().unwrap().len(), 1);
+    let persisted = restarted.configuration().unwrap();
+    let record = persisted
+        .integrations
+        .iter()
+        .find(|record| record.integration_id == integration_id)
+        .unwrap();
+    assert!(record.pending_disconnect.is_none());
+    assert_eq!(
+        record.disconnect_history[0].operation_id,
+        request.operation_id
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn local_unsubscribe_retries_the_same_scope_cleanup_without_restart() {
+    use std::os::unix::fs::symlink;
+
+    let keeper = TestKeeper::new();
+    let commit = ProvisioningCommit {
+        pairing_id: "local-retry-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        operation_id: "local-retry-activation".into(),
+        transcript_hash: "transcript".into(),
+        invitation_id: "invitation".into(),
+        workspace_ids: vec!["second-board".into()],
+        snapshot_hash: "snapshot".into(),
+        future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![keeper.staged_scope("second-board")], commit)
+        .unwrap();
+    let config = keeper.host.configuration().unwrap();
+    let owned_dir = config.additional_scopes[0]
+        .state_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let detached_dir = keeper.directory.join("local-retry-scope");
+    fs::rename(&owned_dir, &detached_dir).unwrap();
+    symlink(&detached_dir, &owned_dir).unwrap();
+
+    assert!(
+        keeper
+            .host
+            .unsubscribe("second-board", Some(&keeper.owner.person_id))
+            .is_err()
+    );
+    assert!(
+        keeper
+            .host
+            .scopes()
+            .unwrap()
+            .iter()
+            .all(|scope| scope.0 != "second-board")
+    );
+    let pending = keeper.host.configuration().unwrap();
+    let operation = pending.integrations[0]
+        .pending_disconnect
+        .as_ref()
+        .expect("failed cleanup stays pending");
+    assert!(operation.operation_id.starts_with("local-"));
+    assert_eq!(operation.workspace_ids, vec!["second-board"]);
+
+    fs::remove_file(&owned_dir).unwrap();
+    fs::rename(&detached_dir, &owned_dir).unwrap();
+    keeper
+        .host
+        .unsubscribe("second-board", Some(&keeper.owner.person_id))
+        .unwrap();
+
+    assert!(!owned_dir.exists());
+    let config = keeper.host.configuration().unwrap();
+    assert!(config.additional_scopes.is_empty());
+    assert!(config.integrations[0].pending_disconnect.is_none());
+    assert_eq!(config.integrations[0].disconnect_history.len(), 1);
+    assert!(
+        keeper
+            .host
+            .scopes()
+            .unwrap()
+            .iter()
+            .any(|scope| scope.0 == "primary-board")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn local_unsubscribe_cannot_drop_another_scope_during_pending_cleanup() {
+    use std::os::unix::fs::symlink;
+
+    let keeper = TestKeeper::new();
+    let integration_id = crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id);
+    let first = ProvisioningCommit {
+        pairing_id: "scope-b-pairing".into(),
+        integration_id: integration_id.clone(),
+        operation_id: "scope-b-operation".into(),
+        transcript_hash: "transcript-b".into(),
+        invitation_id: "invitation-b".into(),
+        workspace_ids: vec!["second-board".into()],
+        snapshot_hash: "snapshot-b".into(),
+        future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![keeper.staged_scope("second-board")], first)
+        .unwrap();
+    let second = ProvisioningCommit {
+        pairing_id: "scope-c-pairing".into(),
+        integration_id: integration_id.clone(),
+        operation_id: "scope-c-operation".into(),
+        transcript_hash: "transcript-c".into(),
+        invitation_id: "invitation-c".into(),
+        workspace_ids: vec!["third-board".into()],
+        snapshot_hash: "snapshot-c".into(),
+        future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![keeper.staged_scope("third-board")], second)
+        .unwrap();
+    let config = keeper.host.configuration().unwrap();
+    let owned_dir = config.additional_scopes[0]
+        .state_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let detached_dir = keeper.directory.join("pending-scope");
+    fs::rename(&owned_dir, &detached_dir).unwrap();
+    symlink(&detached_dir, &owned_dir).unwrap();
+    let pending = VerifiedDisconnectRequest {
+        integration_id,
+        operation_id: URL_SAFE_NO_PAD.encode([9_u8; 16]),
+        controller_person_id: keeper.owner.person_id.clone(),
+        controller_device_id: keeper.owner.device_id.clone(),
+        expected_revision: 2,
+        scopes: vec![("second-board".into(), 2)],
+        request_hash: "pending-b-intent".into(),
+    };
+    assert_eq!(
+        keeper.host.disconnect_integration(&pending).unwrap()["status"],
+        "pending"
+    );
+
+    assert!(
+        keeper
+            .host
+            .unsubscribe("third-board", Some(&keeper.owner.person_id))
+            .is_err()
+    );
+    let scopes = keeper.host.scopes().unwrap();
+    assert!(scopes.iter().any(|scope| scope.0 == "primary-board"));
+    assert!(scopes.iter().any(|scope| scope.0 == "third-board"));
+    assert!(
+        keeper
+            .host
+            .configuration()
+            .unwrap()
+            .additional_scopes
+            .iter()
+            .any(|scope| scope.workspace_id == "third-board")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signed_http_status_disconnect_retry_and_restart_preserve_scope_authority() {
+    use std::os::unix::fs::symlink;
+
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let (pairings, pairing_id, integration_id, _, transcript_hash, old_provision) =
+        approved_active_pairing(&keeper, service_origin, 2);
+    let config = keeper.host.configuration().unwrap();
+    let owned_dir = config.additional_scopes[0]
+        .state_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let detached_dir = keeper.directory.join("http-contract-scope");
+    fs::rename(&owned_dir, &detached_dir).unwrap();
+    symlink(&detached_dir, &owned_dir).unwrap();
+
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let status_url = format!("http://{address}/v1/integrations/status");
+    let disconnect_url = format!("http://{address}/v1/integrations/{integration_id}/disconnect");
+    let initial_status = status_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &operation_id(44),
+    );
+    let (status, body) = post_controller_request(&client, &status_url, &initial_status).await;
+    assert!(status.is_success());
+    let payload = verify_service_response(body, &keeper.keeper);
+    assert_eq!(payload["kind"], "lighthouse-integration-status");
+    assert_eq!(payload["controllerPersonId"], keeper.owner.person_id);
+    assert_eq!(payload["controllerDeviceId"], keeper.owner.device_id);
+    assert_eq!(
+        payload["operationId"],
+        initial_status.signed.payload["operationId"]
+    );
+    let integration = payload["integrations"].as_array().unwrap().first().unwrap();
+    assert_eq!(integration["integrationId"], integration_id);
+    assert_eq!(integration["scopes"][0]["workspaceId"], "second-board");
+    assert_eq!(integration["scopes"][0]["grantEpoch"], 2);
+    assert_eq!(integration["scopes"][0]["state"], "active");
+    let revision = integration["revision"].as_u64().unwrap();
+    assert_eq!(payload["servicePersonId"], keeper.keeper.person_id);
+    assert_eq!(payload["serviceDeviceId"], keeper.keeper.device_id);
+    assert_eq!(payload["serviceOrigin"], service_origin);
+    let wrong_service = status_request(
+        &keeper.owner,
+        &keeper.keeper,
+        "https://different-rusty.example",
+        &operation_id(51),
+    );
+    assert!(
+        !post_controller_request(&client, &status_url, &wrong_service)
+            .await
+            .0
+            .is_success()
+    );
+
+    let attacker = Identity::new(31, 32, 33);
+    let wrong_owner = disconnect_request(
+        &attacker,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(45),
+        revision,
+        2,
+    );
+    let (status, _) = post_controller_request(&client, &disconnect_url, &wrong_owner).await;
+    assert!(!status.is_success());
+    let mut wrong_device = disconnect_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(46),
+        revision,
+        2,
+    );
+    wrong_device.device_id = "uncertified-device".into();
+    let (status, _) = post_controller_request(&client, &disconnect_url, &wrong_device).await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    let stale_revision = disconnect_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(47),
+        revision.saturating_sub(1),
+        2,
+    );
+    assert!(
+        !post_controller_request(&client, &disconnect_url, &stale_revision)
+            .await
+            .0
+            .is_success()
+    );
+    let stale_epoch = disconnect_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(48),
+        revision,
+        1,
+    );
+    assert!(
+        !post_controller_request(&client, &disconnect_url, &stale_epoch)
+            .await
+            .0
+            .is_success()
+    );
+    assert_eq!(keeper.host.scopes().unwrap().len(), 2);
+
+    let remove = disconnect_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(49),
+        revision,
+        2,
+    );
+    let verified_remove = pairings
+        .verify_disconnect_request(&integration_id, &remove)
+        .unwrap();
+    let (status, body) = post_controller_request(&client, &disconnect_url, &remove).await;
+    assert!(status.is_success());
+    let pending = verify_service_response(body, &keeper.keeper);
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["operationId"], remove.signed.payload["operationId"]);
+    assert_eq!(pending["integrationId"], integration_id);
+    assert_eq!(pending["controllerPersonId"], keeper.owner.person_id);
+    assert_eq!(pending["servicePersonId"], keeper.keeper.person_id);
+    assert_eq!(pending["scopes"][0]["state"], "pending");
+    assert_eq!(pending["scopes"][0]["cleanup"], "pending");
+    let pending_hash = pending["requestHash"].clone();
+    assert_eq!(pending_hash, verified_remove.request_hash);
+
+    let pending_status = status_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &operation_id(50),
+    );
+    let (status, body) = post_controller_request(&client, &status_url, &pending_status).await;
+    assert!(status.is_success());
+    let payload = verify_service_response(body, &keeper.keeper);
+    let pending_record = &payload["integrations"][0];
+    assert!(pending_record["scopes"].as_array().unwrap().is_empty());
+    assert_eq!(pending_record["tombstones"][0]["state"], "pending");
+    assert_eq!(
+        pending_record["pendingOperation"]["requestHash"],
+        pending_hash
+    );
+    assert_eq!(
+        pending_record["pendingOperation"]["operationId"],
+        remove.signed.payload["operationId"]
+    );
+
+    fs::remove_file(&owned_dir).unwrap();
+    fs::rename(&detached_dir, &owned_dir).unwrap();
+    let retry_device = keeper.owner.additional_device(33);
+    let retry = disconnect_request(
+        &retry_device,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        remove.signed.payload["operationId"].as_str().unwrap(),
+        revision,
+        2,
+    );
+    assert_eq!(
+        pairings
+            .verify_disconnect_request(&integration_id, &retry)
+            .unwrap()
+            .request_hash,
+        pending_hash
+    );
+    let (status, body) = post_controller_request(&client, &disconnect_url, &retry).await;
+    assert!(status.is_success());
+    let removed = verify_service_response(body, &keeper.keeper);
+    assert_eq!(removed["status"], "removed");
+    assert_eq!(removed["requestHash"], pending_hash);
+    assert_eq!(removed["operationId"], remove.signed.payload["operationId"]);
+    assert_eq!(removed["controllerPersonId"], keeper.owner.person_id);
+    assert_eq!(removed["controllerDeviceId"], retry_device.device_id);
+    assert_eq!(removed["integrationId"], integration_id);
+    assert_eq!(removed["scopes"][0]["cleanup"], "complete");
+    assert!(!owned_dir.exists());
+
+    let pairing_status_url = format!("http://{address}/v1/pairings/{pairing_id}/status");
+    let old_pairing_status = pairing_status_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &pairing_id,
+        &transcript_hash,
+        &operation_id(52),
+    );
+    let (status, body) =
+        post_controller_request(&client, &pairing_status_url, &old_pairing_status).await;
+    assert!(status.is_success());
+    let old_status = verify_service_response(body, &keeper.keeper);
+    assert_eq!(old_status["status"], "detached");
+    let old_provision_url = format!("http://{address}/v1/pairings/{pairing_id}/provision");
+    let (status, _) = post_controller_request(&client, &old_provision_url, &old_provision).await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    server.abort();
+    let _ = server.await;
+
+    let persisted: Config =
+        serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    let restarted_host = KeeperHost::open(persisted, keeper.config_path.clone()).unwrap();
+    assert_eq!(restarted_host.scopes().unwrap().len(), 1);
+    let restarted_pairings = PairingService::open(
+        keeper.directory.join("pairings"),
+        &keeper.keeper.bundle("primary-board"),
+        service_origin.into(),
+        keeper.keeper.device_seed,
+        "test-operator-token-that-is-long-enough".into(),
+    )
+    .unwrap();
+    let (address, _server) = start_integration_http(
+        &keeper.directory,
+        restarted_host,
+        &keeper.keeper,
+        service_origin,
+        restarted_pairings,
+    )
+    .await;
+    let status_url = format!("http://{address}/v1/integrations/status");
+    let (status, body) = post_controller_request(&client, &status_url, &pending_status).await;
+    assert!(status.is_success());
+    let payload = verify_service_response(body, &keeper.keeper);
+    assert_eq!(payload["controllerPersonId"], keeper.owner.person_id);
+    assert_eq!(payload["integrations"][0]["integrationId"], integration_id);
+    assert!(
+        payload["integrations"][0]["scopes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        payload["integrations"][0]["tombstones"][0]["state"],
+        "removed"
+    );
+    assert_eq!(
+        payload["integrations"][0]["tombstones"][0]["cleanup"],
+        "complete"
+    );
+    assert!(payload["integrations"][0]["pendingOperation"].is_null());
+    let pairing_status_url = format!("http://{address}/v1/pairings/{pairing_id}/status");
+    let (status, body) =
+        post_controller_request(&client, &pairing_status_url, &old_pairing_status).await;
+    assert!(status.is_success());
+    let old_status = verify_service_response(body, &keeper.keeper);
+    assert_eq!(old_status["status"], "detached");
+    assert_eq!(
+        keeper.host.configuration().unwrap().provisioning_commits[0].pairing_id,
+        pairing_id
+    );
+}
+
+#[test]
+fn readding_tombstoned_scope_requires_a_fresh_pairing_and_newer_grant() {
+    let keeper = TestKeeper::new();
+    let origin = "https://rusty.example";
+    let (old_pairings, old_pairing_id, _, old_operation_id, _, _) =
+        approved_active_pairing(&keeper, origin, 2);
+    let old_commit = keeper
+        .host
+        .provisioning_commit(&old_pairing_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        keeper
+            .host
+            .provisioning_lifecycle_status(&old_pairing_id)
+            .unwrap(),
+        Some(crate::keeper::ProvisioningLifecycleStatus::Active)
+    );
+
+    keeper
+        .host
+        .unsubscribe("second-board", Some(&keeper.owner.person_id))
+        .unwrap();
+    assert_eq!(
+        keeper
+            .host
+            .provisioning_lifecycle_status(&old_pairing_id)
+            .unwrap(),
+        Some(crate::keeper::ProvisioningLifecycleStatus::Detached)
+    );
+
+    let (new_pairings, new_pairing_id, _, new_operation_id, _, _) =
+        approved_active_pairing(&keeper, origin, 3);
+    assert_ne!(new_pairing_id, old_pairing_id);
+    assert_ne!(new_operation_id, old_operation_id);
+    assert_eq!(
+        keeper
+            .host
+            .provisioning_lifecycle_status(&old_pairing_id)
+            .unwrap(),
+        Some(crate::keeper::ProvisioningLifecycleStatus::Detached)
+    );
+    assert_eq!(
+        keeper
+            .host
+            .provisioning_lifecycle_status(&new_pairing_id)
+            .unwrap(),
+        Some(crate::keeper::ProvisioningLifecycleStatus::Active)
+    );
+    let record = keeper
+        .host
+        .configuration()
+        .unwrap()
+        .integrations
+        .into_iter()
+        .find(|record| record.controller_person_id == keeper.owner.person_id)
+        .unwrap();
+    assert_eq!(record.scopes.len(), 1);
+    assert_eq!(record.scopes[0].workspace_id, "second-board");
+    assert_eq!(record.scopes[0].grant_epoch, 3);
+    assert_eq!(record.scopes[0].activation_operation_id, new_operation_id);
+
+    old_pairings
+        .reconcile_durable_provisioning(&old_pairing_id, &old_commit.operation_id, "detached")
+        .unwrap();
+    let old_status = verify_service_response(
+        serde_json::to_value(
+            old_pairings
+                .signed_provision_status(&old_pairing_id)
+                .unwrap(),
+        )
+        .unwrap(),
+        &keeper.keeper,
+    );
+    assert_eq!(old_status["status"], "detached");
+    let new_status = verify_service_response(
+        serde_json::to_value(
+            new_pairings
+                .signed_provision_status(&new_pairing_id)
+                .unwrap(),
+        )
+        .unwrap(),
+        &keeper.keeper,
+    );
+    assert_eq!(new_status["status"], "active");
+}
+
+#[test]
+fn scope_cleanup_refuses_the_scopes_root_itself() {
+    let keeper = TestKeeper::new();
+    let config = keeper.host.configuration().unwrap();
+    let scopes_root = keeper.directory.join("scopes");
+    fs::create_dir_all(&scopes_root).unwrap();
+    let survivor = scopes_root.join("unrelated-scope");
+    fs::create_dir_all(&survivor).unwrap();
+    fs::write(survivor.join("state.json"), b"keep this board").unwrap();
+    let mut invalid_scope = config;
+    invalid_scope.state_path = scopes_root.join("state.json");
+    fs::write(&invalid_scope.state_path, b"not a scope directory").unwrap();
+
+    assert!(super::cleanup_scope_storage(&keeper.directory, &invalid_scope, false).is_err());
+    assert_eq!(
+        fs::read(survivor.join("state.json")).unwrap(),
+        b"keep this board"
     );
 }
 
@@ -517,6 +1620,10 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
             vec![staged],
             ProvisioningCommit {
                 pairing_id: "overview-pairing".into(),
+                integration_id: crate::integration_id(
+                    &keeper.owner.person_id,
+                    &keeper.keeper.person_id,
+                ),
                 operation_id: "overview-operation".into(),
                 transcript_hash: "overview-transcript".into(),
                 invitation_id: "overview-invitation".into(),
@@ -997,6 +2104,7 @@ fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
     let keeper = TestKeeper::new();
     let commit = ProvisioningCommit {
         pairing_id: "pairing-test".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
         operation_id: "operation-test".into(),
         transcript_hash: "transcript-test".into(),
         invitation_id: "invitation-test".into(),
@@ -1075,6 +2183,7 @@ fn failed_scope_validation_never_activates_a_subset_of_provisioned_scopes() {
     second.controller_person_id = Some("wrong-controller".into());
     let commit = ProvisioningCommit {
         pairing_id: "pairing-test".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
         operation_id: "operation-test".into(),
         transcript_hash: "transcript-test".into(),
         invitation_id: "invitation-test".into(),

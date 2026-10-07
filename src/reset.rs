@@ -67,6 +67,7 @@ pub(crate) fn apply_pending(config_path: &Path) -> Result<(), String> {
     config.primary_detached = true;
     config.additional_scopes.clear();
     config.provisioning_commits.clear();
+    config.integrations.clear();
     config.controller_person_id = None;
     config.transport_secret.clear();
     config.initial_state.document.clear();

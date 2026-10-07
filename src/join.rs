@@ -201,6 +201,7 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
 pub async fn provision_existing_identity(
     invite: WorkspaceJoinInvitation,
     approved_scopes: &[String],
+    integration_id: &str,
     pairing_id: &str,
     operation_id: &str,
     transcript_hash: &str,
@@ -218,8 +219,8 @@ pub async fn provision_existing_identity(
     if scope_ids.is_empty() || scope_ids != approved_scopes {
         return Err("Invitation scope set differs from dual-approved scopes".into());
     }
-    if invite.role != "visitor" {
-        return Err("Keeper replication requires visitor grants".into());
+    if invite.role != "editor" {
+        return Err("Keeper integration requires an editor grant".into());
     }
     let identity_seed: [u8; 32] = base
         .identity_seed
@@ -414,6 +415,7 @@ pub async fn provision_existing_identity(
         }
         let commit = ProvisioningCommit {
             pairing_id: pairing_id.to_owned(),
+            integration_id: integration_id.to_owned(),
             operation_id: operation_id.to_owned(),
             transcript_hash: transcript_hash.to_owned(),
             invitation_id: invite.invitation_id.clone(),
@@ -628,7 +630,7 @@ pub(crate) fn prepare_config(
         authorization: entry
             .authorization
             .clone()
-            .ok_or("Missing Match write authorization")?,
+            .ok_or("Missing Tincanban write authorization")?,
         chat: entry
             .chat
             .clone()
@@ -663,7 +665,7 @@ pub(crate) fn prepare_config(
     if authority.expected_current_owner.person_id != invite.issuer_person_id
         || authority.expected_current_owner.public_key != owner_public_key
     {
-        return Err("Match document owner differs from invitation issuer".into());
+        return Err("Tincanban document owner differs from invitation issuer".into());
     }
     let mut initial_peers = peers.clone();
     initial_peers.push(local_peer.clone());
@@ -704,6 +706,7 @@ pub(crate) fn prepare_config(
         primary_detached: false,
         controller_person_id: None,
         provisioning_commits: Vec::new(),
+        integrations: Vec::new(),
     })
 }
 

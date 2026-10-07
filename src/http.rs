@@ -330,6 +330,8 @@ pub(crate) async fn operator_test_router_with_runtime(
     for name in ["inbox", "results", "captcha-used"] {
         fs::create_dir_all(directory.join(name)).unwrap();
     }
+    let pairings = discovery.pairings.clone();
+    let provisioner = discovery.provisioner.clone();
     http_app(AppState {
         inbox: Inbox {
             directory: Arc::new(directory.join("inbox")),
@@ -341,8 +343,8 @@ pub(crate) async fn operator_test_router_with_runtime(
             used: Arc::new(directory.join("captcha-used")),
         },
         ingest_slots: Arc::new(Semaphore::new(1)),
-        pairings: discovery.pairings.clone(),
-        provisioner: None,
+        pairings,
+        provisioner,
         discovery: Some(discovery),
         cors_settings: CorsSettings::open(directory.join("cors-origins.json"), Vec::new()).unwrap(),
         keeper: Some(keeper),
@@ -403,14 +405,7 @@ pub(crate) async fn pairing_status(
         .status(&id, request.clone())
         .map_err(PairingResponseError)?;
     if let Some(provisioner) = &state.provisioner {
-        if let Some(commit) = provisioner
-            .durable_commit(&id)
-            .map_err(|_| PairingResponseError(PairingError::Unavailable))?
-        {
-            pairings
-                .complete_from_durable_activation(&id, &commit)
-                .map_err(PairingResponseError)?;
-        }
+        reconcile_pairing_provisioning(pairings, provisioner, &id)?;
     }
     Ok(Json(
         serde_json::to_value(
@@ -438,6 +433,7 @@ pub(crate) async fn pairing_provision(
         let scope_results = if let Some(provisioner) = &state.provisioner {
             match provisioner
                 .provision(
+                    &provision.integration_id,
                     &id,
                     &provision.operation_id,
                     &provision.transcript_hash,
@@ -480,11 +476,105 @@ pub(crate) async fn pairing_provision(
         pairings
             .complete_provision(&id, scope_results, active)
             .map_err(PairingResponseError)?;
+    } else if let Some(provisioner) = &state.provisioner {
+        reconcile_pairing_provisioning(pairings, provisioner, &id)?;
     }
     let status = pairings
         .signed_provision_status(&id)
         .map_err(PairingResponseError)?;
     Ok(Json(serde_json::to_value(status).map_err(|_| {
+        PairingResponseError(PairingError::Unavailable)
+    })?))
+}
+
+fn reconcile_pairing_provisioning(
+    pairings: &PairingService,
+    provisioner: &ProvisioningService,
+    pairing_id: &str,
+) -> Result<(), PairingResponseError> {
+    let Some(commit) = provisioner
+        .durable_commit(pairing_id)
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?
+    else {
+        return Ok(());
+    };
+    match provisioner
+        .durable_lifecycle_status(pairing_id)
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?
+    {
+        Some(crate::keeper::ProvisioningLifecycleStatus::Active) => pairings
+            .complete_from_durable_activation(pairing_id, &commit)
+            .map_err(PairingResponseError),
+        Some(crate::keeper::ProvisioningLifecycleStatus::PendingCleanup) => pairings
+            .reconcile_durable_provisioning(pairing_id, &commit.operation_id, "pending_cleanup")
+            .map_err(PairingResponseError),
+        Some(crate::keeper::ProvisioningLifecycleStatus::Detached) => pairings
+            .reconcile_durable_provisioning(pairing_id, &commit.operation_id, "detached")
+            .map_err(PairingResponseError),
+        None => Ok(()),
+    }
+}
+
+pub(crate) async fn integration_status(
+    state: AppState,
+    request: ControllerRequest,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let controller_person_id = pairings
+        .verify_integration_status_request(&request)
+        .map_err(PairingResponseError)?;
+    let candidates = pairings
+        .integration_candidates(&controller_person_id)
+        .map_err(PairingResponseError)?;
+    let provisioner = state
+        .provisioner
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let (revision, integrations) = provisioner
+        .integration_status(&candidates, &controller_person_id)
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
+    let status = pairings
+        .sign_integration_status(
+            &controller_person_id,
+            &request.device_id,
+            request.signed.payload["operationId"]
+                .as_str()
+                .ok_or(PairingResponseError(PairingError::Unavailable))?,
+            revision,
+            json!(integrations),
+        )
+        .map_err(PairingResponseError)?;
+    Ok(Json(serde_json::to_value(status).map_err(|_| {
+        PairingResponseError(PairingError::Unavailable)
+    })?))
+}
+
+pub(crate) async fn integration_disconnect(
+    state: AppState,
+    integration_id: String,
+    request: ControllerRequest,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let verified = pairings
+        .verify_disconnect_request(&integration_id, &request)
+        .map_err(PairingResponseError)?;
+    let provisioner = state
+        .provisioner
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let receipt = provisioner
+        .disconnect_integration(&verified)
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
+    let signed = pairings
+        .sign_disconnect_receipt(receipt)
+        .map_err(PairingResponseError)?;
+    Ok(Json(serde_json::to_value(signed).map_err(|_| {
         PairingResponseError(PairingError::Unavailable)
     })?))
 }
@@ -1285,10 +1375,10 @@ async fn process_one(
             response,
         })
         .await
-        .map_err(|_| "Match writer unavailable".to_owned())?;
+        .map_err(|_| "Tincanban writer unavailable".to_owned())?;
     let card_id = received
         .await
-        .map_err(|_| "Match writer stopped".to_owned())??;
+        .map_err(|_| "Tincanban writer stopped".to_owned())??;
     result.status = if card_id.is_some() {
         "card_created_v2"
     } else {

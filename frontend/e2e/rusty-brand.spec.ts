@@ -12,7 +12,10 @@ for (const unavailable of [false, true]) {
     expect(await page.getByRole("heading", { name: "RUSTY", exact: true }).evaluate(el => getComputedStyle(el).fontFamily)).toContain("Caveat")
     expect(await page.getByRole("heading", { name: unavailable ? "Session check unavailable" : "Sign in", exact: true }).evaluate(el => getComputedStyle(el).fontFamily)).toContain("Caveat")
     expect(await robot.evaluate(image => ({ width: image.getBoundingClientRect().width, height: image.getBoundingClientRect().height }))).toEqual({ width: 64, height: 80 })
-    await expect(page.getByRole("button", { name: unavailable ? "Retry session check" : "Sign in with Match", exact: true })).toBeVisible()
+    await expect(page.getByRole("button", { name: unavailable ? "Retry session check" : "Sign in with Tincanban", exact: true })).toBeVisible()
+    if (!unavailable) {
+      await expect(page.getByText("Use your Tincanban identity to see boards connected to your account.", { exact: true })).toBeVisible()
+    }
     const controls = await page.locator("main .button, .login-card").evaluateAll(elements => elements.map(el => ({ radius: getComputedStyle(el).borderRadius, border: getComputedStyle(el).borderTopWidth })))
     expect(controls.every(control => control.radius === "0px" && control.border === "2px")).toBe(true)
     const paint = await page.locator("main .button, .login-card").evaluateAll(elements => elements.map(el => getComputedStyle(el).borderImageSource))
@@ -31,6 +34,18 @@ for (const unavailable of [false, true]) {
     await page.screenshot({ path: unavailable ? "/tmp/rusty-pending.png" : "/tmp/rusty-desktop.png" })
   })
 }
+
+test("Given an unsafe Tincanban sign-in response, when signing in, then the user sees a Tincanban-specific error", async ({ page }) => {
+  await page.route("**/admin/api/session", route => route.fulfill({ status: 403, json: { message: "Forbidden" } }))
+  await page.route("**/admin/api/login/challenge", route => route.fulfill({ json: {
+    challengeId: "challenge-1",
+    matchUrl: "https://attacker.example/login?keeper=https%3A%2F%2Frusty.example&challenge=challenge-1",
+  } }))
+  await page.goto("/admin/")
+  await page.getByRole("button", { name: "Sign in with Tincanban", exact: true }).click()
+  await expect(page.getByRole("status")).toContainText("Rusty returned an unsafe Tincanban sign-in link.")
+  await expect(page).toHaveURL(/\/admin\/$/)
+})
 
 test("Given narrow viewport, when Rusty opens, then robot and header fit without overflow", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 })

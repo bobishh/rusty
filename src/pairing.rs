@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 #[path = "owner_auth_tests.rs"]
 mod owner_auth_tests;
 
-use crate::ProvisioningCommit;
+use crate::{ProvisioningCommit, integration_id};
 
 pub const CONTROL_DOMAIN: &str = "MESH-LIGHTHOUSE/1";
 const MAX_AGE_SECONDS: u64 = 600;
@@ -97,10 +97,38 @@ pub struct ProvisionedScope {
 pub struct ProvisionRequest {
     pub invitation: WorkspaceJoinInvitation,
     pub scopes: Vec<String>,
+    pub integration_id: String,
     pub operation_id: String,
     pub transcript_hash: String,
     pub future_boards: bool,
     pub should_run: bool,
+}
+
+#[derive(Clone)]
+pub struct IntegrationCandidate {
+    pub integration_id: String,
+    pub pairing_id: String,
+    pub controller_person_id: String,
+    pub future_boards: bool,
+}
+
+#[derive(Clone)]
+pub struct VerifiedDisconnectRequest {
+    pub integration_id: String,
+    pub operation_id: String,
+    pub controller_person_id: String,
+    pub controller_device_id: String,
+    pub expected_revision: u64,
+    pub scopes: Vec<(String, u64)>,
+    pub request_hash: String,
+}
+
+fn provisioning_future_boards(record: &PairingRecord) -> bool {
+    record
+        .offer
+        .pointer("/body/policy/futureBoards")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[derive(Clone)]
@@ -335,7 +363,7 @@ impl PairingService {
             "servicePersonId": self.service_identity.person_id,
             "serviceDeviceId": self.service_device_id,
             "serviceOrigin": self.origin, "nonce": nonce,
-            "integrationId": random_token(16), "issuedAt": now, "expiresAt": expires_at,
+            "integrationId": integration_id(&request.identity.person_id, &self.service_identity.person_id), "issuedAt": now, "expiresAt": expires_at,
         });
         let challenge = sign_json_envelope(
             &self.service_seed,
@@ -517,6 +545,12 @@ impl PairingService {
         if record.controller_approved != Some(true) || record.operator_approved != Some(true) {
             return Err(PairingError::Forbidden);
         }
+        let integration_id = record.challenge.payload["integrationId"]
+            .as_str()
+            .ok_or(PairingError::Invalid(
+                "Pairing is missing integration identity",
+            ))?
+            .to_owned();
         if record
             .offer
             .pointer("/body/policy/futureBoards")
@@ -560,7 +594,7 @@ impl PairingService {
             || invitation.issuer_person_id != request.identity.person_id
             || invitation.issuer_device_id != request.device_id
             || invitation.issuer_public_key != device_key
-            || invitation.role != "visitor"
+            || invitation.role != "editor"
             || invitation.secret.len() < 32
             || invitation
                 .workspaces
@@ -601,10 +635,14 @@ impl PairingService {
             if previous.operation_id != operation_id || previous.request_hash != request_hash {
                 return Err(PairingError::Conflict);
             }
+            if matches!(previous.status.as_str(), "pending_cleanup" | "detached") {
+                return Err(PairingError::Conflict);
+            }
             if previous.status == "active" {
                 return Ok(ProvisionRequest {
                     invitation,
                     scopes: scope_ids,
+                    integration_id: integration_id.clone(),
                     operation_id,
                     transcript_hash,
                     future_boards,
@@ -642,6 +680,7 @@ impl PairingService {
         Ok(ProvisionRequest {
             invitation,
             scopes: scope_ids,
+            integration_id,
             operation_id,
             transcript_hash,
             future_boards,
@@ -731,6 +770,46 @@ impl PairingService {
         Ok(())
     }
 
+    pub fn reconcile_durable_provisioning(
+        &self,
+        id: &str,
+        operation_id: &str,
+        status: &str,
+    ) -> Result<(), PairingError> {
+        if !matches!(status, "pending_cleanup" | "detached") {
+            return Err(PairingError::Invalid("Invalid durable provisioning state"));
+        }
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let mut next = state.clone();
+        let provisioning = next
+            .records
+            .get_mut(id)
+            .ok_or(PairingError::NotFound)?
+            .provisioning
+            .as_mut()
+            .ok_or(PairingError::Conflict)?;
+        if provisioning.operation_id != operation_id {
+            return Err(PairingError::Conflict);
+        }
+        if provisioning.status == "detached" && status != "detached" {
+            return Err(PairingError::Conflict);
+        }
+        let scope_status = if status == "detached" {
+            "removed"
+        } else {
+            "pending"
+        };
+        provisioning.status = status.into();
+        for scope in &mut provisioning.scopes {
+            scope.status = scope_status.into();
+            scope.error = None;
+            scope.error_detail = None;
+        }
+        self.persist(&next)?;
+        *state = next;
+        Ok(())
+    }
+
     pub fn status(
         &self,
         id: &str,
@@ -773,6 +852,179 @@ impl PairingService {
         self.sign_status_record(record)
     }
 
+    pub fn verify_integration_status_request(
+        &self,
+        request: &ControllerRequest,
+    ) -> Result<String, PairingError> {
+        self.verify_controller(request)?;
+        let now = now_seconds();
+        let payload = &request.signed.payload;
+        validate_common(
+            payload,
+            "lighthouse-integration-status-request",
+            request,
+            &self.service_identity,
+            &self.origin,
+            now,
+        )?;
+        if payload["serviceDeviceId"] != self.service_device_id {
+            return Err(PairingError::Forbidden);
+        }
+        Ok(request.identity.person_id.clone())
+    }
+
+    pub fn integration_candidates(
+        &self,
+        controller_person_id: &str,
+    ) -> Result<Vec<IntegrationCandidate>, PairingError> {
+        let state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let mut candidates = state
+            .records
+            .values()
+            .filter_map(|record| {
+                let provisioning = record.provisioning.as_ref()?;
+                if record.controller.person_id != controller_person_id
+                    || provisioning.status != "active"
+                {
+                    return None;
+                }
+                let integration_id = record.challenge.payload["integrationId"].as_str()?;
+                Some(IntegrationCandidate {
+                    integration_id: integration_id.to_owned(),
+                    pairing_id: record.id.clone(),
+                    controller_person_id: controller_person_id.to_owned(),
+                    future_boards: provisioning_future_boards(record),
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.integration_id
+                .cmp(&right.integration_id)
+                .then_with(|| left.pairing_id.cmp(&right.pairing_id))
+        });
+        candidates.dedup_by(|left, right| {
+            if left.integration_id == right.integration_id {
+                // Conflicting historical consent resolves to the restrictive value.
+                left.future_boards &= right.future_boards;
+                true
+            } else {
+                false
+            }
+        });
+        Ok(candidates)
+    }
+
+    pub fn verify_disconnect_request(
+        &self,
+        path_integration_id: &str,
+        request: &ControllerRequest,
+    ) -> Result<VerifiedDisconnectRequest, PairingError> {
+        self.verify_controller(request)?;
+        let now = now_seconds();
+        let payload = &request.signed.payload;
+        validate_common(
+            payload,
+            "lighthouse-integration-disconnect",
+            request,
+            &self.service_identity,
+            &self.origin,
+            now,
+        )?;
+        let integration_id = string_field(payload, "integrationId")?;
+        if integration_id != path_integration_id
+            || payload["serviceDeviceId"] != self.service_device_id
+        {
+            return Err(PairingError::Forbidden);
+        }
+        let scopes = payload["scopes"]
+            .as_array()
+            .filter(|scopes| !scopes.is_empty() && scopes.len() <= MAX_SCOPES)
+            .ok_or(PairingError::Invalid("Invalid disconnect scope list"))?
+            .iter()
+            .map(|scope| {
+                let workspace_id = scope["workspaceId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 256)
+                    .ok_or(PairingError::Invalid("Invalid disconnect scope"))?;
+                let epoch = scope["expectedGrantEpoch"]
+                    .as_u64()
+                    .filter(|epoch| *epoch > 0)
+                    .ok_or(PairingError::Invalid("Invalid disconnect grant epoch"))?;
+                Ok((workspace_id.to_owned(), epoch))
+            })
+            .collect::<Result<Vec<_>, PairingError>>()?;
+        let mut unique = std::collections::HashSet::new();
+        if scopes.iter().any(|(id, _)| !unique.insert(id.as_str())) {
+            return Err(PairingError::Invalid("Duplicate disconnect scope"));
+        }
+        let expected_revision = payload["expectedRevision"]
+            .as_u64()
+            .ok_or(PairingError::Invalid("Missing integration revision"))?;
+        let mut semantic = payload.clone();
+        if let Some(object) = semantic.as_object_mut() {
+            object.remove("controllerDeviceId");
+            object.remove("issuedAt");
+            object.remove("expiresAt");
+        }
+        let canonical = canonicalize_json(&semantic)
+            .map_err(|_| PairingError::Invalid("Invalid disconnect request"))?;
+        let request_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
+        Ok(VerifiedDisconnectRequest {
+            integration_id: integration_id.to_owned(),
+            operation_id: string_field(payload, "operationId")?.to_owned(),
+            controller_person_id: request.identity.person_id.clone(),
+            controller_device_id: request.device_id.clone(),
+            expected_revision,
+            scopes,
+            request_hash,
+        })
+    }
+
+    pub fn sign_integration_status(
+        &self,
+        controller_person_id: &str,
+        controller_device_id: &str,
+        operation_id: &str,
+        revision: u64,
+        integrations: Value,
+    ) -> Result<SignedEnvelope<Value>, PairingError> {
+        sign_json_envelope(
+            &self.service_seed,
+            json!({
+                "kind":"lighthouse-integration-status", "version":1,
+                "servicePersonId":self.service_identity.person_id,
+                "serviceDeviceId":self.service_device_id,
+                "serviceOrigin":self.origin,
+                "controllerPersonId":controller_person_id,
+                "controllerDeviceId":controller_device_id,
+                "operationId":operation_id,
+                "revision":revision,
+                "integrations":integrations,
+                "issuedAt":now_seconds(),
+            }),
+            &self.service_device_id,
+            CONTROL_DOMAIN,
+        )
+        .map_err(|_| PairingError::Unavailable)
+    }
+
+    pub fn sign_disconnect_receipt(
+        &self,
+        mut receipt: Value,
+    ) -> Result<SignedEnvelope<Value>, PairingError> {
+        receipt["servicePersonId"] = json!(self.service_identity.person_id);
+        receipt["serviceDeviceId"] = json!(self.service_device_id);
+        receipt["serviceOrigin"] = json!(self.origin);
+        receipt["issuedAt"] = json!(now_seconds());
+        sign_json_envelope(
+            &self.service_seed,
+            receipt,
+            &self.service_device_id,
+            CONTROL_DOMAIN,
+        )
+        .map_err(|_| PairingError::Unavailable)
+    }
+
     fn sign_status_record(
         &self,
         record: &PairingRecord,
@@ -802,6 +1054,7 @@ impl PairingService {
             .unwrap_or(Value::Bool(false));
         sign_json_envelope(&self.service_seed, json!({
             "kind":"lighthouse-pairing-status", "version":1, "pairingId":record.id,
+            "integrationId":record.challenge.payload["integrationId"],
             "transcriptHash":record.transcript_hash, "servicePersonId":self.service_identity.person_id,
             "serviceDeviceId":self.service_device_id, "serviceOrigin":self.origin,
             "expiresAt":record.expires_at, "operatorApproved":record.operator_approved,
@@ -853,11 +1106,11 @@ impl PairingService {
         let intent_cookie = random_token(32);
         let expires_at = now + LOGIN_TTL_SECONDS;
         let mut url = reqwest::Url::parse(match_origin)
-            .map_err(|_| PairingError::Invalid("Invalid Match origin"))?;
+            .map_err(|_| PairingError::Invalid("Invalid Tincanban origin"))?;
         if url.origin().ascii_serialization() != match_origin
             || !matches!(url.scheme(), "https" | "http")
         {
-            return Err(PairingError::Invalid("Invalid Match origin"));
+            return Err(PairingError::Invalid("Invalid Tincanban origin"));
         }
         url.set_path("/login");
         url.set_query(None);

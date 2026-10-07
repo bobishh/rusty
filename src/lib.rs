@@ -9,7 +9,7 @@ use automerge::{
     ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ROOT, ReadDoc, ScalarValue,
     transaction::{CommitOptions, Transactable},
 };
-use match_authority::{admit_match_candidate, prepare_match_write_authority};
+use match_authority::{admit_tincanban_candidate, prepare_tincanban_write_authority};
 use meta_mesh_core::{
     DEFAULT_SIGNATURE_DOMAIN, MeshCatalog, MeshHandshake, MeshPeerAdmission, SignedDeparture,
     SignedDeviceRevocation, VerifyWorkspaceMemberOptions, WorkspaceChangeAuthorizationPayload,
@@ -122,7 +122,7 @@ impl MatchScopeStore {
                 .map(|change| change.hash().to_string())
                 .collect::<Vec<_>>();
             let admission = authorization_admission_bundle(&guard.state.authorization)?;
-            admit_match_candidate(
+            admit_tincanban_candidate(
                 None,
                 &guard.state.document,
                 &hashes,
@@ -155,15 +155,15 @@ impl MatchScopeStore {
             .state
             .document
             .clone();
-        let mut document = AutoCommit::load(&bytes).map_err(|_| "Invalid Match document")?;
+        let mut document = AutoCommit::load(&bytes).map_err(|_| "Invalid Tincanban document")?;
         let title = match document
             .get(ROOT, "title")
-            .map_err(|_| "Invalid Match document title")?
+            .map_err(|_| "Invalid Tincanban document title")?
         {
             Some((automerge::Value::Object(ObjType::Text), object)) => Some(
                 document
                     .text(object)
-                    .map_err(|_| "Invalid Match document title")?,
+                    .map_err(|_| "Invalid Tincanban document title")?,
             ),
             Some((value, _)) => value.as_str().map(str::to_owned),
             None => None,
@@ -186,8 +186,8 @@ impl MatchScopeStore {
             .state
             .document
             .clone();
-        let document =
-            AutoCommit::load(&bytes).map_err(|error| format!("Invalid Match document: {error}"))?;
+        let document = AutoCommit::load(&bytes)
+            .map_err(|error| format!("Invalid Tincanban document: {error}"))?;
         let view =
             serde_json::to_value(AutoSerde::from(&document)).map_err(|error| error.to_string())?;
         Ok(view
@@ -257,14 +257,14 @@ impl MatchScopeStore {
         }
         let state = self.snapshot()?;
         let mut document = AutoCommit::load(&state.document)
-            .map_err(|error| format!("Invalid Match document: {error}"))?;
+            .map_err(|error| format!("Invalid Tincanban document: {error}"))?;
         document.set_actor(ActorId::from(member.payload.device_id.as_bytes().to_vec()));
         let view =
             serde_json::to_value(AutoSerde::from(&document)).map_err(|error| error.to_string())?;
         let entities = view
             .get("entities")
             .and_then(Value::as_object)
-            .ok_or("Invalid Match entities")?;
+            .ok_or("Invalid Tincanban entities")?;
         if entities.contains_key(lead_id) {
             return Ok(lead_id.to_owned());
         }
@@ -295,7 +295,7 @@ impl MatchScopeStore {
         let (_, entities_object) = document
             .get(ROOT, "entities")
             .map_err(|error| error.to_string())?
-            .ok_or("Missing Match entities")?;
+            .ok_or("Missing Tincanban entities")?;
         let id = lead_id.to_owned();
         let now = time::OffsetDateTime::from_unix_timestamp_nanos(now_ms()? * 1_000_000)
             .map_err(|error| error.to_string())?
@@ -358,9 +358,9 @@ impl MatchScopeStore {
         )?;
         let mut proof = state
             .authorization
-            .ok_or("Missing Match write authorization")?;
+            .ok_or("Missing Tincanban write authorization")?;
         proof.get_mut("records").and_then(Value::as_array_mut)
-            .ok_or("Missing Match write authorizations")?
+            .ok_or("Missing Tincanban write authorizations")?
             .push(json!({"signed":signed,"publicKey":member.public_key,"certificates":member.certificates,
                 "grant":member.grant,"ownerPublicKey":member.owner_public_key,
                 "ownerCertificates":member.owner_certificates}));
@@ -516,7 +516,7 @@ impl MatchScopeStore {
             .get("records")
             .and_then(Value::as_array)
             .ok_or("Missing lighthouse write authorizations")?;
-        let (snapshot, merged) = prepare_match_write_authority(
+        let (snapshot, merged) = prepare_tincanban_write_authority(
             &state.document,
             evidence,
             None,
@@ -544,14 +544,14 @@ impl MatchScopeStore {
 }
 
 fn match_chat_scope(document: &[u8]) -> Result<String, String> {
-    let document =
-        AutoCommit::load(document).map_err(|error| format!("Invalid Match document: {error}"))?;
+    let document = AutoCommit::load(document)
+        .map_err(|error| format!("Invalid Tincanban document: {error}"))?;
     let view =
         serde_json::to_value(AutoSerde::from(&document)).map_err(|error| error.to_string())?;
     let owner = view
         .get("ownerPersonId")
         .and_then(Value::as_str)
-        .ok_or("Match workspace has no owner")?;
+        .ok_or("Tincanban workspace has no owner")?;
     let board_id = view
         .get("entities")
         .and_then(Value::as_object)
@@ -560,7 +560,7 @@ fn match_chat_scope(document: &[u8]) -> Result<String, String> {
                 (entity.get("kind").and_then(Value::as_str) == Some("board")).then_some(id)
             })
         })
-        .ok_or("Match workspace has no board")?;
+        .ok_or("Tincanban workspace has no board")?;
     Ok(format!("{owner}:{board_id}"))
 }
 
@@ -647,11 +647,11 @@ impl NativeScopeHost for MatchScopeStore {
             .map_err(|_| "Lighthouse state lock poisoned")?;
         let incoming = proof
             .and_then(|value| value.get("authority"))
-            .ok_or("Missing incoming Match authority")?;
+            .ok_or("Missing incoming Tincanban authority")?;
         let incoming_records =
-            authorization_records(proof.ok_or("Missing incoming Match write authorizations")?)?;
+            authorization_records(proof.ok_or("Missing incoming Tincanban write authorizations")?)?;
         let known = guard.state.authorization.get("authority");
-        let (snapshot, merged) = prepare_match_write_authority(
+        let (snapshot, merged) = prepare_tincanban_write_authority(
             candidate,
             incoming,
             known,
@@ -659,7 +659,7 @@ impl NativeScopeHost for MatchScopeStore {
             &self.genesis_person_id,
             now_ms()?,
         )?;
-        let verified = admit_match_candidate(
+        let verified = admit_tincanban_candidate(
             Some(&guard.state.document),
             candidate,
             accepted_hashes,
@@ -686,9 +686,11 @@ impl NativeScopeHost for MatchScopeStore {
             .inner
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
-        let incoming_evidence = incoming.get("authority").ok_or("Missing Match authority")?;
+        let incoming_evidence = incoming
+            .get("authority")
+            .ok_or("Missing Tincanban authority")?;
         let incoming_records = authorization_records(incoming)?;
-        let (snapshot, merged) = prepare_match_write_authority(
+        let (snapshot, merged) = prepare_tincanban_write_authority(
             &guard.state.document,
             incoming_evidence,
             guard.state.authorization.get("authority"),
@@ -696,7 +698,7 @@ impl NativeScopeHost for MatchScopeStore {
             &self.genesis_person_id,
             now_ms()?,
         )?;
-        let verified = admit_match_candidate(
+        let verified = admit_tincanban_candidate(
             Some(&guard.state.document),
             &guard.state.document,
             &[],
@@ -750,11 +752,11 @@ impl NativeScopeHost for MatchScopeStore {
     }
 
     fn merge_durable_batch(&mut self, _: &[u8]) -> Result<(), String> {
-        Err("Match lighthouse does not accept workspace-set imports".into())
+        Err("Tincanban lighthouse does not accept workspace-set imports".into())
     }
 
     fn merge_owner_offer(&mut self, _: &[u8]) -> Result<(), String> {
-        Err("Match lighthouse does not accept owner workspace offers".into())
+        Err("Tincanban lighthouse does not accept owner workspace offers".into())
     }
 
     fn receive_gossip(&mut self, _: &[u8]) -> Result<(), String> {

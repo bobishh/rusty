@@ -13,7 +13,7 @@ async function signedInOperator(page: import("@playwright/test").Page) {
   await page.route("**/admin/api/pairings", route => route.fulfill({ json: { pairings: [] } }))
 }
 
-test("Given an operator, when allowed origins are saved, then Match stays required and homepage is accepted", async ({ page }) => {
+test("Given an operator, when allowed origins are saved, then Tincanban stays required and homepage is accepted", async ({ page }) => {
   await signedInOperator(page)
   await page.route("**/admin/api/settings/cors", route => {
     if (route.request().method() === "GET") return route.fulfill({ json: {
@@ -25,7 +25,7 @@ test("Given an operator, when allowed origins are saved, then Match stays requir
   })
   await page.goto("/admin/settings")
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible()
-  await expect(page.getByText(`Match: ${matchOrigin}`)).toBeVisible()
+  await expect(page.getByText(`Tincanban: ${matchOrigin}`)).toBeVisible()
   await page.getByRole("textbox", { name: "Additional origins" }).fill("https://meta-uber-engineer.dev")
   await page.getByRole("button", { name: "Save origins" }).click()
   await expect(page.getByRole("status")).toContainText("Allowed origins saved")

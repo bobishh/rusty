@@ -29,6 +29,27 @@ test("Given operator session, when navigating and reloading routes, then pages f
   await expect(page.getByRole("heading", { name: "Approvals", exact: true })).toBeVisible()
 })
 
+test("Given a signed-in admin, when viewing keeper, approval, and settings routes, then user-facing references use Tincanban", async ({ page }) => {
+  await signedIn(page)
+  await page.goto("/admin/keepers")
+  await expect(page.getByText("Keeper services connected to your Tincanban identity.", { exact: true })).toBeVisible()
+  await page.getByRole("link", { name: "Open keeper" }).click()
+  await expect(page.getByText("0 cards created · 0 chats queued · 1 awaiting Tincanban", { exact: true })).toBeVisible()
+  await page.getByRole("link", { name: "Approvals", exact: true }).click()
+  await expect(page.getByText("No pending keeper requests. Create one from Tincanban → Sync → Add keeper.", { exact: true })).toBeVisible()
+  await page.getByRole("link", { name: "Settings", exact: true }).click()
+  await expect(page.getByText("Tincanban sign-in origin stays enabled. Add other websites allowed to reach Rusty intake, one HTTPS origin per line.", { exact: true })).toBeVisible()
+  await expect(page.getByText("Tincanban: https://match.example", { exact: true })).toBeVisible()
+})
+
+test("Given a keeper awaiting owner confirmation, when opening approvals, then status names Tincanban", async ({ page }) => {
+  await page.route("**/admin/api/session", route => route.fulfill({ json: { csrfToken: "csrf", personId: "owner", displayName: "Owner", operator: false } }))
+  await page.route("**/admin/api/overview", route => route.fulfill({ json: { keeper: { displayName: "Rusty", personId: "keeper-person", deviceId: "device-1", boards: [] }, triggers: [], replication: { state: "idle", activePeers: 0 } } }))
+  await page.route("**/admin/api/pairings", route => route.fulfill({ json: { pairings: [{ id: "pending-1", comparisonCode: "123456", controller: { displayName: "Owner" }, controllerFingerprint: "owner", serviceFingerprint: "keeper", scopes: [{ title: "Garden", mode: "replicate" }], futureBoards: false, operatorApproved: true, controllerApproved: null }] } }))
+  await page.goto("/admin/approvals")
+  await expect(page.getByText("Waiting for Tincanban identity confirmation.", { exact: false })).toBeVisible()
+})
+
 test("Given owner session, when opening operator settings URL, then route returns to keepers", async ({ page }) => {
   await signedIn(page, false)
   await page.goto("/admin/settings")

@@ -14,6 +14,8 @@ use tokio::sync::Mutex;
 mod app;
 mod controllers;
 mod cors_settings;
+#[cfg(feature = "e2e-fixture")]
+mod e2e_fixture;
 mod http;
 mod join;
 mod keeper;
@@ -53,12 +55,60 @@ pub(crate) struct Config {
     pub(crate) controller_person_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) provisioning_commits: Vec<ProvisioningCommit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) integrations: Vec<IntegrationRecord>,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct IntegrationRecord {
+    pub(crate) integration_id: String,
+    pub(crate) controller_person_id: String,
+    pub(crate) service_person_id: String,
+    pub(crate) revision: u64,
+    pub(crate) future_boards: bool,
+    pub(crate) scopes: Vec<IntegrationScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tombstones: Vec<ScopeTombstone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_disconnect: Option<DisconnectOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) disconnect_history: Vec<DisconnectOperation>,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct IntegrationScope {
+    pub(crate) workspace_id: String,
+    pub(crate) grant_epoch: u64,
+    pub(crate) state: String,
+    pub(crate) activation_operation_id: String,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScopeTombstone {
+    pub(crate) workspace_id: String,
+    pub(crate) grant_epoch: u64,
+    pub(crate) operation_id: String,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DisconnectOperation {
+    pub(crate) operation_id: String,
+    pub(crate) request_hash: String,
+    pub(crate) expected_revision: u64,
+    pub(crate) workspace_ids: Vec<String>,
+    pub(crate) status: String,
 }
 
 #[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProvisioningCommit {
     pub(crate) pairing_id: String,
+    #[serde(default)]
+    pub(crate) integration_id: String,
     pub(crate) operation_id: String,
     pub(crate) transcript_hash: String,
     pub(crate) invitation_id: String,
@@ -71,16 +121,38 @@ pub(crate) struct ProvisioningCommit {
     pub(crate) controller_person_id: Option<String>,
 }
 
+pub(crate) fn integration_id(controller_person_id: &str, service_person_id: &str) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"MESH-LIGHTHOUSE-INTEGRATION/1\0");
+    digest.update(controller_person_id.as_bytes());
+    digest.update([0]);
+    digest.update(service_person_id.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
     let path = args.next().ok_or(
         "Usage: match-lighthouse CONFIG.json | match-lighthouse join INVITE_URL STATE_DIR",
     )?;
+    #[cfg(feature = "e2e-fixture")]
+    if path == "e2e-fixture-empty" {
+        let directory = PathBuf::from(args.next().ok_or("Missing fixture state directory")?);
+        if args.next().is_some() {
+            return Err("Too many e2e-fixture-empty arguments".into());
+        }
+        let output = e2e_fixture::write_empty_service(&directory)?;
+        println!("{}", serde_json::to_string(&output)?);
+        return Ok(());
+    }
     if path == "join" {
         let invite = args
             .next()
-            .ok_or("Missing Match workspace invitation URL")?;
+            .ok_or("Missing Tincanban workspace invitation URL")?;
         let directory = args.next().ok_or("Missing lighthouse state directory")?;
         if args.next().is_some() {
             return Err("Too many join arguments".into());

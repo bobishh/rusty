@@ -53,6 +53,7 @@ impl Hooks for LighthouseApp {
         AppRoutes::empty()
             .add_route(controllers::public::routes())
             .add_route(controllers::pairings::routes())
+            .add_route(controllers::integrations::routes())
             .add_route(controllers::pairings::login_routes())
             .add_route(controllers::operator::routes())
     }

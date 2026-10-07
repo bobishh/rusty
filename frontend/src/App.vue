@@ -186,7 +186,7 @@ function validMatchLoginUrl(value: string, challengeId: string) {
     || target.searchParams.get("keeper") !== window.location.origin
     || target.searchParams.get("challenge") !== challengeId
     || (target.protocol !== "https:" && !(loopback && target.protocol === "http:"))) {
-    throw new Error("Rusty returned an unsafe Match sign-in link.")
+    throw new Error("Rusty returned an unsafe Tincanban sign-in link.")
   }
   return target.toString()
 }
@@ -202,7 +202,7 @@ async function signInWithMatch() {
     window.location.assign(validMatchLoginUrl(response.matchUrl, response.challengeId))
   } catch (cause) {
     loading.value = false
-    error.value = cause instanceof Error ? cause.message : "Could not start Match sign-in."
+    error.value = cause instanceof Error ? cause.message : "Could not start Tincanban sign-in."
   }
 }
 
@@ -279,7 +279,7 @@ async function exchangeLoginCode() {
     await loadCorsSettings()
   } catch (cause) {
     clearIdentity()
-    error.value = cause instanceof Error ? cause.message : "Could not complete Match sign-in."
+    error.value = cause instanceof Error ? cause.message : "Could not complete Tincanban sign-in."
   } finally {
     sessionLoading.value = false
   }
@@ -414,7 +414,7 @@ async function unsubscribe() {
 function pairingStatus(pairing: Pairing) {
   if (pairing.operatorApproved === false || pairing.controllerApproved === false) return "Keeper request declined. No access granted."
   if (pairing.operatorApproved === null) return "Waiting for keeper operator to approve service access."
-  if (pairing.controllerApproved === null) return "Waiting for Match identity confirmation."
+  if (pairing.controllerApproved === null) return "Waiting for Tincanban identity confirmation."
   return "Both approvals are recorded. Board status appears on keeper detail."
 }
 
@@ -450,8 +450,8 @@ onUnmounted(() => {
         <button class="button button-primary" type="button" @click="restoreSession">Retry session check</button>
       </section>
       <form v-else-if="!signedIn" class="login-card" @submit.prevent="signIn">
-        <h2 tabindex="-1">Sign in</h2><p class="section-copy">Use your Match identity to see boards connected to your account.</p>
-        <button class="button button-primary" type="button" :disabled="loading" @click="signInWithMatch">{{ loading ? "Opening Match…" : "Sign in with Match" }}</button>
+        <h2 tabindex="-1">Sign in</h2><p class="section-copy">Use your Tincanban identity to see boards connected to your account.</p>
+        <button class="button button-primary" type="button" :disabled="loading" @click="signInWithMatch">{{ loading ? "Opening Tincanban…" : "Sign in with Tincanban" }}</button>
         <details class="service-admin-fallback"><summary>Service administration</summary><p class="section-copy">Operator token grants service-wide approval access.</p>
           <label class="field-label" for="operator-token">Operator token</label><input id="operator-token" v-model="token" type="password" autocomplete="current-password" required />
           <button class="button button-quiet" type="submit">Sign in as operator</button>
@@ -474,7 +474,7 @@ onUnmounted(() => {
           <a class="button button-small" href="/admin/keepers" @click.prevent="navigate('/admin/keepers')">Back to keepers</a>
         </section>
         <section v-if="currentPage === 'keepers'" aria-labelledby="keepers-title" class="admin-section">
-          <div class="section-heading"><div><h2 id="keepers-title">Keepers</h2><p class="section-copy">Keeper services connected to your Match identity.</p></div><p v-if="overview" class="replication-status" :data-state="replicationState">Replication {{ replicationState }}</p></div>
+          <div class="section-heading"><div><h2 id="keepers-title">Keepers</h2><p class="section-copy">Keeper services connected to your Tincanban identity.</p></div><p v-if="overview" class="replication-status" :data-state="replicationState">Replication {{ replicationState }}</p></div>
           <p v-if="!overview" class="empty-state">Keeper list unavailable. {{ error || 'Retrying automatically…' }}</p>
           <div v-else class="keeper-list">
             <article class="keeper-card keeper-list-item">
@@ -482,7 +482,7 @@ onUnmounted(() => {
               <p>{{ overview.keeper.boards.map(board => board.title).join(' · ') || 'No attached boards' }}</p>
               <a class="button button-small" :href="`/admin/keepers/${encodeURIComponent(overview.keeper.personId)}`" @click.prevent="navigate(`/admin/keepers/${encodeURIComponent(overview.keeper.personId)}`)">Open keeper</a>
             </article>
-            <p class="muted">To connect boards, use Match → Sync → Add keeper.</p>
+            <p class="muted">To connect boards, use Tincanban → Sync → Add keeper.</p>
           </div>
         </section>
 
@@ -502,7 +502,7 @@ onUnmounted(() => {
             <article class="keeper-card"><h3>Triggers</h3><p v-if="!overview.triggers.length" class="muted">No configured triggers.</p>
               <article v-for="trigger in overview.triggers" :key="trigger.id" class="board-row"><div class="board-title"><strong>{{ trigger.name }}</strong></div>
                 <p v-if="trigger.errorDetail" class="admin-notice admin-notice-error" role="alert">{{ trigger.errorDetail }}</p><p>{{ trigger.configured ? "Configured" : "Not configured" }} · {{ trigger.pendingCount }} pending · {{ trigger.model }}</p>
-                <p>{{ trigger.outcomes.cardCreated }} cards created · {{ trigger.outcomes.chatQueued }} chats queued · {{ trigger.outcomes.awaitingMesh }} awaiting Match</p>
+                <p>{{ trigger.outcomes.cardCreated }} cards created · {{ trigger.outcomes.chatQueued }} chats queued · {{ trigger.outcomes.awaitingMesh }} awaiting Tincanban</p>
               </article>
             </article>
             <a class="button button-quiet" href="/admin/keepers" @click.prevent="navigate('/admin/keepers')">Back to keepers</a>
@@ -511,7 +511,7 @@ onUnmounted(() => {
 
         <section v-else-if="currentPage === 'approvals'" aria-labelledby="approvals-title" class="admin-section approvals-section">
           <div class="section-heading"><h2 id="approvals-title">Approvals<span v-if="pendingPairings.length"> ({{ pendingPairings.length }})</span></h2></div>
-          <p v-if="!pendingPairings.length" class="empty-state">No pending keeper requests. Create one from Match → Sync → Add keeper.</p>
+          <p v-if="!pendingPairings.length" class="empty-state">No pending keeper requests. Create one from Tincanban → Sync → Add keeper.</p>
           <article v-for="pairing in pendingPairings" :key="pairing.id" class="approval-card">
             <h3>{{ pairing.controller.displayName }} · {{ pairing.comparisonCode }}</h3><p class="muted">Controller {{ pairing.controllerFingerprint }} · service {{ pairing.serviceFingerprint }}</p>
             <ul><li v-for="scope in pairing.scopes" :key="scope.title">{{ scope.title }} · {{ scope.mode }}</li></ul><p>{{ pairing.futureBoards ? "Future boards included in approval" : "Future boards not included" }}</p>
@@ -526,22 +526,22 @@ onUnmounted(() => {
         <section v-else-if="currentPage === 'settings'" aria-labelledby="settings-title" class="admin-section">
           <div class="section-heading"><h2 id="settings-title">Settings</h2></div>
           <template v-if="adminIdentity?.operator">
-            <form class="keeper-card cors-settings" @submit.prevent="saveCorsSettings"><h3>Allowed website origins</h3><p class="section-copy">Match sign-in origin stays enabled. Add other websites allowed to reach Rusty intake, one HTTPS origin per line.</p>
-              <p class="muted">Match: {{ corsRequired || "Loading…" }}</p><label class="field-label" for="cors-origins">Additional origins</label><textarea id="cors-origins" v-model="corsDraft" :disabled="!corsLoaded || corsSaving" rows="3" placeholder="https://example.com"></textarea>
+            <form class="keeper-card cors-settings" @submit.prevent="saveCorsSettings"><h3>Allowed website origins</h3><p class="section-copy">Tincanban sign-in origin stays enabled. Add other websites allowed to reach Rusty intake, one HTTPS origin per line.</p>
+              <p class="muted">Tincanban: {{ corsRequired || "Loading…" }}</p><label class="field-label" for="cors-origins">Additional origins</label><textarea id="cors-origins" v-model="corsDraft" :disabled="!corsLoaded || corsSaving" rows="3" placeholder="https://example.com"></textarea>
               <div class="cors-actions"><button class="button button-small button-primary" type="submit" :disabled="!corsLoaded || corsSaving">{{ corsSaving ? "Saving…" : "Save origins" }}</button><button v-if="!corsLoaded" class="button button-small" type="button" @click="loadCorsSettings">Retry loading</button></div>
               <p v-if="corsError" class="admin-notice admin-notice-error" role="alert">{{ corsError }}</p><p v-if="corsNotice" class="admin-notice" role="status">{{ corsNotice }}</p>
             </form>
-            <div class="keeper-card danger-zone"><h3>Reset keeper</h3><p>Remove all boards, pairing requests, intake messages and JEV results. Rusty keeps its identity and website settings. Match keeps its boards. A private recovery backup stays on the server.</p><button class="button button-small button-danger" type="button" @click="openReset">Reset keeper</button></div>
+            <div class="keeper-card danger-zone"><h3>Reset keeper</h3><p>Remove all boards, pairing requests, intake messages and JEV results. Rusty keeps its identity and website settings. Tincanban keeps its boards. A private recovery backup stays on the server.</p><button class="button button-small button-danger" type="button" @click="openReset">Reset keeper</button></div>
           </template>
           <p v-else class="empty-state">Settings require operator access.</p>
         </section>
       </template>
 
       <dialog ref="unsubscribeDialog" class="dialog" aria-labelledby="unsubscribe-title" @cancel="unsubscribing && $event.preventDefault()" @close="onUnsubscribeDialogClose">
-        <form method="dialog" @submit.prevent="unsubscribe"><div class="dialog-head"><h2 id="unsubscribe-title">Unsubscribe board</h2></div><div class="dialog-body"><p>Stop replicating {{ unsubscribeBoard?.title }}?</p><p class="muted">Disconnects this board from Rusty and ends its owner's future-board subscription. Match keeps its copy.</p><p v-if="unsubscribeError" class="admin-notice admin-notice-error" role="alert">{{ unsubscribeError }}</p></div><div class="dialog-actions"><button class="button button-danger" type="submit" :disabled="unsubscribing">{{ unsubscribing ? 'Unsubscribing…' : 'Confirm unsubscribe' }}</button><button class="button" type="button" :disabled="unsubscribing" @click="closeUnsubscribe">Cancel</button></div></form>
+        <form method="dialog" @submit.prevent="unsubscribe"><div class="dialog-head"><h2 id="unsubscribe-title">Unsubscribe board</h2></div><div class="dialog-body"><p>Stop replicating {{ unsubscribeBoard?.title }}?</p><p class="muted">Disconnects this board from Rusty and ends its owner's future-board subscription. Tincanban keeps its copy.</p><p v-if="unsubscribeError" class="admin-notice admin-notice-error" role="alert">{{ unsubscribeError }}</p></div><div class="dialog-actions"><button class="button button-danger" type="submit" :disabled="unsubscribing">{{ unsubscribing ? 'Unsubscribing…' : 'Confirm unsubscribe' }}</button><button class="button" type="button" :disabled="unsubscribing" @click="closeUnsubscribe">Cancel</button></div></form>
       </dialog>
       <dialog ref="resetDialog" class="dialog" aria-labelledby="reset-title" @cancel="resetting && $event.preventDefault()" @close="onResetDialogClose">
-        <form @submit.prevent="resetKeeper"><div class="dialog-head"><h2 id="reset-title">Reset keeper</h2></div><div class="dialog-body"><p>Remove all boards, pairing requests, intake messages and JEV results? Rusty keeps its identity and website settings. Match keeps its boards.</p><label class="field-label" for="reset-token">Reset operator token</label><input id="reset-token" v-model="resetToken" type="password" autocomplete="off" :disabled="resetting" required /><p v-if="resetError" class="admin-notice admin-notice-error" role="alert">{{ resetError }}</p></div><div class="dialog-actions"><button class="button button-danger" type="submit" :disabled="resetting || !resetToken">{{ resetting ? 'Resetting…' : 'Delete all keeper data' }}</button><button class="button" type="button" :disabled="resetting" @click="closeReset">Cancel</button></div></form>
+        <form @submit.prevent="resetKeeper"><div class="dialog-head"><h2 id="reset-title">Reset keeper</h2></div><div class="dialog-body"><p>Remove all boards, pairing requests, intake messages and JEV results? Rusty keeps its identity and website settings. Tincanban keeps its boards.</p><label class="field-label" for="reset-token">Reset operator token</label><input id="reset-token" v-model="resetToken" type="password" autocomplete="off" :disabled="resetting" required /><p v-if="resetError" class="admin-notice admin-notice-error" role="alert">{{ resetError }}</p></div><div class="dialog-actions"><button class="button button-danger" type="submit" :disabled="resetting || !resetToken">{{ resetting ? 'Resetting…' : 'Delete all keeper data' }}</button><button class="button" type="button" :disabled="resetting" @click="closeReset">Cancel</button></div></form>
       </dialog>
     </main>
   </div>
