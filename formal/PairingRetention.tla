@@ -52,6 +52,7 @@ CleanupCompletes ==
 TickTerminal ==
   /\ recordPresent
   /\ state \in {"expired", "cancelled"}
+  /\ terminalAge < TerminalRetention
   /\ terminalAge' = terminalAge + 1
   /\ UNCHANGED <<recordPresent, state>>
 
