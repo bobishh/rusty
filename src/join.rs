@@ -438,6 +438,7 @@ pub async fn provision_existing_identity(
         let commit = ProvisioningCommit {
             pairing_id: pairing_id.to_owned(),
             integration_id: integration_id.to_owned(),
+            expected_integration_revision: None,
             operation_id: operation_id.to_owned(),
             transcript_hash: transcript_hash.to_owned(),
             invitation_id: invite.invitation_id.clone(),

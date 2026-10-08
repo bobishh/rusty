@@ -5,7 +5,10 @@ use meta_mesh_native::NativeNode;
 use crate::{
     Config, ProvisioningCommit, join,
     keeper::{KeeperHost, ProvisioningLifecycleStatus},
-    pairing::{IntegrationCandidate, PairingService, ProvisionedScope, VerifiedDisconnectRequest},
+    pairing::{
+        IntegrationCandidate, PairingService, ProvisionedScope, VerifiedDisconnectRequest,
+        VerifiedIntegrationSettingsRequest,
+    },
 };
 
 #[derive(Clone)]
@@ -49,6 +52,32 @@ impl ProvisioningService {
         self.host.disconnect_integration(request)
     }
 
+    pub(crate) fn update_integration_settings(
+        &self,
+        request: &VerifiedIntegrationSettingsRequest,
+    ) -> Result<serde_json::Value, crate::keeper::DisconnectError> {
+        self.host.update_integration_settings(request)
+    }
+
+    pub(crate) fn activate_integration_future_policy(
+        &self,
+        integration_id: &str,
+        expected_revision: u64,
+        controller_person_id: &str,
+        operation_id: &str,
+        request_hash: &str,
+        baseline_workspace_ids: &[String],
+    ) -> Result<(), crate::pairing::PolicyActivationFailure> {
+        self.host.activate_integration_future_policy(
+            integration_id,
+            expected_revision,
+            controller_person_id,
+            operation_id,
+            request_hash,
+            baseline_workspace_ids,
+        )
+    }
+
     pub(crate) async fn provision(
         &self,
         integration_id: &str,
@@ -59,6 +88,7 @@ impl ProvisioningService {
         workspace_ids: Vec<String>,
         future_boards: bool,
         baseline_workspace_ids: Vec<String>,
+        expected_integration_revision: Option<u64>,
         pairings: PairingService,
     ) -> Result<Vec<ProvisionedScope>, String> {
         let invitation_id = invitation.invitation_id.clone();
@@ -66,6 +96,7 @@ impl ProvisioningService {
         let expected_commit = ProvisioningCommit {
             pairing_id: pairing_id.into(),
             integration_id: integration_id.into(),
+            expected_integration_revision,
             operation_id: operation_id.into(),
             transcript_hash: transcript_hash.into(),
             invitation_id: invitation_id.clone(),
@@ -78,6 +109,8 @@ impl ProvisioningService {
         if let Some(previous) = self.host.provisioning_commit(pairing_id)? {
             if previous.pairing_id != expected_commit.pairing_id
                 || previous.integration_id != expected_commit.integration_id
+                || previous.expected_integration_revision
+                    != expected_commit.expected_integration_revision
                 || previous.operation_id != expected_commit.operation_id
                 || previous.transcript_hash != expected_commit.transcript_hash
                 || previous.invitation_id != expected_commit.invitation_id

@@ -19,7 +19,7 @@ use crate::{
     Config, ProvisioningCommit, join,
     pairing::{
         CONTROL_DOMAIN, ControllerRequest, IntegrationCandidate, PairingService,
-        VerifiedDisconnectRequest,
+        VerifiedDisconnectRequest, VerifiedIntegrationSettingsRequest,
     },
     provisioning::ProvisioningService,
 };
@@ -451,6 +451,7 @@ impl TestKeeper {
         config.provisioning_commits.push(ProvisioningCommit {
             pairing_id: format!("test-future-{}", rand::random::<u64>()),
             integration_id: crate::integration_id(&self.owner.person_id, &self.keeper.person_id),
+            expected_integration_revision: None,
             operation_id: format!("test-future-operation-{}", rand::random::<u64>()),
             transcript_hash: "test-future-transcript".into(),
             invitation_id: "test-future-invitation".into(),
@@ -525,6 +526,65 @@ fn approved_active_pairing(
         "test-operator-token-that-is-long-enough".into(),
     )
     .unwrap();
+    let integration_id = crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id);
+    let existing = keeper
+        .host
+        .configuration()
+        .unwrap()
+        .integrations
+        .into_iter()
+        .find(|record| record.integration_id == integration_id);
+    let mut baseline = existing
+        .as_ref()
+        .map(|record| {
+            record
+                .baseline_workspace_ids
+                .iter()
+                .cloned()
+                .chain(
+                    record
+                        .scopes
+                        .iter()
+                        .filter(|scope| scope.state == "active")
+                        .map(|scope| scope.workspace_id.clone()),
+                )
+                .chain(
+                    record
+                        .tombstones
+                        .iter()
+                        .map(|tombstone| tombstone.workspace_id.clone()),
+                )
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    baseline.push("second-board".into());
+    baseline.sort();
+    baseline.dedup();
+    let policy = json!({
+        "futureBoards": false,
+        "baselineWorkspaceIds": baseline,
+    });
+    let integration_update = existing.as_ref().map(|record| {
+        json!({
+            "integrationId": integration_id,
+            "expectedRevision": record.revision,
+            "scopeWorkspaceIds": ["second-board"],
+            "policy": policy,
+            "policyOnly": false,
+        })
+    });
+    let mut offer_body = json!({
+        "policy": policy,
+        "scopes": [{
+            "workspaceId": "second-board",
+            "title": "Second board",
+            "genesisAnchor": "second-board-genesis",
+            "mode": "replicate"
+        }]
+    });
+    if let Some(update) = integration_update.as_ref() {
+        offer_body["integrationUpdate"] = update.clone();
+    }
     let offer = controller_request(
         &keeper.owner,
         &keeper.keeper,
@@ -532,15 +592,7 @@ fn approved_active_pairing(
         json!({
             "kind": "lighthouse-pairing-offer",
             "operationId": operation_id(rand::random()),
-            "body": {
-                "policy": {"futureBoards": false},
-                "scopes": [{
-                    "workspaceId": "second-board",
-                    "title": "Second board",
-                    "genesisAnchor": "second-board-genesis",
-                    "mode": "replicate"
-                }]
-            }
+            "body": offer_body
         }),
     );
     let record = pairings.create(offer).unwrap();
@@ -582,6 +634,18 @@ fn approved_active_pairing(
         .unwrap();
     invitation.secret = "invite-secret-that-is-long-enough-123".into();
     let provision_operation = operation_id(rand::random());
+    let mut provision_body = json!({
+        "pairingId": record.id,
+        "transcriptHash": record.transcript_hash,
+        "servicePersonId": keeper.keeper.person_id,
+        "futureBoards": false,
+        "baselineWorkspaceIds": baseline,
+        "approvedScopes": [{"workspaceId":"second-board", "mode":"replicate"}],
+        "invitation": invitation
+    });
+    if let Some(update) = integration_update.as_ref() {
+        provision_body["integrationUpdate"] = update.clone();
+    }
     let provision = controller_request(
         &keeper.owner,
         &keeper.keeper,
@@ -589,14 +653,7 @@ fn approved_active_pairing(
         json!({
             "kind": "lighthouse-pairing-provision",
             "operationId": provision_operation,
-            "body": {
-                "pairingId": record.id,
-                "transcriptHash": record.transcript_hash,
-                "servicePersonId": keeper.keeper.person_id,
-                "futureBoards": false,
-                "approvedScopes": [{"workspaceId":"second-board", "mode":"replicate"}],
-                "invitation": invitation
-            }
+            "body": provision_body
         }),
     );
     let provision_request = pairings
@@ -608,9 +665,15 @@ fn approved_active_pairing(
     let commit = ProvisioningCommit {
         pairing_id: record.id.clone(),
         integration_id: provision_request.integration_id.clone(),
+        expected_integration_revision: provision_request.expected_integration_revision,
         operation_id: provision_operation,
         transcript_hash: record.transcript_hash.clone(),
-        invitation_id: provision_request.invitation.invitation_id.clone(),
+        invitation_id: provision_request
+            .invitation
+            .as_ref()
+            .unwrap()
+            .invitation_id
+            .clone(),
         workspace_ids: vec!["second-board".into()],
         snapshot_hash: "http-contract-snapshot".into(),
         future_boards: false,
@@ -787,6 +850,45 @@ fn disconnect_request(
     )
 }
 
+fn settings_request(
+    controller: &Identity,
+    service: &Identity,
+    service_origin: &str,
+    integration_id: &str,
+    operation_id: &str,
+    expected_revision: u64,
+    expected_epoch: u64,
+    future_boards: bool,
+) -> ControllerRequest {
+    controller_request(
+        controller,
+        service,
+        service_origin,
+        json!({
+            "kind":"lighthouse-integration-settings",
+            "serviceDeviceId":service.device_id,
+            "integrationId":integration_id,
+            "operationId":operation_id,
+            "expectedRevision":expected_revision,
+            "policy":{"futureBoards":future_boards},
+            "scopes":[{"workspaceId":"second-board","expectedGrantEpoch":expected_epoch}],
+        }),
+    )
+}
+
+fn add_signed_payload_padding(request: &mut ControllerRequest, controller: &Identity) {
+    let mut payload = request.signed.payload.clone();
+    payload["integrationId"] = json!("different-integration");
+    payload["proofPadding"] = json!("x".repeat(20_000));
+    request.signed = sign_json_envelope(
+        &controller.device_seed,
+        payload,
+        &controller.device_id,
+        CONTROL_DOMAIN,
+    )
+    .unwrap();
+}
+
 async fn start_integration_http(
     directory: &std::path::Path,
     host: KeeperHost,
@@ -902,10 +1004,12 @@ fn unsubscribe_cannot_hide_board_when_registry_write_fails() {
 fn unsubscribed_primary_can_be_added_again_by_fresh_provisioning() {
     let keeper = TestKeeper::new();
     keeper.host.unsubscribe("primary-board", None).unwrap();
+    let revision = keeper.host.configuration().unwrap().integrations[0].revision;
     let scope = keeper.staged_scope_at_epoch("primary-board", 3);
     let commit = ProvisioningCommit {
         pairing_id: "new-pairing".into(),
         integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: Some(revision),
         operation_id: "new-operation".into(),
         transcript_hash: "new-transcript".into(),
         invitation_id: "new-invitation".into(),
@@ -939,6 +1043,7 @@ fn unsubscribed_additional_board_can_receive_a_fresh_grant() {
     let mut commit = ProvisioningCommit {
         pairing_id: "first-pairing".into(),
         integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
         operation_id: "first-operation".into(),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),
@@ -959,6 +1064,8 @@ fn unsubscribed_additional_board_can_receive_a_fresh_grant() {
     assert!(!old_path.exists());
     commit.pairing_id = "fresh-pairing".into();
     commit.operation_id = "fresh-operation".into();
+    commit.expected_integration_revision =
+        Some(keeper.host.configuration().unwrap().integrations[0].revision);
     keeper
         .host
         .activate_provisioned_scopes(
@@ -984,6 +1091,7 @@ fn unsubscribe_removes_only_the_owned_scope_files() {
     let commit = ProvisioningCommit {
         pairing_id: "first-pairing".into(),
         integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
         operation_id: "first-operation".into(),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),
@@ -1038,6 +1146,7 @@ fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
     let commit = ProvisioningCommit {
         pairing_id: "first-pairing".into(),
         integration_id: integration_id.clone(),
+        expected_integration_revision: None,
         operation_id: "first-operation".into(),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),
@@ -1073,9 +1182,11 @@ fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
     let idempotent_retry = keeper.host.disconnect_integration(&request).unwrap();
     assert_eq!(idempotent_retry["status"], "removed");
 
+    let readd_revision = keeper.host.configuration().unwrap().integrations[0].revision;
     let readd = ProvisioningCommit {
         pairing_id: "second-pairing".into(),
         integration_id: integration_id.clone(),
+        expected_integration_revision: Some(readd_revision),
         operation_id: "second-operation".into(),
         transcript_hash: "new-transcript".into(),
         invitation_id: "new-invitation".into(),
@@ -1127,6 +1238,74 @@ fn signed_disconnect_replay_cannot_remove_a_freshly_readded_scope() {
     assert_eq!(current["tombstones"][0]["state"], "removed");
 }
 
+#[test]
+fn signed_settings_remove_one_board_keeps_other_scopes_and_follow_policy() {
+    let keeper = TestKeeper::new();
+    let integration_id = crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id);
+    let commit = ProvisioningCommit {
+        pairing_id: "settings-pairing".into(),
+        integration_id: integration_id.clone(),
+        expected_integration_revision: None,
+        operation_id: "settings-activation".into(),
+        transcript_hash: "transcript".into(),
+        invitation_id: "invitation".into(),
+        workspace_ids: vec!["second-board".into(), "third-board".into()],
+        snapshot_hash: "snapshot".into(),
+        future_boards: true,
+        baseline_workspace_ids: vec!["primary-board".into()],
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(
+            vec![
+                keeper.staged_scope_at_epoch("second-board", 2),
+                keeper.staged_scope_at_epoch("third-board", 2),
+            ],
+            commit,
+        )
+        .unwrap();
+    let request = VerifiedIntegrationSettingsRequest {
+        integration_id: integration_id.clone(),
+        operation_id: "remove-second-board".into(),
+        controller_person_id: keeper.owner.person_id.clone(),
+        controller_device_id: keeper.owner.device_id.clone(),
+        expected_revision: 1,
+        future_boards: true,
+        scopes: vec![("second-board".into(), 2)],
+        request_hash: "settings-request-hash".into(),
+    };
+    let receipt = keeper.host.update_integration_settings(&request).unwrap();
+    assert_eq!(receipt["status"], "updated");
+    assert_eq!(receipt["policy"]["futureBoards"], true);
+    assert_eq!(
+        receipt["policy"]["baselineWorkspaceIds"][0],
+        "primary-board"
+    );
+    assert_eq!(receipt["policy"]["baselineWorkspaceIds"][1], "second-board");
+    assert_eq!(receipt["scopes"][0]["workspaceId"], "second-board");
+    assert_eq!(receipt["scopes"][0]["cleanup"], "complete");
+    let record = keeper
+        .host
+        .configuration()
+        .unwrap()
+        .integrations
+        .into_iter()
+        .find(|record| record.integration_id == integration_id)
+        .unwrap();
+    assert!(record.future_boards);
+    assert_eq!(
+        record
+            .scopes
+            .iter()
+            .map(|scope| scope.workspace_id.as_str())
+            .collect::<Vec<_>>(),
+        ["third-board"]
+    );
+    let retry = keeper.host.update_integration_settings(&request).unwrap();
+    assert_eq!(retry, receipt);
+}
+
 #[cfg(unix)]
 #[test]
 fn disconnect_cleanup_failure_stays_pending_and_retries_after_restart() {
@@ -1137,6 +1316,7 @@ fn disconnect_cleanup_failure_stays_pending_and_retries_after_restart() {
     let commit = ProvisioningCommit {
         pairing_id: "pending-pairing".into(),
         integration_id: integration_id.clone(),
+        expected_integration_revision: None,
         operation_id: "pending-activation".into(),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),
@@ -1217,6 +1397,7 @@ fn local_unsubscribe_retries_the_same_scope_cleanup_without_restart() {
     let commit = ProvisioningCommit {
         pairing_id: "local-retry-pairing".into(),
         integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
         operation_id: "local-retry-activation".into(),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),
@@ -1294,6 +1475,7 @@ fn local_unsubscribe_cannot_drop_another_scope_during_pending_cleanup() {
     let first = ProvisioningCommit {
         pairing_id: "scope-b-pairing".into(),
         integration_id: integration_id.clone(),
+        expected_integration_revision: None,
         operation_id: "scope-b-operation".into(),
         transcript_hash: "transcript-b".into(),
         invitation_id: "invitation-b".into(),
@@ -1310,13 +1492,16 @@ fn local_unsubscribe_cannot_drop_another_scope_during_pending_cleanup() {
     let second = ProvisioningCommit {
         pairing_id: "scope-c-pairing".into(),
         integration_id: integration_id.clone(),
+        expected_integration_revision: Some(
+            keeper.host.configuration().unwrap().integrations[0].revision,
+        ),
         operation_id: "scope-c-operation".into(),
         transcript_hash: "transcript-c".into(),
         invitation_id: "invitation-c".into(),
         workspace_ids: vec!["third-board".into()],
         snapshot_hash: "snapshot-c".into(),
         future_boards: false,
-        baseline_workspace_ids: vec!["third-board".into()],
+        baseline_workspace_ids: vec!["second-board".into(), "third-board".into()],
         controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     keeper
@@ -1642,6 +1827,555 @@ async fn signed_http_status_disconnect_retry_and_restart_preserve_scope_authorit
 
 #[cfg(unix)]
 #[tokio::test]
+async fn signed_http_settings_rejects_owner_revision_and_epoch_mismatch_then_retries_cleanup() {
+    use std::os::unix::fs::symlink;
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let (pairings, _, integration_id, _, _, _) =
+        approved_active_pairing(&keeper, service_origin, 2);
+    let config = keeper.host.configuration().unwrap();
+    let owned_dir = config.additional_scopes[0]
+        .state_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let detached_dir = keeper.directory.join("settings-cleanup-scope");
+    let missing_dir = keeper.directory.join("settings-cleanup-missing");
+    fs::rename(&owned_dir, &detached_dir).unwrap();
+    symlink(&missing_dir, &owned_dir).unwrap();
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let settings_url = format!("http://{address}/v1/integrations/{integration_id}/settings");
+    let mut large_settings = settings_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(70),
+        1,
+        2,
+        true,
+    );
+    add_signed_payload_padding(&mut large_settings, &keeper.owner);
+    assert!(
+        serde_json::to_vec(&controller_request_json(&large_settings))
+            .unwrap()
+            .len()
+            > 16 * 1024
+    );
+    assert_eq!(
+        post_controller_request(&client, &settings_url, &large_settings)
+            .await
+            .0,
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let disconnect_url = format!("http://{address}/v1/integrations/{integration_id}/disconnect");
+    let mut large_disconnect = disconnect_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(71),
+        1,
+        2,
+    );
+    add_signed_payload_padding(&mut large_disconnect, &keeper.owner);
+    assert!(
+        serde_json::to_vec(&controller_request_json(&large_disconnect))
+            .unwrap()
+            .len()
+            > 16 * 1024
+    );
+    assert_eq!(
+        post_controller_request(&client, &disconnect_url, &large_disconnect)
+            .await
+            .0,
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let initial_revision = keeper.host.configuration().unwrap().integrations[0].revision;
+    let attacker = Identity::new(61, 62, 63);
+    let wrong_owner = settings_request(
+        &attacker,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(71),
+        initial_revision,
+        2,
+        false,
+    );
+    assert_eq!(
+        post_controller_request(&client, &settings_url, &wrong_owner)
+            .await
+            .0,
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let stale_revision = settings_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(72),
+        initial_revision.saturating_sub(1),
+        2,
+        false,
+    );
+    assert_eq!(
+        post_controller_request(&client, &settings_url, &stale_revision)
+            .await
+            .0,
+        reqwest::StatusCode::CONFLICT
+    );
+    let stale_epoch = settings_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(73),
+        initial_revision,
+        1,
+        false,
+    );
+    assert_eq!(
+        post_controller_request(&client, &settings_url, &stale_epoch)
+            .await
+            .0,
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        keeper.host.configuration().unwrap().integrations[0]
+            .scopes
+            .len(),
+        1
+    );
+
+    let update = settings_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(74),
+        initial_revision,
+        2,
+        false,
+    );
+    let (status, body) = post_controller_request(&client, &settings_url, &update).await;
+    assert!(
+        status.is_success(),
+        "settings update failed: {status} {body}"
+    );
+    let pending = verify_service_response(body, &keeper.keeper);
+    assert_eq!(pending["kind"], "lighthouse-integration-settings-receipt");
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["scopes"][0]["workspaceId"], "second-board");
+    assert_eq!(pending["scopes"][0]["cleanup"], "pending");
+
+    fs::remove_file(&owned_dir).unwrap();
+    fs::rename(&detached_dir, &owned_dir).unwrap();
+    let (status, body) = post_controller_request(&client, &settings_url, &update).await;
+    assert!(status.is_success());
+    let completed = verify_service_response(body, &keeper.keeper);
+    assert_eq!(completed["status"], "updated");
+    assert_eq!(completed["policy"]["futureBoards"], false);
+    assert_eq!(completed["scopes"][0]["cleanup"], "complete");
+    let completed_revision = completed["revision"].as_u64().unwrap();
+    let current_revision = keeper.host.configuration().unwrap().integrations[0].revision;
+    let later_operation = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-integration-settings",
+            "serviceDeviceId":keeper.keeper.device_id,
+            "integrationId":integration_id,
+            "operationId":operation_id(75),
+            "expectedRevision":current_revision,
+            "policy":{"futureBoards":false},
+            "scopes":[],
+        }),
+    );
+    let (status, body) = post_controller_request(&client, &settings_url, &later_operation).await;
+    assert!(
+        status.is_success(),
+        "later settings update failed: {status} {body}"
+    );
+    let later = verify_service_response(body, &keeper.keeper);
+    assert!(later["revision"].as_u64().unwrap() > completed_revision);
+    let (status, body) = post_controller_request(&client, &settings_url, &update).await;
+    assert!(status.is_success());
+    let historical = verify_service_response(body, &keeper.keeper);
+    assert_eq!(historical["operationId"], completed["operationId"]);
+    assert_eq!(historical["revision"], completed["revision"]);
+    assert_eq!(historical["policy"], completed["policy"]);
+    assert!(
+        keeper.host.configuration().unwrap().integrations[0].revision
+            > historical["revision"].as_u64().unwrap()
+    );
+    assert!(!owned_dir.exists());
+    server.abort();
+    let _ = server.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signed_http_policy_only_pairing_preserves_active_scopes_and_blocks_late_cancel() {
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let (pairings, _, integration_id, _, _, _) =
+        approved_active_pairing(&keeper, service_origin, 2);
+    let before = keeper.host.configuration().unwrap().integrations[0].clone();
+    let baseline = vec![
+        "primary-board".to_owned(),
+        "second-board".to_owned(),
+        "unselected-owned-board".to_owned(),
+    ];
+    let baseline_json = serde_json::to_value(&baseline).unwrap();
+    let offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(101),
+            "body":{
+                "scopes":[],
+                "policy":{"futureBoards":true,"baselineWorkspaceIds":baseline},
+                "integrationUpdate":{
+                    "integrationId":integration_id,
+                    "expectedRevision":before.revision,
+                    "scopeWorkspaceIds":[],
+                    "policy":{"futureBoards":true,"baselineWorkspaceIds":baseline},
+                    "policyOnly":true
+                }
+            }
+        }),
+    );
+    let record = pairings.create(offer).unwrap();
+    assert_eq!(
+        record.offer.pointer("/body/integrationUpdate/policyOnly"),
+        Some(&json!(true))
+    );
+    let (cookie, csrf) = pairings
+        .login("test-operator-token-that-is-long-enough")
+        .unwrap();
+    pairings
+        .admin_decision(&record.id, &cookie, &csrf, true)
+        .unwrap();
+    let owner_approval = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-decision",
+            "operationId":operation_id(102),
+            "pairingId":record.id,
+            "transcriptHash":record.transcript_hash,
+            "challengeNonce":record.challenge.payload["nonce"],
+            "decision":"approve"
+        }),
+    );
+    pairings
+        .controller_decision(&record.id, owner_approval)
+        .unwrap();
+    let provision = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-provision",
+            "operationId":operation_id(103),
+            "body":{
+                "pairingId":record.id,
+                "transcriptHash":record.transcript_hash,
+                "servicePersonId":keeper.keeper.person_id,
+                "policyOnly":true,
+                "futureBoards":true,
+                "baselineWorkspaceIds":baseline_json,
+                "approvedScopes":[],
+                "integrationUpdate":record.offer["body"]["integrationUpdate"],
+            }
+        }),
+    );
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let provision_url = format!("http://{address}/v1/pairings/{}/provision", record.id);
+    let provision_request = pairings
+        .begin_provision(&record.id, provision.clone())
+        .unwrap();
+    let config_backup = keeper
+        .directory
+        .join("keeper-config-before-unknown-outcome.json");
+    fs::rename(&keeper.config_path, &config_backup).unwrap();
+    fs::create_dir(&keeper.config_path).unwrap();
+    let expected_revision = provision_request.expected_integration_revision.unwrap();
+    let unknown_error = pairings
+        .commit_policy_activation_if_not_withdrawn(&record.id, || {
+            keeper.host.activate_integration_future_policy(
+                &provision_request.integration_id,
+                expected_revision,
+                &provision_request.controller_person_id,
+                &provision_request.operation_id,
+                &provision_request.transcript_hash,
+                &provision_request.baseline_workspace_ids,
+            )
+        })
+        .unwrap_err();
+    assert!(!unknown_error.is_empty());
+    assert_eq!(
+        pairings.status_json(&record.id).unwrap()["provisioning"]["status"],
+        "provisioning"
+    );
+    let unknown_withdrawal = pairing_withdrawal_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &record.id,
+        &record.transcript_hash,
+        record.challenge.payload["nonce"].as_str().unwrap(),
+        &operation_id(109),
+    );
+    assert!(pairings.withdraw(&record.id, unknown_withdrawal).is_err());
+    fs::remove_dir(&keeper.config_path).unwrap();
+    fs::rename(config_backup, &keeper.config_path).unwrap();
+    let retry_request = pairings
+        .begin_provision(&record.id, provision.clone())
+        .unwrap();
+    assert!(retry_request.should_run);
+    let pairings_directory = keeper.directory.join("pairings");
+    let pairings_backup = keeper.directory.join("pairings-before-commit.json");
+    fs::rename(&pairings_directory, &pairings_backup).unwrap();
+    fs::write(&pairings_directory, b"block pairing state persistence").unwrap();
+    let persist_error = pairings
+        .commit_policy_activation_if_not_withdrawn(&record.id, || {
+            keeper.host.activate_integration_future_policy(
+                &retry_request.integration_id,
+                expected_revision,
+                &retry_request.controller_person_id,
+                &retry_request.operation_id,
+                &retry_request.transcript_hash,
+                &retry_request.baseline_workspace_ids,
+            )
+        })
+        .unwrap_err();
+    assert!(persist_error.contains("pairing status could not be persisted"));
+    fs::remove_file(&pairings_directory).unwrap();
+    fs::rename(pairings_backup, &pairings_directory).unwrap();
+    let (status, body) = post_controller_request(&client, &provision_url, &provision).await;
+    assert!(
+        status.is_success(),
+        "policy-only provision failed: {status} {body}"
+    );
+    let activated = verify_service_response(body, &keeper.keeper);
+    assert_eq!(activated["status"], "active");
+    let after = keeper.host.configuration().unwrap().integrations[0].clone();
+    assert!(after.revision > before.revision);
+    assert!(after.future_boards);
+    assert_eq!(after.baseline_workspace_ids, baseline);
+    assert_eq!(
+        serde_json::to_value(after.scopes).unwrap(),
+        serde_json::to_value(before.scopes).unwrap()
+    );
+
+    let withdrawal = pairing_withdrawal_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &record.id,
+        &record.transcript_hash,
+        record.challenge.payload["nonce"].as_str().unwrap(),
+        &operation_id(104),
+    );
+    let withdrawal_url = format!("http://{address}/v1/pairings/{}/withdraw", record.id);
+    assert_eq!(
+        post_controller_request(&client, &withdrawal_url, &withdrawal)
+            .await
+            .0,
+        reqwest::StatusCode::CONFLICT
+    );
+    let (status, body) = post_controller_request(&client, &provision_url, &provision).await;
+    assert!(status.is_success());
+    assert_eq!(
+        verify_service_response(body, &keeper.keeper)["status"],
+        "active"
+    );
+
+    let stale_offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(105),
+            "body":{
+                "scopes":[],
+                "policy":{"futureBoards":true,"baselineWorkspaceIds":baseline},
+                "integrationUpdate":{
+                    "integrationId":integration_id,
+                    "expectedRevision":before.revision,
+                    "scopeWorkspaceIds":[],
+                    "policy":{"futureBoards":true,"baselineWorkspaceIds":baseline},
+                    "policyOnly":true
+                }
+            }
+        }),
+    );
+    let stale_record = pairings.create(stale_offer).unwrap();
+    pairings
+        .admin_decision(&stale_record.id, &cookie, &csrf, true)
+        .unwrap();
+    let stale_approval = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-decision",
+            "operationId":operation_id(106),
+            "pairingId":stale_record.id,
+            "transcriptHash":stale_record.transcript_hash,
+            "challengeNonce":stale_record.challenge.payload["nonce"],
+            "decision":"approve"
+        }),
+    );
+    pairings
+        .controller_decision(&stale_record.id, stale_approval)
+        .unwrap();
+    let stale_provision = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-provision",
+            "operationId":operation_id(107),
+            "body":{
+                "pairingId":stale_record.id,
+                "transcriptHash":stale_record.transcript_hash,
+                "servicePersonId":keeper.keeper.person_id,
+                "policyOnly":true,
+                "futureBoards":true,
+                "baselineWorkspaceIds":baseline_json,
+                "approvedScopes":[],
+                "integrationUpdate":stale_record.offer["body"]["integrationUpdate"],
+            }
+        }),
+    );
+    let stale_provision_url = format!("http://{address}/v1/pairings/{}/provision", stale_record.id);
+    assert_eq!(
+        post_controller_request(&client, &stale_provision_url, &stale_provision)
+            .await
+            .0,
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        post_controller_request(&client, &stale_provision_url, &stale_provision)
+            .await
+            .0,
+        reqwest::StatusCode::CONFLICT
+    );
+    let stale_withdrawal = pairing_withdrawal_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &stale_record.id,
+        &stale_record.transcript_hash,
+        stale_record.challenge.payload["nonce"].as_str().unwrap(),
+        &operation_id(110),
+    );
+    let stale_withdrawal_url = format!("http://{address}/v1/pairings/{}/withdraw", stale_record.id);
+    let (status, body) =
+        post_controller_request(&client, &stale_withdrawal_url, &stale_withdrawal).await;
+    assert!(status.is_success());
+    assert_eq!(
+        verify_service_response(body, &keeper.keeper)["status"],
+        "cancelled"
+    );
+    server.abort();
+}
+
+#[test]
+fn policy_only_future_approval_keeps_active_scopes_and_requires_current_baseline_and_revision() {
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let (_, _, integration_id, _, _, _) = approved_active_pairing(&keeper, service_origin, 2);
+    let before = keeper.host.configuration().unwrap().integrations[0].clone();
+    let baseline = vec![
+        "primary-board".to_owned(),
+        "second-board".to_owned(),
+        "unselected-owned-board".to_owned(),
+    ];
+    keeper
+        .host
+        .activate_integration_future_policy(
+            &integration_id,
+            before.revision,
+            &keeper.owner.person_id,
+            "policy-only-operation",
+            "signed-transcript-hash",
+            &baseline,
+        )
+        .unwrap();
+    let after = keeper.host.configuration().unwrap().integrations[0].clone();
+    assert_eq!(after.revision, before.revision + 1);
+    assert!(after.future_boards);
+    assert_eq!(after.baseline_workspace_ids, baseline);
+    assert_eq!(
+        serde_json::to_value(after.scopes).unwrap(),
+        serde_json::to_value(before.scopes).unwrap()
+    );
+
+    keeper
+        .host
+        .activate_integration_future_policy(
+            &integration_id,
+            before.revision,
+            &keeper.owner.person_id,
+            "policy-only-operation",
+            "signed-transcript-hash",
+            &[
+                "primary-board".into(),
+                "second-board".into(),
+                "unselected-owned-board".into(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        keeper.host.configuration().unwrap().integrations[0].revision,
+        after.revision
+    );
+    assert!(
+        keeper
+            .host
+            .activate_integration_future_policy(
+                &integration_id,
+                before.revision,
+                &keeper.owner.person_id,
+                "stale-policy-operation",
+                "another-signed-transcript",
+                &[
+                    "primary-board".into(),
+                    "second-board".into(),
+                    "unselected-owned-board".into()
+                ],
+            )
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed() {
     let keeper = TestKeeper::new();
     let service_origin = "https://rusty.example";
@@ -1920,6 +2654,10 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
     .await;
     assert!(status.is_success());
     let integration_status = verify_service_response(body, &keeper.keeper);
+    assert_eq!(
+        integration_status["capabilities"]["integrationSettings"],
+        true
+    );
     let integration = integration_status["integrations"]
         .as_array()
         .unwrap()
@@ -2631,6 +3369,9 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
                     &keeper.owner.person_id,
                     &keeper.keeper.person_id,
                 ),
+                expected_integration_revision: Some(
+                    keeper.host.configuration().unwrap().integrations[0].revision,
+                ),
                 operation_id: "overview-operation".into(),
                 transcript_hash: "overview-transcript".into(),
                 invitation_id: "overview-invitation".into(),
@@ -3121,6 +3862,7 @@ fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
     let commit = ProvisioningCommit {
         pairing_id: "pairing-test".into(),
         integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
         operation_id: "operation-test".into(),
         transcript_hash: "transcript-test".into(),
         invitation_id: "invitation-test".into(),
@@ -3201,6 +3943,7 @@ fn failed_scope_validation_never_activates_a_subset_of_provisioned_scopes() {
     let commit = ProvisioningCommit {
         pairing_id: "pairing-test".into(),
         integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
         operation_id: "operation-test".into(),
         transcript_hash: "transcript-test".into(),
         invitation_id: "invitation-test".into(),

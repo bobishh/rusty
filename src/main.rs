@@ -74,8 +74,26 @@ pub(crate) struct IntegrationRecord {
     pub(crate) tombstones: Vec<ScopeTombstone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_disconnect: Option<DisconnectOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_settings: Option<DisconnectOperation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) disconnect_history: Vec<DisconnectOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) settings_history: Vec<IntegrationSettingsOperation>,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct IntegrationSettingsOperation {
+    pub(crate) operation_id: String,
+    pub(crate) request_hash: String,
+    pub(crate) expected_revision: u64,
+    pub(crate) result_revision: u64,
+    pub(crate) future_boards: bool,
+    #[serde(default)]
+    pub(crate) baseline_workspace_ids: Vec<String>,
+    pub(crate) status: String,
+    pub(crate) scopes: Vec<(String, u64)>,
 }
 
 #[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -111,6 +129,8 @@ pub(crate) struct ProvisioningCommit {
     pub(crate) pairing_id: String,
     #[serde(default)]
     pub(crate) integration_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_integration_revision: Option<u64>,
     pub(crate) operation_id: String,
     pub(crate) transcript_hash: String,
     pub(crate) invitation_id: String,

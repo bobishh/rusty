@@ -633,17 +633,48 @@ pub(crate) async fn pairing_provision(
         .begin_provision(&id, request)
         .map_err(PairingResponseError)?;
     if provision.should_run {
-        let scope_results = if let Some(provisioner) = &state.provisioner {
+        let scope_results = if provision.policy_only {
+            let provisioner = state
+                .provisioner
+                .as_ref()
+                .ok_or(PairingResponseError(PairingError::Unavailable))?;
+            let expected_revision =
+                provision
+                    .expected_integration_revision
+                    .ok_or(PairingResponseError(PairingError::Invalid(
+                        "Policy-only update is missing expected integration revision",
+                    )))?;
+            pairings
+                .commit_policy_activation_if_not_withdrawn(&id, || {
+                    provisioner.activate_integration_future_policy(
+                        &provision.integration_id,
+                        expected_revision,
+                        &provision.controller_person_id,
+                        &provision.operation_id,
+                        &provision.transcript_hash,
+                        &provision.baseline_workspace_ids,
+                    )
+                })
+                .map_err(|_| PairingResponseError(PairingError::Conflict))?;
+            Vec::new()
+        } else if let Some(provisioner) = &state.provisioner {
+            let invitation =
+                provision
+                    .invitation
+                    .ok_or(PairingResponseError(PairingError::Invalid(
+                        "Missing workspace invitation",
+                    )))?;
             match provisioner
                 .provision(
                     &provision.integration_id,
                     &id,
                     &provision.operation_id,
                     &provision.transcript_hash,
-                    provision.invitation,
+                    invitation,
                     provision.scopes.clone(),
                     provision.future_boards,
                     provision.baseline_workspace_ids.clone(),
+                    provision.expected_integration_revision,
                     pairings.clone(),
                 )
                 .await
@@ -680,9 +711,11 @@ pub(crate) async fn pairing_provision(
         let active = scope_results
             .iter()
             .all(|scope| scope.status == "active" && scope.error.is_none());
-        pairings
-            .complete_provision(&id, scope_results, active)
-            .map_err(PairingResponseError)?;
+        if !provision.policy_only {
+            pairings
+                .complete_provision(&id, scope_results, active)
+                .map_err(PairingResponseError)?;
+        }
     } else if let Some(provisioner) = &state.provisioner {
         reconcile_pairing_provisioning(pairings, provisioner, &id)?;
     }
@@ -781,12 +814,53 @@ pub(crate) async fn integration_disconnect(
             crate::keeper::DisconnectError::Conflict => {
                 PairingResponseError(PairingError::Conflict)
             }
+            crate::keeper::DisconnectError::Forbidden => {
+                PairingResponseError(PairingError::Forbidden)
+            }
             crate::keeper::DisconnectError::Unavailable => {
                 PairingResponseError(PairingError::Unavailable)
             }
         })?;
     let signed = pairings
         .sign_disconnect_receipt(receipt)
+        .map_err(PairingResponseError)?;
+    Ok(Json(serde_json::to_value(signed).map_err(|_| {
+        PairingResponseError(PairingError::Unavailable)
+    })?))
+}
+
+pub(crate) async fn integration_settings(
+    state: AppState,
+    integration_id: String,
+    request: ControllerRequest,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let verified = pairings
+        .verify_integration_settings_request(&integration_id, &request)
+        .map_err(PairingResponseError)?;
+    let provisioner = state
+        .provisioner
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let receipt =
+        provisioner
+            .update_integration_settings(&verified)
+            .map_err(|error| match error {
+                crate::keeper::DisconnectError::Conflict => {
+                    PairingResponseError(PairingError::Conflict)
+                }
+                crate::keeper::DisconnectError::Forbidden => {
+                    PairingResponseError(PairingError::Forbidden)
+                }
+                crate::keeper::DisconnectError::Unavailable => {
+                    PairingResponseError(PairingError::Unavailable)
+                }
+            })?;
+    let signed = pairings
+        .sign_integration_settings_receipt(receipt)
         .map_err(PairingResponseError)?;
     Ok(Json(serde_json::to_value(signed).map_err(|_| {
         PairingResponseError(PairingError::Unavailable)

@@ -9,6 +9,7 @@ fn provision_commit(
     ProvisioningCommit {
         pairing_id: format!("pairing-{}", owner.person_id),
         integration_id: format!("test-integration-{}", owner.person_id),
+        expected_integration_revision: None,
         operation_id: format!("operation-{}", owner.person_id),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),
@@ -474,6 +475,7 @@ fn mixed_owner_activation_is_rejected_without_config_or_scope_changes() {
     let commit = ProvisioningCommit {
         pairing_id: "mixed-owner-pairing".into(),
         integration_id: "test-integration".into(),
+        expected_integration_revision: None,
         operation_id: "mixed-owner-operation".into(),
         transcript_hash: "mixed-owner-transcript".into(),
         invitation_id: "mixed-owner-invitation".into(),
@@ -790,6 +792,7 @@ fn provision_commit_from_ids(workspace_ids: &[&str], future_boards: bool) -> Pro
     ProvisioningCommit {
         pairing_id: "pairing-owner-a".into(),
         integration_id: "test-integration".into(),
+        expected_integration_revision: None,
         operation_id: "operation-owner-a".into(),
         transcript_hash: "transcript".into(),
         invitation_id: "invitation".into(),

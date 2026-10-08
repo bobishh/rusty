@@ -23,6 +23,24 @@ mod owner_auth_tests;
 
 use crate::{ProvisioningCommit, integration_id};
 
+#[derive(Debug)]
+pub(crate) enum PolicyActivationFailure {
+    Rejected(String),
+    OutcomeUnknown(String),
+}
+
+impl From<String> for PolicyActivationFailure {
+    fn from(message: String) -> Self {
+        Self::Rejected(message)
+    }
+}
+
+impl From<&str> for PolicyActivationFailure {
+    fn from(message: &str) -> Self {
+        Self::Rejected(message.to_owned())
+    }
+}
+
 pub const CONTROL_DOMAIN: &str = "MESH-LIGHTHOUSE/1";
 const MAX_AGE_SECONDS: u64 = 600;
 const LOGIN_TTL_SECONDS: u64 = 5 * 60;
@@ -157,13 +175,16 @@ pub struct ProvisionedScope {
 }
 
 pub struct ProvisionRequest {
-    pub invitation: WorkspaceJoinInvitation,
+    pub invitation: Option<WorkspaceJoinInvitation>,
     pub scopes: Vec<String>,
     pub integration_id: String,
+    pub controller_person_id: String,
+    pub expected_integration_revision: Option<u64>,
     pub operation_id: String,
     pub transcript_hash: String,
     pub future_boards: bool,
     pub baseline_workspace_ids: Vec<String>,
+    pub policy_only: bool,
     pub should_run: bool,
 }
 
@@ -182,6 +203,18 @@ pub struct VerifiedDisconnectRequest {
     pub controller_person_id: String,
     pub controller_device_id: String,
     pub expected_revision: u64,
+    pub scopes: Vec<(String, u64)>,
+    pub request_hash: String,
+}
+
+#[derive(Clone)]
+pub struct VerifiedIntegrationSettingsRequest {
+    pub integration_id: String,
+    pub operation_id: String,
+    pub controller_person_id: String,
+    pub controller_device_id: String,
+    pub expected_revision: u64,
+    pub future_boards: bool,
     pub scopes: Vec<(String, u64)>,
     pub request_hash: String,
 }
@@ -406,8 +439,64 @@ impl PairingService {
             .get("scopes")
             .and_then(Value::as_array)
             .ok_or(PairingError::Invalid("Missing scope list"))?;
-        if scopes.is_empty() || scopes.len() > MAX_SCOPES {
+        let policy_only = body
+            .pointer("/integrationUpdate/policyOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if (scopes.is_empty() && !policy_only)
+            || (!scopes.is_empty() && policy_only)
+            || scopes.len() > MAX_SCOPES
+            || (policy_only && !future_boards)
+        {
             return Err(PairingError::Invalid("Select between 1 and 16 boards"));
+        }
+        if let Some(update) = body.get("integrationUpdate") {
+            let integration_id = integration_id(
+                &request.identity.person_id,
+                &self.service_identity.person_id,
+            );
+            if update["integrationId"].as_str() != Some(integration_id.as_str())
+                || update["expectedRevision"].as_u64().is_none()
+                || update["policy"] != body["policy"]
+            {
+                return Err(PairingError::Invalid(
+                    "Integration update is not bound to this owner, revision, and policy",
+                ));
+            }
+            let mut offered = scopes
+                .iter()
+                .map(|scope| scope["workspaceId"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>();
+            let mut requested = update["scopeWorkspaceIds"]
+                .as_array()
+                .ok_or(PairingError::Invalid(
+                    "Integration update is missing exact scope delta",
+                ))?
+                .iter()
+                .map(|scope| {
+                    scope
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or(PairingError::Invalid("Invalid integration update scope"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            offered.sort();
+            requested.sort();
+            if offered != requested {
+                return Err(PairingError::Invalid(
+                    "Integration update scope delta differs from offer",
+                ));
+            }
+            if policy_only
+                && (update["policyOnly"] != true
+                    || update["policy"]["baselineWorkspaceIds"]
+                        .as_array()
+                        .is_none_or(Vec::is_empty))
+            {
+                return Err(PairingError::Invalid(
+                    "Policy-only pairing requires current-board baseline",
+                ));
+            }
         }
         let mut seen = std::collections::HashSet::new();
         for scope in scopes {
@@ -635,6 +724,13 @@ impl PairingService {
             || payload["challengeNonce"] != record.challenge.payload["nonce"]
         {
             return Err(PairingError::Forbidden);
+        }
+        if record.offer.pointer("/body/integrationUpdate/policyOnly") == Some(&Value::Bool(true))
+            && record.provisioning.as_ref().is_some_and(|provisioning| {
+                provisioning.status == "provisioning" || provisioning.status == "active"
+            })
+        {
+            return Err(PairingError::Conflict);
         }
         let operation_id = string_field(payload, "operationId")?.to_owned();
         let mut semantic = payload.clone();
@@ -1136,6 +1232,86 @@ impl PairingService {
         commit()
     }
 
+    /// Commit policy-only activation and terminal pairing status under same withdrawal fence.
+    pub fn commit_policy_activation_if_not_withdrawn(
+        &self,
+        id: &str,
+        commit: impl FnOnce() -> Result<(), PolicyActivationFailure>,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Pairing state lock poisoned".to_owned())?;
+        let record = state
+            .records
+            .get(id)
+            .ok_or_else(|| "Pairing was not found".to_owned())?;
+        if record.withdrawal.is_some()
+            || record.offer.pointer("/body/integrationUpdate/policyOnly")
+                != Some(&Value::Bool(true))
+        {
+            return Err("Pairing withdrawal is pending or policy-only approval is missing".into());
+        }
+        let provisioning = record
+            .provisioning
+            .as_ref()
+            .ok_or_else(|| "Policy-only pairing is not provisioning".to_owned())?;
+        if !provisioning.scopes.is_empty() || provisioning.status == "active" {
+            return Err("Policy-only pairing has invalid provisioning state".into());
+        }
+        if let Err(error) = commit() {
+            let message = match error {
+                PolicyActivationFailure::Rejected(message) => {
+                    let mut next = state.clone();
+                    if let Some(provisioning) = next
+                        .records
+                        .get_mut(id)
+                        .and_then(|record| record.provisioning.as_mut())
+                    {
+                        // A rejected CAS proves no policy was committed; zero-scope
+                        // withdrawal can now finish without a revocation proof.
+                        provisioning.status = "detached".into();
+                    }
+                    if self.persist(&next).is_err() {
+                        self.release_provisioning_run(id)?;
+                        return Err("Failed to persist rejected policy activation".into());
+                    }
+                    *state = next;
+                    message
+                }
+                PolicyActivationFailure::OutcomeUnknown(message) => {
+                    // Keep durable provisioning state retryable until an idempotent
+                    // retry determines whether the host committed before the error.
+                    message
+                }
+            };
+            self.release_provisioning_run(id)?;
+            return Err(message);
+        }
+        let mut next = state.clone();
+        let provisioning = next
+            .records
+            .get_mut(id)
+            .and_then(|record| record.provisioning.as_mut())
+            .ok_or_else(|| "Policy-only pairing lost its provisioning record".to_owned())?;
+        provisioning.status = "active".into();
+        if self.persist(&next).is_err() {
+            self.release_provisioning_run(id)?;
+            return Err("Policy activated but pairing status could not be persisted".into());
+        }
+        *state = next;
+        self.release_provisioning_run(id)?;
+        Ok(())
+    }
+
+    fn release_provisioning_run(&self, id: &str) -> Result<(), String> {
+        self.provisioning_runs
+            .lock()
+            .map_err(|_| "Provisioning state lock poisoned".to_owned())?
+            .remove(id);
+        Ok(())
+    }
+
     /// Persist every owner-issued grant epoch as soon as its staged scope is verified.
     /// This survives a later staging/activation failure so withdrawal can prove revocation
     /// moved beyond the exact credential issued by this pairing.
@@ -1232,6 +1408,7 @@ impl PairingService {
 
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         let record = state.records.get(id).ok_or(PairingError::NotFound)?;
+        let controller_person_id = record.controller.person_id.clone();
         if record.expires_at <= now && record.withdrawal.is_none() {
             return Err(PairingError::Expired);
         }
@@ -1254,6 +1431,41 @@ impl PairingService {
                 "Pairing is missing integration identity",
             ))?
             .to_owned();
+        let signed_update = record.offer["body"].get("integrationUpdate");
+        let policy_only = signed_update
+            .and_then(|update| update["policyOnly"].as_bool())
+            .unwrap_or(false);
+        if policy_only
+            != body
+                .get("policyOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Err(PairingError::Invalid(
+                "Policy-only request differs from signed pairing offer",
+            ));
+        }
+        if body.get("integrationUpdate") != signed_update {
+            return Err(PairingError::Invalid(
+                "Integration update differs from the signed pairing offer",
+            ));
+        }
+        let expected_integration_revision = if let Some(update) = signed_update {
+            if update["integrationId"].as_str() != Some(integration_id.as_str()) {
+                return Err(PairingError::Invalid(
+                    "Integration update targets another integration",
+                ));
+            }
+            Some(
+                update["expectedRevision"]
+                    .as_u64()
+                    .ok_or(PairingError::Invalid(
+                        "Integration update is missing its expected revision",
+                    ))?,
+            )
+        } else {
+            None
+        };
         if record
             .offer
             .pointer("/body/policy/futureBoards")
@@ -1289,12 +1501,23 @@ impl PairingService {
             ));
         }
         let transcript_hash = record.transcript_hash.clone();
-        let invitation: WorkspaceJoinInvitation = serde_json::from_value(
-            body.get("invitation")
-                .cloned()
-                .ok_or(PairingError::Invalid("Missing workspace invitation"))?,
-        )
-        .map_err(|_| PairingError::Invalid("Invalid workspace invitation"))?;
+        let invitation = if policy_only {
+            if !approved.is_empty() {
+                return Err(PairingError::Invalid(
+                    "Policy-only pairing cannot contain workspace scopes",
+                ));
+            }
+            None
+        } else {
+            Some(
+                serde_json::from_value::<WorkspaceJoinInvitation>(
+                    body.get("invitation")
+                        .cloned()
+                        .ok_or(PairingError::Invalid("Missing workspace invitation"))?,
+                )
+                .map_err(|_| PairingError::Invalid("Invalid workspace invitation"))?,
+            )
+        };
         let offered = record.offer["body"]["scopes"]
             .as_array()
             .ok_or(PairingError::Invalid("Pairing has no approved scopes"))?;
@@ -1315,48 +1538,94 @@ impl PairingService {
             }
             scope_ids.push(workspace_id.to_owned());
         }
-        if approved.len() != scope_ids.len()
-            || invitation.kind != "workspace-join"
-            || invitation.version != 1
-            || invitation.issuer_person_id != request.identity.person_id
-            || invitation.issuer_device_id != request.device_id
-            || invitation.issuer_public_key != device_key
-            || invitation.role != "editor"
-            || invitation.secret.len() < 32
-            || invitation
-                .workspaces
+        if let Some(update) = signed_update {
+            let mut expected_scopes = update["scopeWorkspaceIds"]
+                .as_array()
+                .ok_or(PairingError::Invalid(
+                    "Integration update is missing exact board delta",
+                ))?
                 .iter()
-                .map(|scope| scope.id.clone())
-                .collect::<Vec<_>>()
-                != scope_ids
-            || invitation.workspace_id != scope_ids.first().cloned().unwrap_or_default()
-            || invitation.invitation_id.is_empty()
-            || invitation.issuer_endpoint.is_empty()
-            || invitation.expires_at.is_empty()
-        {
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or(PairingError::Invalid("Invalid integration update board"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            expected_scopes.sort();
+            let mut approved_scope_ids = scope_ids.clone();
+            approved_scope_ids.sort();
+            let mut baseline = update["policy"]["baselineWorkspaceIds"]
+                .as_array()
+                .ok_or(PairingError::Invalid(
+                    "Integration update is missing policy baseline",
+                ))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or(PairingError::Invalid("Invalid integration update baseline"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            baseline.sort();
+            if expected_scopes != approved_scope_ids
+                || update["policy"]["futureBoards"].as_bool() != Some(future_boards)
+                || baseline != requested_baseline
+            {
+                return Err(PairingError::Invalid(
+                    "Integration update differs from exact approved scope delta and policy",
+                ));
+            }
+        }
+        if approved.len() != scope_ids.len() {
             return Err(PairingError::Invalid(
-                "Invitation does not match the approved owner and scopes",
+                "Provision scopes differ from the approved transcript",
             ));
         }
-        let created_at = time::OffsetDateTime::parse(
-            &invitation.created_at,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .map_err(|_| PairingError::Invalid("Invalid invitation creation time"))?;
-        let expires_at = time::OffsetDateTime::parse(
-            &invitation.expires_at,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .map_err(|_| PairingError::Invalid("Invalid invitation expiry"))?;
-        let now = time::OffsetDateTime::now_utc();
-        if created_at > now + time::Duration::seconds(30)
-            || expires_at <= now
-            || expires_at <= created_at
-            || expires_at - created_at > time::Duration::minutes(10)
-        {
-            return Err(PairingError::Invalid(
-                "Invitation must be valid and expire within 10 minutes",
-            ));
+        if let Some(invitation) = invitation.as_ref() {
+            if invitation.kind != "workspace-join"
+                || invitation.version != 1
+                || invitation.issuer_person_id != request.identity.person_id
+                || invitation.issuer_device_id != request.device_id
+                || invitation.issuer_public_key != device_key
+                || invitation.role != "editor"
+                || invitation.secret.len() < 32
+                || invitation
+                    .workspaces
+                    .iter()
+                    .map(|scope| scope.id.clone())
+                    .collect::<Vec<_>>()
+                    != scope_ids
+                || invitation.workspace_id != scope_ids.first().cloned().unwrap_or_default()
+                || invitation.invitation_id.is_empty()
+                || invitation.issuer_endpoint.is_empty()
+                || invitation.expires_at.is_empty()
+            {
+                return Err(PairingError::Invalid(
+                    "Invitation does not match the approved owner and scopes",
+                ));
+            }
+            let created_at = time::OffsetDateTime::parse(
+                &invitation.created_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map_err(|_| PairingError::Invalid("Invalid invitation creation time"))?;
+            let expires_at = time::OffsetDateTime::parse(
+                &invitation.expires_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map_err(|_| PairingError::Invalid("Invalid invitation expiry"))?;
+            let now = time::OffsetDateTime::now_utc();
+            if created_at > now + time::Duration::seconds(30)
+                || expires_at <= now
+                || expires_at <= created_at
+                || expires_at - created_at > time::Duration::minutes(10)
+            {
+                return Err(PairingError::Invalid(
+                    "Invitation must be valid and expire within 10 minutes",
+                ));
+            }
         }
         if let Some(previous) = &record.provisioning {
             if previous.operation_id != operation_id || previous.request_hash != request_hash {
@@ -1370,10 +1639,13 @@ impl PairingService {
                     invitation,
                     scopes: scope_ids,
                     integration_id: integration_id.clone(),
+                    controller_person_id: controller_person_id.clone(),
+                    expected_integration_revision,
                     operation_id,
                     transcript_hash,
                     future_boards,
                     baseline_workspace_ids: approved_baseline,
+                    policy_only,
                     should_run: false,
                 });
             }
@@ -1411,10 +1683,13 @@ impl PairingService {
             invitation,
             scopes: scope_ids,
             integration_id,
+            controller_person_id,
+            expected_integration_revision,
             operation_id,
             transcript_hash,
             future_boards,
             baseline_workspace_ids: approved_baseline,
+            policy_only,
             should_run,
         })
     }
@@ -1722,6 +1997,78 @@ impl PairingService {
         })
     }
 
+    pub fn verify_integration_settings_request(
+        &self,
+        path_integration_id: &str,
+        request: &ControllerRequest,
+    ) -> Result<VerifiedIntegrationSettingsRequest, PairingError> {
+        self.verify_controller(request)?;
+        let payload = &request.signed.payload;
+        validate_common(
+            payload,
+            "lighthouse-integration-settings",
+            request,
+            &self.service_identity,
+            &self.origin,
+            now_seconds(),
+        )?;
+        let integration_id = string_field(payload, "integrationId")?;
+        if integration_id != path_integration_id
+            || payload["serviceDeviceId"] != self.service_device_id
+        {
+            return Err(PairingError::Forbidden);
+        }
+        let future_boards = payload["policy"]["futureBoards"]
+            .as_bool()
+            .ok_or(PairingError::Invalid("Missing future-board policy"))?;
+        let expected_revision = payload["expectedRevision"]
+            .as_u64()
+            .ok_or(PairingError::Invalid("Missing integration revision"))?;
+        let scopes = payload["scopes"]
+            .as_array()
+            .filter(|scopes| scopes.len() <= MAX_SCOPES)
+            .ok_or(PairingError::Invalid("Invalid integration settings scopes"))?
+            .iter()
+            .map(|scope| {
+                let workspace_id = scope["workspaceId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 256)
+                    .ok_or(PairingError::Invalid("Invalid integration settings scope"))?;
+                let epoch = scope["expectedGrantEpoch"]
+                    .as_u64()
+                    .filter(|epoch| *epoch > 0)
+                    .ok_or(PairingError::Invalid(
+                        "Invalid integration settings grant epoch",
+                    ))?;
+                Ok((workspace_id.to_owned(), epoch))
+            })
+            .collect::<Result<Vec<_>, PairingError>>()?;
+        let mut unique = std::collections::HashSet::new();
+        if scopes.iter().any(|(id, _)| !unique.insert(id.as_str())) {
+            return Err(PairingError::Invalid(
+                "Duplicate integration settings scope",
+            ));
+        }
+        let mut semantic = payload.clone();
+        if let Some(object) = semantic.as_object_mut() {
+            object.remove("controllerDeviceId");
+            object.remove("issuedAt");
+            object.remove("expiresAt");
+        }
+        let canonical = canonicalize_json(&semantic)
+            .map_err(|_| PairingError::Invalid("Invalid settings request"))?;
+        Ok(VerifiedIntegrationSettingsRequest {
+            integration_id: integration_id.to_owned(),
+            operation_id: string_field(payload, "operationId")?.to_owned(),
+            controller_person_id: request.identity.person_id.clone(),
+            controller_device_id: request.device_id.clone(),
+            expected_revision,
+            future_boards,
+            scopes,
+            request_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())),
+        })
+    }
+
     pub fn sign_integration_status(
         &self,
         controller_person_id: &str,
@@ -1742,6 +2089,7 @@ impl PairingService {
                 "operationId":operation_id,
                 "revision":revision,
                 "integrations":integrations,
+                "capabilities":{"integrationSettings":true},
                 "issuedAt":now_seconds(),
             }),
             &self.service_device_id,
@@ -1751,6 +2099,23 @@ impl PairingService {
     }
 
     pub fn sign_disconnect_receipt(
+        &self,
+        mut receipt: Value,
+    ) -> Result<SignedEnvelope<Value>, PairingError> {
+        receipt["servicePersonId"] = json!(self.service_identity.person_id);
+        receipt["serviceDeviceId"] = json!(self.service_device_id);
+        receipt["serviceOrigin"] = json!(self.origin);
+        receipt["issuedAt"] = json!(now_seconds());
+        sign_json_envelope(
+            &self.service_seed,
+            receipt,
+            &self.service_device_id,
+            CONTROL_DOMAIN,
+        )
+        .map_err(|_| PairingError::Unavailable)
+    }
+
+    pub fn sign_integration_settings_receipt(
         &self,
         mut receipt: Value,
     ) -> Result<SignedEnvelope<Value>, PairingError> {

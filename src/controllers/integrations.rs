@@ -22,6 +22,12 @@ pub(crate) fn routes() -> Routes {
                 MAX_INTEGRATION_MUTATION_REQUEST_BODY_BYTES,
             )),
         )
+        .add(
+            "/{id}/settings",
+            post(settings).layer(DefaultBodyLimit::max(
+                MAX_INTEGRATION_MUTATION_REQUEST_BODY_BYTES,
+            )),
+        )
 }
 
 async fn status(
@@ -37,4 +43,12 @@ async fn disconnect(
     Json(request): Json<ControllerRequest>,
 ) -> impl IntoResponse {
     http::integration_disconnect(state, id, request).await
+}
+
+async fn settings(
+    SharedStore(state): SharedStore<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ControllerRequest>,
+) -> impl IntoResponse {
+    http::integration_settings(state, id, request).await
 }
