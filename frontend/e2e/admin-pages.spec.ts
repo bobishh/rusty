@@ -60,6 +60,33 @@ test("Given owner-origin approval, when opening approvals, then Rusty does not r
   await expect(page.getByText("Waiting for keeper operator to approve service access.", { exact: true })).toHaveCount(0)
 })
 
+test("Given cancellation cleanup is pending, when Rusty confirms completion, then only unresolved cancellation stays in approvals", async ({ page }) => {
+  let withdrawalStatus: "cancel_pending" | "cancelled" = "cancel_pending"
+  await page.route("**/admin/api/session", route => route.fulfill({ json: { csrfToken: "csrf", personId: null, displayName: "Operator", operator: true } }))
+  await page.route("**/admin/api/overview", route => route.fulfill({ json: { keeper: { displayName: "Rusty", personId: "keeper-person", deviceId: "device-1", boards: [] }, triggers: [], replication: { state: "idle", activePeers: 0 } } }))
+  await page.route("**/admin/api/pairings", route => route.fulfill({ json: { pairings: [
+    { id: "cancel-pending", comparisonCode: "111111", controller: { displayName: "Owner" }, controllerFingerprint: "owner", serviceFingerprint: "keeper", scopes: [{ workspaceId: "board-1", title: "Garden", mode: "replicate" }], futureBoards: false, operatorApproved: true, controllerApproved: true, withdrawalStatus, provisioning: { status: withdrawalStatus === "cancel_pending" ? "pending_cleanup" : "detached", scopes: [] } },
+    { id: "active-history", comparisonCode: "222222", controller: { displayName: "Owner" }, controllerFingerprint: "owner", serviceFingerprint: "keeper", scopes: [{ workspaceId: "board-1", title: "Garden", mode: "replicate" }], futureBoards: false, operatorApproved: true, controllerApproved: true, provisioning: { status: "active", scopes: [{ workspaceId: "board-1", status: "active" }] } },
+    { id: "detached-history", comparisonCode: "333333", controller: { displayName: "Owner" }, controllerFingerprint: "owner", serviceFingerprint: "keeper", scopes: [{ workspaceId: "board-1", title: "Garden", mode: "replicate" }], futureBoards: false, operatorApproved: true, controllerApproved: true, provisioning: { status: "detached", scopes: [] } },
+  ] } }))
+  await page.route("**/admin/api/settings/cors", route => route.fulfill({ json: { requiredOrigin: "https://match.example", origins: ["https://match.example"] } }))
+  await page.goto("/admin/approvals")
+
+  const pendingCard = page.locator(".approval-card").filter({ hasText: "111111" })
+  await expect(page.getByRole("link", { name: "Approvals (1)" })).toBeVisible()
+  await expect(pendingCard.getByRole("status")).toContainText("Cancellation pending. Rusty is completing cleanup; approval is unavailable.")
+  await expect(pendingCard.getByRole("button", { name: "Approve exact boards" })).toHaveCount(0)
+  await expect(pendingCard.getByRole("button", { name: "Decline" })).toHaveCount(0)
+  await expect(page.locator(".approval-card")).toHaveCount(1)
+
+  withdrawalStatus = "cancelled"
+  await page.reload()
+  await expect(page.getByRole("heading", { name: "Approvals" })).toBeVisible()
+  await expect(page.getByText("No pending keeper requests. Create one from Tincanban → Sync → Add keeper.", { exact: true })).toBeVisible()
+  await expect(page.locator(".approval-card")).toHaveCount(0)
+  await expect(page.getByRole("link", { name: /Approvals/ })).toHaveText("Approvals")
+})
+
 test("Given owner session, when opening operator settings URL, then route returns to keepers", async ({ page }) => {
   await signedIn(page, false)
   await page.goto("/admin/settings")

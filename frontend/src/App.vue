@@ -37,8 +37,23 @@ type Pairing = {
   futureBoards: boolean
   operatorApproved: boolean | null
   controllerApproved: boolean | null
+  withdrawalStatus?: "cancel_pending" | "cancelled" | null
   admissionSource?: string | null
   provisioning?: { status: string; scopes: { workspaceId: string; status: string; error?: string; errorDetail?: string }[] } | null
+}
+
+type PairingLifecycle = "approval_pending" | "setup_pending" | "cleanup_pending" | "review" | "terminal"
+
+function pairingLifecycle(pairing: Pairing): PairingLifecycle {
+  if (pairing.withdrawalStatus === "cancelled") return "terminal"
+  if (pairing.withdrawalStatus === "cancel_pending") return "cleanup_pending"
+  const provisioning = pairing.provisioning?.status
+  if (provisioning === "active" || provisioning === "detached") return "terminal"
+  if (provisioning === "pending_cleanup") return "cleanup_pending"
+  if (provisioning === "provisioning") return "setup_pending"
+  if (provisioning) return "review"
+  if (pairing.operatorApproved === false || pairing.controllerApproved === false) return "terminal"
+  return "approval_pending"
 }
 
 const resetOpen = ref(false)
@@ -72,8 +87,7 @@ const loading = ref(false)
 const error = ref("")
 const overview = ref<Overview | null>(null)
 const pairings = ref<Pairing[]>([])
-const pendingPairings = computed(() => pairings.value.filter(pairing =>
-  pairing.provisioning?.status !== "active" && pairing.operatorApproved !== false && pairing.controllerApproved !== false))
+const pendingPairings = computed(() => pairings.value.filter(pairing => pairingLifecycle(pairing) !== "terminal"))
 const corsRequired = ref("")
 const corsDraft = ref("")
 const corsLoaded = ref(false)
@@ -410,6 +424,15 @@ async function unsubscribe() {
 }
 
 function pairingStatus(pairing: Pairing) {
+  const lifecycle = pairingLifecycle(pairing)
+  if (pairing.withdrawalStatus === "cancel_pending" || pairing.provisioning?.status === "pending_cleanup") {
+    return "Cancellation pending. Rusty is completing cleanup; approval is unavailable."
+  }
+  if (pairing.provisioning?.status === "detached" || pairing.withdrawalStatus === "cancelled") {
+    return "Request completed. No approval is available."
+  }
+  if (lifecycle === "review") return "Request status needs review. Approval is unavailable."
+  if (lifecycle === "setup_pending") return "Rusty is preparing the selected boards. Approval is unavailable."
   if (pairing.operatorApproved === false || pairing.controllerApproved === false) return "Keeper request declined. No access granted."
   if (pairing.admissionSource === "owner_origin" && pairing.operatorApproved === true) {
     return pairing.provisioning
@@ -520,7 +543,7 @@ onUnmounted(() => {
             <ul><li v-for="scope in pairing.scopes" :key="scope.title">{{ scope.title }} · {{ scope.mode }}</li></ul><p>{{ pairing.futureBoards ? "Future boards included in approval" : "Future boards not included" }}</p>
             <p>Controller approval: {{ pairing.controllerApproved === true ? "approved" : pairing.controllerApproved === false ? "declined" : "pending" }}</p><p v-if="pairing.provisioning">Board setup: {{ pairing.provisioning.status }}</p>
             <p v-for="scope in pairing.provisioning?.scopes.filter(scope => scope.error) ?? []" :key="scope.workspaceId" class="admin-notice admin-notice-error" role="alert">{{ scope.workspaceId }}: {{ scope.errorDetail || scope.error }}</p>
-            <div v-if="adminIdentity?.operator" class="dialog-actions"><button class="button button-primary" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false || decisionBusy === pairing.id" @click="decide(pairing, 'approve')">{{ decisionBusy === pairing.id ? 'Saving…' : 'Approve exact boards' }}</button><button class="button" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false || decisionBusy === pairing.id" @click="decide(pairing, 'decline')">Decline</button></div>
+            <div v-if="adminIdentity?.operator && pairingLifecycle(pairing) === 'approval_pending'" class="dialog-actions"><button class="button button-primary" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false || decisionBusy === pairing.id" @click="decide(pairing, 'approve')">{{ decisionBusy === pairing.id ? 'Saving…' : 'Approve exact boards' }}</button><button class="button" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false || decisionBusy === pairing.id" @click="decide(pairing, 'decline')">Decline</button></div>
             <p v-else class="muted" role="status">{{ pairingStatus(pairing) }} <a href="/admin/keepers" @click.prevent="navigate('/admin/keepers')">Open keeper</a></p>
             <p v-if="decisionError" class="admin-notice admin-notice-error" role="alert">{{ decisionError }}</p>
           </article>
