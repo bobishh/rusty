@@ -2,18 +2,44 @@ use crate::{
     http::{self, AppState},
     pairing::ControllerRequest,
 };
-use axum::{Json, extract::Path, response::IntoResponse, routing::post};
+use axum::{
+    Json,
+    extract::{DefaultBodyLimit, Path},
+    response::IntoResponse,
+    routing::post,
+};
 use loco_rs::{controller::Routes, prelude::SharedStore};
+
+// Signed baselines allow 4,096 IDs up to 256 bytes, repeated in pairing offers
+// and provisioning updates. Withdrawal evidence allows 8 MiB of raw documents,
+// base64 expansion, and bounded authority bundles. Keep other routes at 16 KiB.
+const MAX_PAIRING_OFFER_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PAIRING_PROVISION_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WITHDRAWAL_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn routes() -> Routes {
     Routes::new()
         .prefix("/v1/pairings")
-        .add("/", post(create))
+        .add(
+            "/",
+            post(create).layer(DefaultBodyLimit::max(MAX_PAIRING_OFFER_REQUEST_BODY_BYTES)),
+        )
         .add("/{id}/decision", post(decision))
-        .add("/{id}/withdraw", post(withdraw))
-        .add("/{id}/withdraw/complete", post(withdraw_complete))
+        .add(
+            "/{id}/withdraw",
+            post(withdraw).layer(DefaultBodyLimit::max(MAX_WITHDRAWAL_REQUEST_BODY_BYTES)),
+        )
+        .add(
+            "/{id}/withdraw/complete",
+            post(withdraw_complete).layer(DefaultBodyLimit::max(MAX_WITHDRAWAL_REQUEST_BODY_BYTES)),
+        )
         .add("/{id}/status", post(status))
-        .add("/{id}/provision", post(provision))
+        .add(
+            "/{id}/provision",
+            post(provision).layer(DefaultBodyLimit::max(
+                MAX_PAIRING_PROVISION_REQUEST_BODY_BYTES,
+            )),
+        )
 }
 
 pub(crate) fn login_routes() -> Routes {

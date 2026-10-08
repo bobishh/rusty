@@ -1647,8 +1647,47 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
     let service_origin = "https://rusty.example";
     let (pairings, pairing_id, integration_id, _, transcript_hash, old_provision) =
         approved_active_pairing(&keeper, service_origin, 2);
-    let legacy_grant_fixture =
+    let mut legacy_grant_fixture =
         fixture_with_preset_at_epoch(&keeper.owner, &keeper.keeper, "second-board", None, 2);
+    let mut grant_document = AutoCommit::load(
+        &URL_SAFE_NO_PAD
+            .decode(legacy_grant_fixture.entry["bytes"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let padding = URL_SAFE_NO_PAD.encode(
+        (0..32_000)
+            .map(|_| rand::random::<u8>())
+            .collect::<Vec<_>>(),
+    );
+    grant_document
+        .put(ROOT, "largeWithdrawalEvidence", padding)
+        .unwrap();
+    let grant_document_bytes = grant_document.save();
+    assert!(grant_document_bytes.len() > 16 * 1024);
+    let grant_hashes = grant_document
+        .get_changes(&[])
+        .iter()
+        .map(|change| change.hash().to_string())
+        .collect::<Vec<_>>();
+    legacy_grant_fixture.entry["bytes"] = json!(URL_SAFE_NO_PAD.encode(&grant_document_bytes));
+    legacy_grant_fixture.entry["authorization"]["records"][0]["signed"] = serde_json::to_value(
+        sign_json_envelope(
+            &keeper.owner.device_seed,
+            json!(WorkspaceChangeAuthorizationPayload {
+                kind: "workspace-changes".into(),
+                version: 1,
+                workspace_id: "second-board".into(),
+                hashes: grant_hashes,
+                person_id: keeper.owner.person_id.clone(),
+                device_id: keeper.owner.device_id.clone(),
+            }),
+            &keeper.owner.device_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let grant_scopes = json!([{
         "workspaceId": "second-board",
         "document": legacy_grant_fixture.entry["bytes"],
@@ -1701,6 +1740,7 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
         },
         grant_scopes,
     );
+    assert!(controller_request_json(&withdrawal).to_string().len() > 16 * 1024);
     let (address, server) = start_integration_http(
         &keeper.directory,
         keeper.host.clone(),
@@ -1711,6 +1751,34 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
     .await;
     let client = reqwest::Client::new();
     let withdrawal_url = format!("http://{address}/v1/pairings/{pairing_id}/withdraw");
+    let scopes_before_oversized = keeper.host.scopes().unwrap();
+    let oversized_response = client
+        .post(&withdrawal_url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(vec![b'x'; 16 * 1024 * 1024 + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        oversized_response.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(keeper.host.scopes().unwrap(), scopes_before_oversized);
+    let (status, body) = post_controller_request(
+        &client,
+        &format!("http://{address}/v1/pairings/{pairing_id}/status"),
+        &pairing_status_request(
+            &keeper.owner,
+            &keeper.keeper,
+            service_origin,
+            &pairing_id,
+            &transcript_hash,
+            &operation_id(64),
+        ),
+    )
+    .await;
+    assert!(status.is_success());
+    assert!(verify_service_response(body, &keeper.keeper)["withdrawal"].is_null());
     let attacker = Identity::new(81, 82, 83);
     let wrong_owner = pairing_withdrawal_request(
         &attacker,
@@ -2042,6 +2110,126 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
         verify_service_response(body, &keeper.keeper)["withdrawal"]["status"],
         "cancelled"
     );
+}
+
+#[tokio::test]
+async fn pairing_offer_and_provision_accept_bounded_large_signed_baselines() {
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let pairings = PairingService::open(
+        keeper.directory.join("pairings"),
+        &keeper.keeper.bundle("primary-board"),
+        service_origin.into(),
+        keeper.keeper.device_seed,
+        "test-operator-token-that-is-long-enough".into(),
+    )
+    .unwrap();
+    let mut baseline = (0..128)
+        .map(|index| format!("legacy-board-{index:03}-{}", "x".repeat(220)))
+        .collect::<Vec<_>>();
+    baseline.push("second-board".into());
+    baseline.sort();
+    let offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(201),
+            "body":{
+                "scopes":[{"workspaceId":"second-board","title":"Second board",
+                    "genesisAnchor":"second-board-genesis","mode":"replicate"}],
+                "policy":{"futureBoards":true,"baselineWorkspaceIds":baseline},
+            }
+        }),
+    );
+    assert!(controller_request_json(&offer).to_string().len() > 16 * 1024);
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let offer_response = client
+        .post(format!("http://{address}/v1/pairings"))
+        .json(&controller_request_json(&offer))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(offer_response.status(), reqwest::StatusCode::ACCEPTED);
+    let created: Value = offer_response.json().await.unwrap();
+    let pairing_id = created["pairingId"].as_str().unwrap();
+    let record = pairings
+        .admin_list(
+            &pairings
+                .login("test-operator-token-that-is-long-enough")
+                .unwrap()
+                .0,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == pairing_id)
+        .unwrap();
+    let (cookie, csrf) = pairings
+        .login("test-operator-token-that-is-long-enough")
+        .unwrap();
+    pairings
+        .admin_decision(&record.id, &cookie, &csrf, true)
+        .unwrap();
+    pairings
+        .controller_decision(
+            &record.id,
+            controller_request(
+                &keeper.owner,
+                &keeper.keeper,
+                service_origin,
+                json!({
+                    "kind":"lighthouse-pairing-decision",
+                    "operationId":operation_id(202),
+                    "pairingId":record.id,
+                    "transcriptHash":record.transcript_hash,
+                    "challengeNonce":record.challenge.payload["nonce"],
+                    "decision":"approve",
+                }),
+            ),
+        )
+        .unwrap();
+    let provision = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-provision",
+            "operationId":operation_id(203),
+            "body":{
+                "pairingId":record.id,
+                "transcriptHash":record.transcript_hash,
+                "servicePersonId":keeper.keeper.person_id,
+                "futureBoards":true,
+                "baselineWorkspaceIds":baseline,
+                "approvedScopes":[{"workspaceId":"second-board","mode":"replicate"}],
+            }
+        }),
+    );
+    assert!(controller_request_json(&provision).to_string().len() > 16 * 1024);
+    let provision_response = client
+        .post(format!(
+            "http://{address}/v1/pairings/{pairing_id}/provision"
+        ))
+        .json(&controller_request_json(&provision))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        provision_response.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert!(pairings.status_json(pairing_id).unwrap()["provisioning"].is_null());
+    server.abort();
+    let _ = server.await;
 }
 
 #[cfg(unix)]

@@ -2,14 +2,26 @@ use crate::{
     http::{self, AppState},
     pairing::ControllerRequest,
 };
-use axum::{Json, extract::Path, response::IntoResponse, routing::post};
+use axum::{
+    Json,
+    extract::{DefaultBodyLimit, Path},
+    response::IntoResponse,
+    routing::post,
+};
 use loco_rs::{controller::Routes, prelude::SharedStore};
+
+const MAX_INTEGRATION_MUTATION_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 pub(crate) fn routes() -> Routes {
     Routes::new()
         .prefix("/v1/integrations")
         .add("/status", post(status))
-        .add("/{id}/disconnect", post(disconnect))
+        .add(
+            "/{id}/disconnect",
+            post(disconnect).layer(DefaultBodyLimit::max(
+                MAX_INTEGRATION_MUTATION_REQUEST_BODY_BYTES,
+            )),
+        )
 }
 
 async fn status(
