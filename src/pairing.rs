@@ -91,6 +91,8 @@ pub struct PairingRecord {
     pub controller_device_id: String,
     pub controller_certificates: Vec<DeviceCertificate>,
     pub offer: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_source: Option<String>,
     pub challenge: SignedEnvelope<Value>,
     pub last_operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,7 +478,16 @@ impl PairingService {
         })
     }
 
+    #[cfg(test)]
     pub fn create(&self, request: ControllerRequest) -> Result<PairingRecord, PairingError> {
+        self.create_with_allowed_origin(request, None)
+    }
+
+    pub fn create_with_allowed_origin(
+        &self,
+        request: ControllerRequest,
+        allowed_origin: Option<&str>,
+    ) -> Result<PairingRecord, PairingError> {
         let now = now_seconds();
         self.verify_controller(&request)?;
         let payload = &request.signed.payload;
@@ -488,6 +499,14 @@ impl PairingService {
             &self.origin,
             now,
         )?;
+        let signed_origin = match payload.get("controllerOrigin") {
+            Some(Value::String(origin)) if !origin.is_empty() => Some(origin.as_str()),
+            Some(_) => return Err(PairingError::Invalid("Invalid signed controller origin")),
+            None => None,
+        };
+        if signed_origin.is_some() && signed_origin != allowed_origin {
+            return Err(PairingError::Forbidden);
+        }
         let operation_id = string_field(payload, "operationId")?;
         let body = payload
             .get("body")
@@ -653,6 +672,7 @@ impl PairingService {
             controller_device_id: request.device_id,
             controller_certificates: request.certificates,
             offer: payload.clone(),
+            admission_source: None,
             challenge,
             last_operation_id: operation_id.to_owned(),
             provisioning: None,
@@ -664,15 +684,33 @@ impl PairingService {
         Ok(record)
     }
 
+    #[cfg(test)]
     pub fn controller_decision(
         &self,
         id: &str,
         request: ControllerRequest,
     ) -> Result<PairingRecord, PairingError> {
+        self.controller_decision_from_origin(id, request, None)
+    }
+
+    pub fn controller_decision_from_origin(
+        &self,
+        id: &str,
+        request: ControllerRequest,
+        allowed_origin: Option<&str>,
+    ) -> Result<PairingRecord, PairingError> {
         let _ = self.verify_controller(&request)?;
         let now = now_seconds();
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         let record = state.records.get(id).ok_or(PairingError::NotFound)?;
+        let signed_origin = match record.offer.get("controllerOrigin") {
+            Some(Value::String(origin)) if !origin.is_empty() => Some(origin.as_str()),
+            Some(_) => return Err(PairingError::Invalid("Invalid signed controller origin")),
+            None => None,
+        };
+        if signed_origin.is_some() && signed_origin != allowed_origin {
+            return Err(PairingError::Forbidden);
+        }
         if record.expires_at <= now
             && record
                 .provisioning
@@ -740,8 +778,12 @@ impl PairingService {
         record.controller_approved = Some(approved);
         record.controller_decision_operation = Some(operation_id.to_owned());
         record.controller_decision_hash = Some(decision_hash);
-        if !approved {
+        if approved && signed_origin.is_some() {
+            record.operator_approved = Some(true);
+            record.admission_source = Some("owner_origin".into());
+        } else if !approved {
             record.operator_approved = Some(false);
+            record.admission_source = Some("controller".into());
         }
         let result = record.clone();
         self.persist(&next)?;
@@ -2219,16 +2261,36 @@ impl PairingService {
             .transpose()
             .map_err(|_| PairingError::Unavailable)?
             .unwrap_or(Value::Bool(false));
-        sign_json_envelope(&self.service_seed, json!({
+        let mut payload = json!({
             "kind":"lighthouse-pairing-status", "version":1, "pairingId":record.id,
             "integrationId":record.challenge.payload["integrationId"],
             "transcriptHash":record.transcript_hash, "servicePersonId":self.service_identity.person_id,
             "serviceDeviceId":self.service_device_id, "serviceOrigin":self.origin,
+            "controllerPersonId":record.controller.person_id,
+            "controllerDeviceId":record.controller_device_id,
+            "approvedWorkspaceIds":record.offer.pointer("/body/scopes").and_then(Value::as_array)
+                .map(|scopes| scopes.iter().filter_map(|scope| scope["workspaceId"].as_str()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            "futureBoards":record.offer.pointer("/body/policy/futureBoards").and_then(Value::as_bool).unwrap_or(false),
+            "baselineWorkspaceIds":pairing_baseline(record).unwrap_or_default(),
             "expiresAt":record.expires_at, "operatorApproved":record.operator_approved,
             "controllerApproved":record.controller_approved, "status":status,
             "provisioning":provisioning, "withdrawal":record.withdrawal,
             "issuedAt":now,
-        }), &self.service_device_id, CONTROL_DOMAIN).map_err(|_| PairingError::Unavailable)
+        });
+        if let Some(origin) = record.offer.get("controllerOrigin").and_then(Value::as_str) {
+            payload["controllerOrigin"] = json!(origin);
+        }
+        if let Some(source) = &record.admission_source {
+            payload["admissionSource"] = json!(source);
+        }
+        sign_json_envelope(
+            &self.service_seed,
+            payload,
+            &self.service_device_id,
+            CONTROL_DOMAIN,
+        )
+        .map_err(|_| PairingError::Unavailable)
     }
 
     pub fn authorize_reset(
@@ -2560,9 +2622,13 @@ impl PairingService {
         {
             return Err(PairingError::Conflict);
         }
+        if record.operator_approved == Some(decision) {
+            return Ok(record.clone());
+        }
         let mut next = state.clone();
         let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
         record.operator_approved = Some(decision);
+        record.admission_source = Some("operator".into());
         if !decision {
             record.controller_approved = Some(false);
         }
@@ -2598,9 +2664,24 @@ impl PairingService {
                     .map(|provisioning| provisioning.status.as_str())
             })
             .unwrap_or(approval_status);
-        Ok(
-            json!({ "id":record.id, "status":status, "expiresAt":record.expires_at, "controllerApproved":record.controller_approved, "operatorApproved":record.operator_approved, "provisioning":record.provisioning, "withdrawal":record.withdrawal }),
-        )
+        let mut status = json!({
+            "id":record.id, "status":status, "expiresAt":record.expires_at,
+            "controllerApproved":record.controller_approved, "operatorApproved":record.operator_approved,
+            "controllerPersonId":record.controller.person_id, "controllerDeviceId":record.controller_device_id,
+            "approvedWorkspaceIds":record.offer.pointer("/body/scopes").and_then(Value::as_array)
+                .map(|scopes| scopes.iter().filter_map(|scope| scope["workspaceId"].as_str()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            "futureBoards":record.offer.pointer("/body/policy/futureBoards").and_then(Value::as_bool).unwrap_or(false),
+            "baselineWorkspaceIds":pairing_baseline(record).unwrap_or_default(),
+            "provisioning":record.provisioning, "withdrawal":record.withdrawal,
+        });
+        if let Some(origin) = record.offer.get("controllerOrigin").and_then(Value::as_str) {
+            status["controllerOrigin"] = json!(origin);
+        }
+        if let Some(source) = &record.admission_source {
+            status["admissionSource"] = json!(source);
+        }
+        Ok(status)
     }
 
     fn verify_controller(&self, request: &ControllerRequest) -> Result<String, PairingError> {
@@ -2815,6 +2896,7 @@ mod retention_tests {
             controller_device_id: "owner-device".into(),
             controller_certificates: Vec::new(),
             offer: json!({"body":{"scopes":[]}}),
+            admission_source: None,
             challenge: SignedEnvelope {
                 payload: json!({"integrationId":"integration", "nonce":"nonce"}),
                 signer_key_id: "service-device".into(),

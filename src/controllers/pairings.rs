@@ -5,6 +5,7 @@ use crate::{
 use axum::{
     Json,
     extract::{DefaultBodyLimit, Path},
+    http::HeaderMap,
     response::IntoResponse,
     routing::post,
 };
@@ -51,16 +52,18 @@ pub(crate) fn login_routes() -> Routes {
 
 async fn create(
     SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
     Json(request): Json<ControllerRequest>,
 ) -> impl IntoResponse {
-    http::create_pairing(state, request).await
+    http::create_pairing(state, headers, request).await
 }
 async fn decision(
     SharedStore(state): SharedStore<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<ControllerRequest>,
 ) -> impl IntoResponse {
-    http::pairing_decision(state, id, request).await
+    http::pairing_decision(state, id, headers, request).await
 }
 async fn status(
     SharedStore(state): SharedStore<AppState>,

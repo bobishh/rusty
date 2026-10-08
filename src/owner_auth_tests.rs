@@ -483,6 +483,7 @@ fn exact_provision_failure_survives_restart_in_signed_status() {
         controller_device_id: device_id,
         controller_certificates: certificates,
         offer: json!({}),
+        admission_source: None,
         challenge,
         last_operation_id: "operation".into(),
         provisioning: Some(ProvisioningRecord {

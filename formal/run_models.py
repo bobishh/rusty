@@ -43,6 +43,14 @@ CASES = [
     ("PairingLateActivation", None, "NoLateActivation", "PairingWithdrawal"),
     ("PairingRetryAfterWithdrawal", None, "NoRetryAfterFence", "PairingWithdrawal"),
     ("PairingUnverifiedCompletion", None, "CancelledHasNoGrant", "PairingWithdrawal"),
+    ("OriginScopedAdmission", None, None, "OriginScopedAdmission"),
+    ("OriginScopedForeign", None, None, "OriginScopedAdmission"),
+    ("OriginScopedMismatch", None, None, "OriginScopedAdmission"),
+    ("OriginScopedForeignOwner", None, None, "OriginScopedAdmission"),
+    ("OriginScopedForeignScope", None, None, "OriginScopedAdmission"),
+    ("OriginScopedPartialGrant", None, None, "OriginScopedAdmission"),
+    ("OriginScopedLegacy", None, None, "OriginScopedAdmission"),
+    ("OriginScopedLegacyUnapproved", None, None, "OriginScopedAdmission"),
 ]
 
 

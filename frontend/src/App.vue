@@ -37,6 +37,7 @@ type Pairing = {
   futureBoards: boolean
   operatorApproved: boolean | null
   controllerApproved: boolean | null
+  admissionSource?: string | null
   provisioning?: { status: string; scopes: { workspaceId: string; status: string; error?: string; errorDetail?: string }[] } | null
 }
 
@@ -410,6 +411,11 @@ async function unsubscribe() {
 
 function pairingStatus(pairing: Pairing) {
   if (pairing.operatorApproved === false || pairing.controllerApproved === false) return "Keeper request declined. No access granted."
+  if (pairing.admissionSource === "owner_origin" && pairing.operatorApproved === true) {
+    return pairing.provisioning
+      ? `Owner approved this request from an allowed origin. Board setup: ${pairing.provisioning.status}.`
+      : "Owner approved this request from an allowed origin. Rusty is preparing the selected boards."
+  }
   if (pairing.operatorApproved === null) return "Waiting for keeper operator to approve service access."
   if (pairing.controllerApproved === null) return "Waiting for Tincanban identity confirmation."
   return "Both approvals are recorded. Board status appears on keeper detail."

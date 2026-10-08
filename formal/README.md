@@ -92,6 +92,15 @@ pruning and service restart. Provisioning and cancellation cleanup obligations
 keep the pairing record durable; an expired receipt remains replayable through
 the bounded retention window. Pruning can remove only terminal records.
 
+`OriginScopedAdmission.tla` models same-owner admission for a signed offer
+bound to the exact allowlisted browser origin. A valid owner/device proof and
+whole-scope ownership proof let that owner decision satisfy service admission
+for the one pairing; origin alone cannot. Legacy offers without the signed
+origin still require the manual operator decision. Activation remains gated on
+verified grants for every requested scope, so a mixed or partial grant cannot
+attach anything. Separate configs check foreign/mismatched origin, foreign
+owner, foreign scope, incomplete grants, and legacy manual approval.
+
 | Requirement | Check |
 | --- | --- |
 | Editor invitation and signed Editor grant required | `EditorRoleProofs`; `VisitorActivation.cfg` mutant |
@@ -108,6 +117,7 @@ the bounded retention window. Pruning can remove only terminal records.
 | Operator and identity sessions survive independent sign-in and logout | `SessionCookieIsolation.cfg`; `SessionCookieCollision.cfg` models the overwrite defect |
 | Local OwnerKeeper projection cleanup retries after a verified removal receipt and restart | `LocalProjectionCleanup.cfg`; `LocalProjectionCleanupDropsReceipt.cfg` models lost retry evidence |
 | Pairing withdrawal fences late provision/retry and waits for owner revocation beyond issued grants | `PairingWithdrawal.cfg`; `PairingLateActivation.cfg`, `PairingRetryAfterWithdrawal.cfg`, and `PairingUnverifiedCompletion.cfg` are expected counterexamples |
+| Owner-origin admission requires exact origin and whole owner scope proof; legacy still needs operator consent | `OriginScopedAdmission.cfg`, foreign-origin/owner/scope configs, and legacy consent configs |
 | Expired pairing status stays signed and cleanup/terminal receipt survives bounded pruning and restart | `PairingRetention.cfg` |
 | Ambiguous JobSearch routing is blocked | `AmbiguousRouteBlocked`; `AmbiguousRouteMutation.cfg` mutant |
 

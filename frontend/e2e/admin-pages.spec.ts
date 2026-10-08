@@ -50,6 +50,16 @@ test("Given a keeper awaiting owner confirmation, when opening approvals, then s
   await expect(page.getByText("Waiting for Tincanban identity confirmation.", { exact: false })).toBeVisible()
 })
 
+test("Given owner-origin approval, when opening approvals, then Rusty does not request a second operator approval", async ({ page }) => {
+  await page.route("**/admin/api/session", route => route.fulfill({ json: { csrfToken: "csrf", personId: "owner", displayName: "Owner", operator: false } }))
+  await page.route("**/admin/api/overview", route => route.fulfill({ json: { keeper: { displayName: "Rusty", personId: "keeper-person", deviceId: "device-1", boards: [] }, triggers: [], replication: { state: "idle", activePeers: 0 } } }))
+  await page.route("**/admin/api/pairings", route => route.fulfill({ json: { pairings: [{ id: "owner-origin-1", comparisonCode: "123456", controller: { displayName: "Owner" }, controllerFingerprint: "owner", serviceFingerprint: "keeper", scopes: [{ title: "Garden", mode: "replicate" }], futureBoards: false, operatorApproved: true, controllerApproved: true, admissionSource: "owner_origin" }] } }))
+  await page.goto("/admin/approvals")
+  await expect(page.getByRole("status")).toContainText("Owner approved this request from an allowed origin.")
+  await expect(page.getByRole("status")).toContainText("Rusty is preparing the selected boards.")
+  await expect(page.getByText("Waiting for keeper operator to approve service access.", { exact: true })).toHaveCount(0)
+})
+
 test("Given owner session, when opening operator settings URL, then route returns to keepers", async ({ page }) => {
   await signedIn(page, false)
   await page.goto("/admin/settings")

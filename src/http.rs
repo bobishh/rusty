@@ -129,7 +129,8 @@ impl Discovery {
                     "chatReplication": true,
                     "blobReplication": false,
                     "pairing": false,
-                    "provisioning": false
+                    "provisioning": false,
+                    "ownerOriginAdmission": false
                 },
                 "publicOrigin": origin.origin().ascii_serialization(),
                 "managementPath": "/admin"
@@ -142,6 +143,11 @@ impl Discovery {
     pub fn with_pairings(mut self, pairings: PairingService) -> Self {
         self.descriptor["capabilities"]["pairing"] = Value::Bool(true);
         self.pairings = Some(pairings);
+        self
+    }
+
+    fn with_owner_origin_admission(mut self, enabled: bool) -> Self {
+        self.descriptor["capabilities"]["ownerOriginAdmission"] = Value::Bool(enabled);
         self
     }
 
@@ -257,7 +263,7 @@ pub async fn serve(
     directory: PathBuf,
     address: SocketAddr,
     lead_sender: Option<LeadSender>,
-    discovery: Option<Discovery>,
+    mut discovery: Option<Discovery>,
     keeper: Option<KeeperHost>,
     replication: RuntimeOverview,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -279,6 +285,11 @@ pub async fn serve(
         .collect::<Vec<_>>();
     let cors_settings = CorsSettings::open(directory.join("cors-origins.json"), cors_origins)?;
     let pairings = discovery.as_ref().and_then(|item| item.pairings.clone());
+    if let Some(item) = discovery.take() {
+        discovery = Some(item.with_owner_origin_admission(
+            pairings.is_some() && !cors_settings.origins().is_empty(),
+        ));
+    }
     let provisioner = discovery.as_ref().and_then(|item| item.provisioner.clone());
     let state = AppState {
         inbox: Inbox {
@@ -358,12 +369,17 @@ pub(crate) async fn operator_test_router_with_runtime(
 
 pub(crate) async fn create_pairing(
     state: AppState,
+    headers: axum::http::HeaderMap,
     request: ControllerRequest,
 ) -> Result<(StatusCode, Json<Value>), PairingResponseError> {
     let pairings = state
         .pairings
+        .as_ref()
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
-    let record = pairings.create(request).map_err(PairingResponseError)?;
+    let origin = allowed_controller_origin(&state, &headers, &request.signed.payload)?;
+    let record = pairings
+        .create_with_allowed_origin(request, origin.as_deref())
+        .map_err(PairingResponseError)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
@@ -377,16 +393,56 @@ pub(crate) async fn create_pairing(
     ))
 }
 
+fn allowed_controller_origin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    signed_payload: &Value,
+) -> Result<Option<String>, PairingResponseError> {
+    let Some(claim) = signed_payload.get("controllerOrigin") else {
+        return Ok(None);
+    };
+    let origin = claim
+        .as_str()
+        .filter(|origin| !origin.is_empty())
+        .ok_or(PairingResponseError(PairingError::Invalid(
+            "Invalid signed controller origin",
+        )))?;
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let request_origin = origins
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(PairingResponseError(PairingError::Forbidden))?;
+    if origins.next().is_some()
+        || request_origin != origin
+        || !state.cors_settings.allows_origin(origin)
+    {
+        return Err(PairingResponseError(PairingError::Forbidden));
+    }
+    Ok(Some(origin.to_owned()))
+}
+
+fn allowed_origin_header(state: &AppState, headers: &axum::http::HeaderMap) -> Option<String> {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let origin = origins.next()?.to_str().ok()?;
+    if origins.next().is_some() || !state.cors_settings.allows_origin(origin) {
+        return None;
+    }
+    Some(origin.to_owned())
+}
+
 pub(crate) async fn pairing_decision(
     state: AppState,
     id: String,
+    headers: axum::http::HeaderMap,
     request: ControllerRequest,
 ) -> Result<Json<Value>, PairingResponseError> {
     let pairings = state
         .pairings
+        .as_ref()
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let origin = allowed_origin_header(&state, &headers);
     let record = pairings
-        .controller_decision(&id, request)
+        .controller_decision_from_origin(&id, request, origin.as_deref())
         .map_err(PairingResponseError)?;
     Ok(Json(
         json!({ "pairingId": record.id, "status": pairings.status_json(&record.id).map_err(PairingResponseError)? }),
@@ -1088,6 +1144,8 @@ pub(crate) async fn admin_list(
         "scopes":record.offer["body"]["scopes"],"transcriptHash":record.transcript_hash,
         "futureBoards":record.offer.pointer("/body/policy/futureBoards").and_then(Value::as_bool).unwrap_or(false),
         "operatorApproved":record.operator_approved,"controllerApproved":record.controller_approved,
+        "admissionSource":record.admission_source,
+        "controllerOrigin":record.offer.get("controllerOrigin"),
         "provisioning":record.provisioning,
     })).collect::<Vec<_>>();
     let mut response = Json(json!({"pairings":rows})).into_response();
@@ -1517,6 +1575,7 @@ fn cookie<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str>
         .find_map(|pair| pair.trim().strip_prefix(&format!("{name}=")))
 }
 
+#[derive(Debug)]
 pub(crate) struct PairingResponseError(pub(crate) PairingError);
 impl IntoResponse for PairingResponseError {
     fn into_response(self) -> Response {
@@ -2453,6 +2512,222 @@ mod tests {
             "controllerPersonId":identity.person_id,"controllerDeviceId":device_id,
             "operationId":URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>()),"issuedAt":now,"expiresAt":now+600,
         })
+    }
+
+    #[tokio::test]
+    async fn owner_origin_admission_binds_signed_origin_and_single_owner_decision() {
+        let root = std::env::temp_dir().join(format!(
+            "lighthouse-origin-admission-{}",
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let (service_peer, service_seed, service_identity, _, _) = signed_test_peer("Rusty");
+        let (_, controller_seed, controller_identity, controller_device, controller_certs) =
+            signed_test_peer("Board owner");
+        let service_origin = "https://rusty.example";
+        let controller_origin = "https://match.example";
+        let pairings = PairingService::open(
+            root.join("pairings"),
+            &service_peer,
+            service_origin.into(),
+            service_seed,
+            "operator-secret-long-enough-for-tests".into(),
+        )
+        .unwrap();
+        let state = AppState {
+            inbox: Inbox {
+                directory: Arc::new(root.join("inbox")),
+                results: Arc::new(root.join("results")),
+                write_lock: Arc::new(Mutex::new(())),
+            },
+            captcha: Captcha {
+                secret: Arc::new([1; 32]),
+                used: Arc::new(root.join("captcha-used")),
+            },
+            ingest_slots: Arc::new(Semaphore::new(1)),
+            discovery: Some(
+                Discovery::from_peer(&service_peer, service_origin)
+                    .unwrap()
+                    .with_pairings(pairings.clone())
+                    .with_owner_origin_admission(true),
+            ),
+            pairings: Some(pairings.clone()),
+            provisioner: None,
+            cors_settings: CorsSettings::open(
+                root.join("cors.json"),
+                vec![controller_origin.into()],
+            )
+            .unwrap(),
+            keeper: None,
+            replication: RuntimeOverview::default(),
+        };
+        let mut offer = common_payload(
+            "lighthouse-pairing-offer",
+            &controller_identity,
+            &controller_device,
+            &service_identity.person_id,
+            service_origin,
+            "ignored",
+        );
+        offer["controllerOrigin"] = json!(controller_origin);
+        offer["body"] = json!({
+            "scopes":[{"workspaceId":"owned-board","title":"Owned board","genesisAnchor":"genesis","mode":"replicate"}],
+            "policy":{"futureBoards":false,"baselineWorkspaceIds":["owned-board"]}
+        });
+        let request: ControllerRequest = serde_json::from_value(request_bundle(
+            &controller_seed,
+            &controller_identity,
+            &controller_device,
+            &controller_certs,
+            offer,
+        ))
+        .unwrap();
+        let absent =
+            create_pairing(state.clone(), axum::http::HeaderMap::new(), request.clone()).await;
+        assert!(
+            absent.is_err(),
+            "signed origin without browser Origin must fail"
+        );
+        let mut foreign_headers = axum::http::HeaderMap::new();
+        foreign_headers.append(
+            header::ORIGIN,
+            HeaderValue::from_static("https://foreign.example"),
+        );
+        assert!(
+            create_pairing(state.clone(), foreign_headers, request.clone())
+                .await
+                .is_err()
+        );
+        let mut duplicate_headers = axum::http::HeaderMap::new();
+        duplicate_headers.append(header::ORIGIN, HeaderValue::from_static(controller_origin));
+        duplicate_headers.append(header::ORIGIN, HeaderValue::from_static(controller_origin));
+        assert!(
+            create_pairing(state.clone(), duplicate_headers, request.clone())
+                .await
+                .is_err()
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(header::ORIGIN, HeaderValue::from_static(controller_origin));
+        let (_, Json(created)) = create_pairing(state.clone(), headers, request)
+            .await
+            .unwrap();
+        let id = created["pairingId"].as_str().unwrap();
+        let transcript_hash = created["transcriptHash"].as_str().unwrap();
+        let nonce = created["challenge"]["payload"]["nonce"].as_str().unwrap();
+
+        let mut decision = common_payload(
+            "lighthouse-pairing-decision",
+            &controller_identity,
+            &controller_device,
+            &service_identity.person_id,
+            service_origin,
+            "ignored",
+        );
+        decision["pairingId"] = json!(id);
+        decision["transcriptHash"] = json!(transcript_hash);
+        decision["challengeNonce"] = json!(nonce);
+        decision["decision"] = json!("approve");
+        let decision: ControllerRequest = serde_json::from_value(request_bundle(
+            &controller_seed,
+            &controller_identity,
+            &controller_device,
+            &controller_certs,
+            decision,
+        ))
+        .unwrap();
+        let mut wrong_origin = axum::http::HeaderMap::new();
+        wrong_origin.append(
+            header::ORIGIN,
+            HeaderValue::from_static("https://foreign.example"),
+        );
+        assert!(
+            pairing_decision(state.clone(), id.into(), wrong_origin, decision.clone())
+                .await
+                .is_err()
+        );
+        let (_, foreign_seed, foreign_identity, foreign_device, foreign_certs) =
+            signed_test_peer("Other owner");
+        let mut foreign_decision = common_payload(
+            "lighthouse-pairing-decision",
+            &foreign_identity,
+            &foreign_device,
+            &service_identity.person_id,
+            service_origin,
+            "ignored",
+        );
+        foreign_decision["pairingId"] = json!(id);
+        foreign_decision["transcriptHash"] = json!(transcript_hash);
+        foreign_decision["challengeNonce"] = json!(nonce);
+        foreign_decision["decision"] = json!("approve");
+        let foreign_decision: ControllerRequest = serde_json::from_value(request_bundle(
+            &foreign_seed,
+            &foreign_identity,
+            &foreign_device,
+            &foreign_certs,
+            foreign_decision,
+        ))
+        .unwrap();
+        let mut owner_origin = axum::http::HeaderMap::new();
+        owner_origin.append(header::ORIGIN, HeaderValue::from_static(controller_origin));
+        assert!(
+            pairing_decision(state.clone(), id.into(), owner_origin, foreign_decision)
+                .await
+                .is_err()
+        );
+        let mut owner_origin = axum::http::HeaderMap::new();
+        owner_origin.append(header::ORIGIN, HeaderValue::from_static(controller_origin));
+        let Json(result) = pairing_decision(state.clone(), id.into(), owner_origin, decision)
+            .await
+            .unwrap();
+        let status = &result["status"];
+        assert_eq!(status["status"], "approved");
+        assert_eq!(status["admissionSource"], "owner_origin");
+        assert_eq!(status["controllerOrigin"], controller_origin);
+        assert_eq!(status["controllerPersonId"], controller_identity.person_id);
+        assert_eq!(status["controllerDeviceId"], controller_device);
+        assert_eq!(status["approvedWorkspaceIds"], json!(["owned-board"]));
+        assert_eq!(status["futureBoards"], false);
+        let (operator_cookie, operator_csrf) = pairings
+            .login("operator-secret-long-enough-for-tests")
+            .unwrap();
+        let duplicate_operator_approval = pairings
+            .admin_decision(id, &operator_cookie, &operator_csrf, true)
+            .unwrap();
+        assert_eq!(
+            duplicate_operator_approval.admission_source.as_deref(),
+            Some("owner_origin")
+        );
+        let mut status_payload = common_payload(
+            "lighthouse-pairing-status",
+            &controller_identity,
+            &controller_device,
+            &service_identity.person_id,
+            service_origin,
+            "ignored",
+        );
+        status_payload["pairingId"] = json!(id);
+        status_payload["transcriptHash"] = json!(transcript_hash);
+        let status_request: ControllerRequest = serde_json::from_value(request_bundle(
+            &controller_seed,
+            &controller_identity,
+            &controller_device,
+            &controller_certs,
+            status_payload,
+        ))
+        .unwrap();
+        let Json(signed_status) = pairing_status(state, id.into(), status_request)
+            .await
+            .unwrap();
+        assert_eq!(signed_status["payload"]["admissionSource"], "owner_origin");
+        assert_eq!(
+            signed_status["payload"]["controllerOrigin"],
+            controller_origin
+        );
+        assert_eq!(
+            signed_status["payload"]["approvedWorkspaceIds"],
+            json!(["owned-board"])
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

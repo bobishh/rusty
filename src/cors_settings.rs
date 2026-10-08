@@ -75,6 +75,10 @@ impl CorsSettings {
             .is_ok_and(|value| self.origins().iter().any(|allowed| allowed == value))
     }
 
+    pub(crate) fn allows_origin(&self, origin: &str) -> bool {
+        self.origins().iter().any(|allowed| allowed == origin)
+    }
+
     pub(crate) fn replace(&self, origins: Vec<String>) -> io::Result<()> {
         validate(&origins, self.required_origin())?;
         let mut current = self
