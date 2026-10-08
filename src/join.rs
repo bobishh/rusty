@@ -628,8 +628,12 @@ pub(crate) fn prepare_config(
             peer.pointer("/advertisement/payload/deviceId")
                 .and_then(Value::as_str)
                 == Some(invite.issuer_device_id.as_str())
+                && peer
+                    .pointer("/advertisement/payload/endpoint")
+                    .and_then(Value::as_str)
+                    == Some(invite.issuer_endpoint.as_str())
         })
-        .ok_or("Invitation issuer absent from mesh peers")?;
+        .ok_or("Invitation issuer route absent from mesh peers")?;
     let verified_issuer = verify_workspace_member_bundle(
         issuer.clone(),
         VerifyWorkspaceMemberOptions {

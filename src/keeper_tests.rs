@@ -348,6 +348,95 @@ fn fixture_with_preset_at_epoch(
     }
 }
 
+#[test]
+fn join_selects_the_invitation_bound_owner_instance_and_still_checks_role_and_key() {
+    let owner = Identity::new(31, 32, 33);
+    let keeper = Identity::new(41, 42, 43);
+    let workspace_id = "same-device-multiple-routes";
+    let mut fixture = fixture_with_preset_at_epoch(&owner, &keeper, workspace_id, None, 2);
+    let current_endpoint = iroh::SecretKey::from([34; 32]).public().to_string();
+    let mut current_owner_peer = join::guest_bundle(
+        workspace_id,
+        &owner.person_id,
+        &owner.device_id,
+        &owner.public_key,
+        &owner.certificate,
+        &owner.device_seed,
+        &current_endpoint,
+    )
+    .unwrap();
+    current_owner_peer["ownerPublicKey"] = json!(owner.public_key);
+    current_owner_peer["ownerCertificates"] = json!([owner.certificate]);
+
+    let old_owner_peer = fixture.envelope["peers"][0].clone();
+    let mut response: Value = serde_json::from_slice(&fixture.response).unwrap();
+    response["meshWorkspaces"][0]["peers"] = json!([old_owner_peer, current_owner_peer]);
+    let response = serde_json::to_vec(&response).unwrap();
+    fixture.invitation.issuer_endpoint = current_endpoint.clone();
+    fixture.invitation.issuer_public_key = public_key_from_seed(&owner.device_seed).unwrap();
+    let prepare = |invitation: &WorkspaceJoinInvitation, response: &[u8]| {
+        let directory = std::env::temp_dir().join(format!("join-route-{}", rand::random::<u128>()));
+        fs::create_dir_all(&directory).unwrap();
+        let result = join::prepare_config(
+            invitation,
+            response,
+            &directory,
+            &keeper.person_id,
+            &keeper.device_id,
+            &keeper.bundle(workspace_id),
+            keeper.identity_seed,
+            &keeper.device_seed,
+            [44; 32],
+        );
+        let _ = fs::remove_dir_all(directory);
+        result
+    };
+
+    let config = prepare(&fixture.invitation, &response).unwrap();
+    assert_eq!(config.owner_endpoint_id, current_endpoint);
+
+    let correct_endpoint = fixture.invitation.issuer_endpoint.clone();
+    fixture.invitation.issuer_endpoint = iroh::SecretKey::from([36; 32]).public().to_string();
+    let wrong_endpoint_error = prepare(&fixture.invitation, &response)
+        .err()
+        .expect("an endpoint not present in the signed peer list must fail");
+    assert!(
+        wrong_endpoint_error
+            .to_string()
+            .contains("issuer route absent")
+    );
+    fixture.invitation.issuer_endpoint = correct_endpoint;
+
+    fixture.invitation.issuer_public_key = public_key_from_seed(&[35; 32]).unwrap();
+    let wrong_key_error = prepare(&fixture.invitation, &response)
+        .err()
+        .expect("an invitation key that differs from the signed owner device must fail");
+    assert!(
+        wrong_key_error
+            .to_string()
+            .contains("does not match signed owner route")
+    );
+
+    let mut non_owner_peer = keeper.bundle(workspace_id);
+    non_owner_peer["grant"] = fixture.grant.clone();
+    non_owner_peer["ownerPublicKey"] = json!(owner.public_key);
+    non_owner_peer["ownerCertificates"] = json!([owner.certificate]);
+    let mut non_owner_response: Value = serde_json::from_slice(&fixture.response).unwrap();
+    non_owner_response["meshWorkspaces"][0]["peers"] = json!([non_owner_peer]);
+    let non_owner_response = serde_json::to_vec(&non_owner_response).unwrap();
+    fixture.invitation.issuer_device_id = keeper.device_id.clone();
+    fixture.invitation.issuer_endpoint = keeper.endpoint.clone();
+    fixture.invitation.issuer_public_key = public_key_from_seed(&keeper.device_seed).unwrap();
+    let wrong_role_error = prepare(&fixture.invitation, &non_owner_response)
+        .err()
+        .expect("a signed editor route cannot act as invitation owner");
+    assert!(
+        wrong_role_error
+            .to_string()
+            .contains("does not match signed owner route")
+    );
+}
+
 struct TestKeeper {
     host: KeeperHost,
     owner: Identity,
