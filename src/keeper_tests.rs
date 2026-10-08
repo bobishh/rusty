@@ -2970,6 +2970,270 @@ async fn pairing_offer_and_provision_accept_bounded_large_signed_baselines() {
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn expired_unprovisioned_pairing_survives_offer_prune_restart_and_signed_withdrawal() {
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let scopes_before = keeper.host.scopes().unwrap();
+    let pairings_directory = keeper.directory.join("pairings");
+    let open_pairings = || {
+        PairingService::open(
+            pairings_directory.clone(),
+            &keeper.keeper.bundle("primary-board"),
+            service_origin.into(),
+            keeper.keeper.device_seed,
+            "test-operator-token-that-is-long-enough".into(),
+        )
+        .unwrap()
+    };
+    let pairings = open_pairings();
+    let integration_id = crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id);
+    let old_offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(231),
+            "body":{
+                "scopes":[{"workspaceId":"old-board","title":"Old board",
+                    "genesisAnchor":"old-board-genesis","mode":"replicate"}],
+                "policy":{"futureBoards":false,"baselineWorkspaceIds":["old-board"]}
+            }
+        }),
+    );
+    let old_record = pairings.create(old_offer).unwrap();
+
+    // Model an expired request before a later offer triggers retention pruning.
+    let store_path = pairings_directory.join("pairings.json");
+    let mut stored: Value = serde_json::from_slice(&fs::read(&store_path).unwrap()).unwrap();
+    stored["records"][&old_record.id]["expiresAt"] =
+        json!(time::OffsetDateTime::now_utc().unix_timestamp() as u64 - 60);
+    fs::write(&store_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    drop(pairings);
+    let pairings = open_pairings();
+    let new_offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(232),
+            "body":{
+                "scopes":[{"workspaceId":"new-board","title":"New board",
+                    "genesisAnchor":"new-board-genesis","mode":"replicate"}],
+                "policy":{"futureBoards":false,"baselineWorkspaceIds":["new-board"]}
+            }
+        }),
+    );
+    pairings.create(new_offer).unwrap();
+    drop(pairings);
+
+    // A second restart must still load the expired request for signed cleanup.
+    let pairings = open_pairings();
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let status_url = format!("http://{address}/v1/pairings/{}/status", old_record.id);
+    let status_request = pairing_status_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &old_record.id,
+        &old_record.transcript_hash,
+        &operation_id(233),
+    );
+    let (status, body) = post_controller_request(&client, &status_url, &status_request).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let expired = verify_service_response(body, &keeper.keeper);
+    assert_eq!(expired["status"], "expired");
+    assert_eq!(expired["integrationId"], integration_id);
+
+    let withdrawal_operation = operation_id(234);
+    let withdrawal = pairing_withdrawal_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &old_record.id,
+        &old_record.transcript_hash,
+        old_record.challenge.payload["nonce"].as_str().unwrap(),
+        &withdrawal_operation,
+    );
+    let withdrawal_url = format!("http://{address}/v1/pairings/{}/withdraw", old_record.id);
+    let (status, body) = post_controller_request(&client, &withdrawal_url, &withdrawal).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let cancelled = verify_service_response(body, &keeper.keeper);
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["withdrawal"]["status"], "cancelled");
+    assert!(pairings.status_json(&old_record.id).unwrap()["provisioning"].is_null());
+
+    // Exact-operation retry after another reload must replay the same terminal receipt.
+    server.abort();
+    let _ = server.await;
+    drop(pairings);
+    let pairings = open_pairings();
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings.clone(),
+    )
+    .await;
+    let withdrawal_url = format!("http://{address}/v1/pairings/{}/withdraw", old_record.id);
+    let retry = pairing_withdrawal_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &old_record.id,
+        &old_record.transcript_hash,
+        old_record.challenge.payload["nonce"].as_str().unwrap(),
+        &withdrawal_operation,
+    );
+    let (status, body) = post_controller_request(&client, &withdrawal_url, &retry).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        verify_service_response(body, &keeper.keeper)["status"],
+        "cancelled"
+    );
+    assert_eq!(keeper.host.scopes().unwrap(), scopes_before);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn unresolved_withdrawal_obligation_outlives_ttl_and_terminal_receipt_is_bounded() {
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let pairings_directory = keeper.directory.join("pairings");
+    let open_pairings = || {
+        PairingService::open(
+            pairings_directory.clone(),
+            &keeper.keeper.bundle("primary-board"),
+            service_origin.into(),
+            keeper.keeper.device_seed,
+            "test-operator-token-that-is-long-enough".into(),
+        )
+        .unwrap()
+    };
+    let pairings = open_pairings();
+    let old_offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(241),
+            "body":{
+                "scopes":[{"workspaceId":"old-board","title":"Old board",
+                    "genesisAnchor":"old-board-genesis","mode":"replicate"}],
+                "policy":{"futureBoards":false,"baselineWorkspaceIds":["old-board"]}
+            }
+        }),
+    );
+    let old = pairings.create(old_offer).unwrap();
+    let withdrawal_operation = operation_id(242);
+    let withdrawal = pairing_withdrawal_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &old.id,
+        &old.transcript_hash,
+        old.challenge.payload["nonce"].as_str().unwrap(),
+        &withdrawal_operation,
+    );
+    let pending = pairings.withdraw(&old.id, withdrawal.clone()).unwrap();
+    assert_eq!(
+        verify_service_response(serde_json::to_value(pending).unwrap(), &keeper.keeper)["status"],
+        "cancel_pending"
+    );
+
+    // An unresolved signed cleanup obligation must outlive ordinary terminal retention.
+    let store_path = pairings_directory.join("pairings.json");
+    let mut stored: Value = serde_json::from_slice(&fs::read(&store_path).unwrap()).unwrap();
+    stored["records"][&old.id]["expiresAt"] =
+        json!(time::OffsetDateTime::now_utc().unix_timestamp() as u64 - 30 * 24 * 60 * 60 - 1);
+    fs::write(&store_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    drop(pairings);
+    let pairings = open_pairings();
+    let next_offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(243),
+            "body":{
+                "scopes":[{"workspaceId":"next-board","title":"Next board",
+                    "genesisAnchor":"next-board-genesis","mode":"replicate"}],
+                "policy":{"futureBoards":false,"baselineWorkspaceIds":["next-board"]}
+            }
+        }),
+    );
+    pairings.create(next_offer).unwrap();
+    assert_eq!(
+        pairings.status_json(&old.id).unwrap()["withdrawal"]["status"],
+        "cancel_pending"
+    );
+    pairings.finalize_withdrawal(&old.id).unwrap();
+    drop(pairings);
+
+    // Terminal receipt remains replayable after restart, then expires by policy.
+    let pairings = open_pairings();
+    let replayed = pairings.withdraw(&old.id, withdrawal).unwrap();
+    assert_eq!(
+        verify_service_response(serde_json::to_value(replayed).unwrap(), &keeper.keeper)["status"],
+        "cancelled"
+    );
+    let receipt_retention_offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(244),
+            "body":{
+                "scopes":[{"workspaceId":"receipt-board","title":"Receipt board",
+                    "genesisAnchor":"receipt-board-genesis","mode":"replicate"}],
+                "policy":{"futureBoards":false,"baselineWorkspaceIds":["receipt-board"]}
+            }
+        }),
+    );
+    pairings.create(receipt_retention_offer).unwrap();
+    assert_eq!(
+        pairings.status_json(&old.id).unwrap()["withdrawal"]["status"],
+        "cancelled"
+    );
+    let mut stored: Value = serde_json::from_slice(&fs::read(&store_path).unwrap()).unwrap();
+    stored["records"][&old.id]["withdrawal"]["completedAt"] =
+        json!(time::OffsetDateTime::now_utc().unix_timestamp() as u64 - 30 * 24 * 60 * 60 - 1);
+    fs::write(&store_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    drop(pairings);
+    let pairings = open_pairings();
+    let last_offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind":"lighthouse-pairing-offer",
+            "operationId":operation_id(245),
+            "body":{
+                "scopes":[{"workspaceId":"last-board","title":"Last board",
+                    "genesisAnchor":"last-board-genesis","mode":"replicate"}],
+                "policy":{"futureBoards":false,"baselineWorkspaceIds":["last-board"]}
+            }
+        }),
+    );
+    pairings.create(last_offer).unwrap();
+    assert!(pairings.status_json(&old.id).is_err());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelling_unprovisioned_pairing_does_not_revoke_existing_integration() {

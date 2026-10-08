@@ -87,6 +87,11 @@ the owner grant was revoked. That mutant violates `CancelledHasNoGrant`. The
 model abstracts envelope signatures and grant epochs to booleans; Rust tests
 cover signed owner proof and strict epoch comparison.
 
+`PairingRetention.tla` models an expired or cancelled request across later offer
+pruning and service restart. Provisioning and cancellation cleanup obligations
+keep the pairing record durable; an expired receipt remains replayable through
+the bounded retention window. Pruning can remove only terminal records.
+
 | Requirement | Check |
 | --- | --- |
 | Editor invitation and signed Editor grant required | `EditorRoleProofs`; `VisitorActivation.cfg` mutant |
@@ -103,6 +108,7 @@ cover signed owner proof and strict epoch comparison.
 | Operator and identity sessions survive independent sign-in and logout | `SessionCookieIsolation.cfg`; `SessionCookieCollision.cfg` models the overwrite defect |
 | Local OwnerKeeper projection cleanup retries after a verified removal receipt and restart | `LocalProjectionCleanup.cfg`; `LocalProjectionCleanupDropsReceipt.cfg` models lost retry evidence |
 | Pairing withdrawal fences late provision/retry and waits for owner revocation beyond issued grants | `PairingWithdrawal.cfg`; `PairingLateActivation.cfg`, `PairingRetryAfterWithdrawal.cfg`, and `PairingUnverifiedCompletion.cfg` are expected counterexamples |
+| Expired pairing status stays signed and cleanup/terminal receipt survives bounded pruning and restart | `PairingRetention.cfg` |
 | Ambiguous JobSearch routing is blocked | `AmbiguousRouteBlocked`; `AmbiguousRouteMutation.cfg` mutant |
 
 Source mapping:

@@ -39,6 +39,7 @@ CASES = [
     ("LocalProjectionCleanup", "ProjectionCleanupEventuallyRetryable", None, "LocalProjectionCleanup"),
     ("LocalProjectionCleanupDropsReceipt", "ProjectionCleanupEventuallyRetryable", "TEMPORAL", "LocalProjectionCleanup"),
     ("PairingWithdrawal", "WithdrawalEventuallyCompletes", None, "PairingWithdrawal"),
+    ("PairingRetention", None, None, "PairingRetention"),
     ("PairingLateActivation", None, "NoLateActivation", "PairingWithdrawal"),
     ("PairingRetryAfterWithdrawal", None, "NoRetryAfterFence", "PairingWithdrawal"),
     ("PairingUnverifiedCompletion", None, "CancelledHasNoGrant", "PairingWithdrawal"),

@@ -48,6 +48,9 @@ const MAX_PENDING_LOGINS: usize = 128;
 const MAX_SCOPES: usize = 16;
 const MAX_BASELINE_WORKSPACES: usize = 4096;
 const MAX_REVOCATION_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+const TERMINAL_PAIRING_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
+const MAX_RETAINED_TERMINAL_PAIRINGS: usize = 128;
+const MAX_RETAINED_PAIRING_OBLIGATIONS: usize = 100;
 
 #[derive(Clone)]
 pub struct PairingService {
@@ -96,12 +99,70 @@ pub struct PairingRecord {
     pub withdrawal: Option<PairingWithdrawal>,
 }
 
+fn pairing_has_cleanup_obligation(record: &PairingRecord) -> bool {
+    record
+        .withdrawal
+        .as_ref()
+        .is_some_and(|withdrawal| withdrawal.status != "cancelled")
+        || record
+            .provisioning
+            .as_ref()
+            .is_some_and(|provisioning| provisioning.status != "detached")
+}
+
+fn pairing_terminal_retention_deadline(record: &PairingRecord) -> Option<u64> {
+    if pairing_has_cleanup_obligation(record) {
+        return None;
+    }
+    let terminal_at = record
+        .withdrawal
+        .as_ref()
+        .filter(|withdrawal| withdrawal.status == "cancelled")
+        .and_then(|withdrawal| withdrawal.completed_at)
+        .unwrap_or(record.expires_at);
+    Some(terminal_at.saturating_add(TERMINAL_PAIRING_RETENTION_SECONDS))
+}
+
+fn prune_pairing_records(state: &mut PairingState, now: u64) {
+    state.records.retain(|_, record| {
+        record.expires_at > now
+            || pairing_has_cleanup_obligation(record)
+            || pairing_terminal_retention_deadline(record).is_some_and(|deadline| deadline > now)
+    });
+
+    let mut terminal_records = state
+        .records
+        .iter()
+        .filter(|(_, record)| record.expires_at <= now && !pairing_has_cleanup_obligation(record))
+        .filter_map(|(id, record)| {
+            pairing_terminal_retention_deadline(record).map(|deadline| (id.clone(), deadline))
+        })
+        .collect::<Vec<_>>();
+    terminal_records.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let excess = terminal_records
+        .len()
+        .saturating_sub(MAX_RETAINED_TERMINAL_PAIRINGS);
+    for (id, _) in terminal_records.into_iter().take(excess) {
+        state.records.remove(&id);
+    }
+}
+
+fn retained_obligation_count(state: &PairingState, now: u64) -> usize {
+    state
+        .records
+        .values()
+        .filter(|record| record.expires_at > now || pairing_has_cleanup_obligation(record))
+        .count()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingWithdrawal {
     pub operation_id: String,
     pub request_hash: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_hash: Option<String>,
     #[serde(default)]
@@ -540,11 +601,9 @@ impl PairingService {
             .map_err(|_| PairingError::Invalid("Invalid signed offer"))?;
         let transcript_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
-        // Keep operation replay records through expiry plus the bounded clock skew.
-        state
-            .records
-            .retain(|_, record| record.expires_at.saturating_add(30) > now);
-        if let Some(existing) = state
+        let mut next = state.clone();
+        prune_pairing_records(&mut next, now);
+        if let Some(existing) = next
             .records
             .values()
             .find(|record| record.last_operation_id == operation_id)
@@ -555,13 +614,7 @@ impl PairingService {
                 Err(PairingError::Conflict)
             };
         }
-        if state
-            .records
-            .values()
-            .filter(|record| record.expires_at > now)
-            .count()
-            >= 100
-        {
+        if retained_obligation_count(&next, now) >= MAX_RETAINED_PAIRING_OBLIGATIONS {
             return Err(PairingError::Unavailable);
         }
         let id = random_token(16);
@@ -605,7 +658,6 @@ impl PairingService {
             provisioning: None,
             withdrawal: None,
         };
-        let mut next = state.clone();
         next.records.insert(record.id.clone(), record.clone());
         self.persist(&next)?;
         *state = next;
@@ -754,6 +806,7 @@ impl PairingService {
                 operation_id: operation_id.clone(),
                 request_hash: request_hash.clone(),
                 status: "cancel_pending".into(),
+                completed_at: None,
                 completion_hash: None,
                 verified_revocations: Vec::new(),
                 verified_grants: Vec::new(),
@@ -1158,6 +1211,7 @@ impl PairingService {
             }
         }
         withdrawal.status = "cancelled".into();
+        withdrawal.completed_at = Some(now_seconds());
         withdrawal.completion_hash = Some(completion.request_hash);
         withdrawal.verified_revocations = revocations;
         if let Some(provisioning) = record.provisioning.as_mut() {
@@ -1204,7 +1258,9 @@ impl PairingService {
                 && grant_generations_known
                 && (provisioning.is_none() || detached);
             if safe {
-                record.withdrawal.as_mut().unwrap().status = "cancelled".into();
+                let withdrawal = record.withdrawal.as_mut().unwrap();
+                withdrawal.status = "cancelled".into();
+                withdrawal.completed_at = Some(now_seconds());
             }
         }
         self.persist(&next)?;
@@ -1836,9 +1892,6 @@ impl PairingService {
         let now = now_seconds();
         let state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         let record = state.records.get(id).ok_or(PairingError::NotFound)?;
-        if record.expires_at <= now && record.withdrawal.is_none() {
-            return Err(PairingError::Expired);
-        }
         validate_common(
             &request.signed.payload,
             "lighthouse-pairing-status",
@@ -2157,6 +2210,7 @@ impl PairingService {
                     .as_ref()
                     .map(|provisioning| provisioning.status.as_str())
             })
+            .or_else(|| (record.expires_at <= now).then_some("expired"))
             .unwrap_or(approval_status);
         let provisioning = record
             .provisioning
@@ -2730,5 +2784,87 @@ impl PairingError {
             Self::Conflict => axum::http::StatusCode::CONFLICT,
             Self::Unavailable => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         }
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    fn record(
+        id: String,
+        expires_at: u64,
+        provisioning: Option<&str>,
+        withdrawal: Option<&str>,
+    ) -> PairingRecord {
+        PairingRecord {
+            id: id.clone(),
+            expires_at,
+            created_at: 0,
+            transcript_hash: "transcript".into(),
+            comparison_code: "000000".into(),
+            operator_approved: None,
+            controller_approved: None,
+            controller_decision_operation: None,
+            controller_decision_hash: None,
+            controller: PublicIdentity {
+                person_id: "owner".into(),
+                public_key: "owner-key".into(),
+                display_name: "Owner".into(),
+            },
+            controller_device_id: "owner-device".into(),
+            controller_certificates: Vec::new(),
+            offer: json!({"body":{"scopes":[]}}),
+            challenge: SignedEnvelope {
+                payload: json!({"integrationId":"integration", "nonce":"nonce"}),
+                signer_key_id: "service-device".into(),
+                signature: "signature".into(),
+            },
+            last_operation_id: id.clone(),
+            provisioning: provisioning.map(|status| ProvisioningRecord {
+                operation_id: "provision".into(),
+                request_hash: "request".into(),
+                status: status.into(),
+                scopes: Vec::new(),
+            }),
+            withdrawal: withdrawal.map(|status| PairingWithdrawal {
+                operation_id: "withdraw".into(),
+                request_hash: "request".into(),
+                status: status.into(),
+                completed_at: (status == "cancelled").then_some(expires_at),
+                completion_hash: None,
+                verified_revocations: Vec::new(),
+                verified_grants: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn pruning_keeps_cleanup_obligations_and_bounds_expired_terminal_records() {
+        let mut state = PairingState::default();
+        for index in 0..MAX_RETAINED_TERMINAL_PAIRINGS + 2 {
+            let record = record(format!("terminal-{index:03}"), 1, None, None);
+            state.records.insert(record.id.clone(), record);
+        }
+        let pending = record("pending-cancel".into(), 1, None, Some("cancel_pending"));
+        state.records.insert(pending.id.clone(), pending);
+        let active = record("active-provisioning".into(), 1, Some("active"), None);
+        state.records.insert(active.id.clone(), active);
+
+        prune_pairing_records(&mut state, 100);
+
+        assert_eq!(
+            state
+                .records
+                .values()
+                .filter(|record| !pairing_has_cleanup_obligation(record))
+                .count(),
+            MAX_RETAINED_TERMINAL_PAIRINGS
+        );
+        assert!(state.records.contains_key("pending-cancel"));
+        assert!(state.records.contains_key("active-provisioning"));
+        assert!(!state.records.contains_key("terminal-000"));
+        assert!(!state.records.contains_key("terminal-001"));
+        assert_eq!(retained_obligation_count(&state, 100), 2);
     }
 }
