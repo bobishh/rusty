@@ -143,6 +143,7 @@ impl ProvisioningService {
             transcript_hash,
             future_boards,
             &baseline_workspace_ids,
+            expected_integration_revision,
             &config,
             &self.node,
             &service_directory,
