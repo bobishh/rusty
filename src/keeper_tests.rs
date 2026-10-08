@@ -4199,6 +4199,248 @@ fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
 }
 
 #[test]
+fn activation_preserves_scope_data_when_config_rename_is_visible_but_parent_sync_fails() {
+    let keeper = TestKeeper::new();
+    let commit = ProvisioningCommit {
+        pairing_id: "uncertain-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
+        operation_id: "uncertain-operation".into(),
+        transcript_hash: "uncertain-transcript".into(),
+        invitation_id: "uncertain-invitation".into(),
+        workspace_ids: vec!["uncertain-board".into()],
+        snapshot_hash: "uncertain-snapshot".into(),
+        future_boards: false,
+        baseline_workspace_ids: vec!["uncertain-board".into()],
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    let staged = vec![keeper.staged_scope("uncertain-board")];
+    let result = keeper.host.activate_provisioned_scopes_with_io(
+        staged,
+        commit.clone(),
+        |path, bytes| {
+            let temp = path.with_extension(format!("test-tmp-{}", rand::random::<u64>()));
+            fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+            fs::File::open(&temp)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| error.to_string())?;
+            fs::rename(temp, path).map_err(|error| error.to_string())?;
+            Err("injected parent-directory sync failure after rename".into())
+        },
+        |_| Err("injected persistent parent-directory sync failure".into()),
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.contains("outcome is unknown"),
+        "unexpected error: {error}"
+    );
+
+    let persisted: Config =
+        serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    assert!(persisted.provisioning_commits.contains(&commit));
+    assert_eq!(
+        keeper.host.scopes().unwrap().len(),
+        1,
+        "unconfirmed activation stays unpublished in memory"
+    );
+    let activated = persisted
+        .additional_scopes
+        .iter()
+        .find(|scope| scope.workspace_id == "uncertain-board")
+        .unwrap();
+    assert!(activated.state_path.is_file());
+    let marker = activated
+        .state_path
+        .parent()
+        .unwrap()
+        .join(".lighthouse-provisioning.json");
+    let activated_directory = activated.state_path.parent().unwrap().to_path_buf();
+    assert!(marker.is_file(), "marker remains until durable retry");
+    assert!(
+        serde_json::from_slice::<super::ScopeActivationMarker>(&fs::read(marker).unwrap()).unwrap()
+            == super::ScopeActivationMarker::new(&commit, "uncertain-board")
+    );
+
+    let reopened = super::KeeperHost::open(persisted, keeper.config_path.clone()).unwrap();
+    assert_eq!(reopened.scopes().unwrap().len(), 2);
+    reopened
+        .activate_provisioned_scopes(vec![], commit)
+        .unwrap();
+    assert!(
+        !activated_directory
+            .join(".lighthouse-provisioning.json")
+            .exists()
+    );
+    assert_eq!(reopened.scopes().unwrap().len(), 2);
+}
+
+#[test]
+fn activation_rolls_back_scope_dirs_when_config_write_never_replaces_file() {
+    let keeper = TestKeeper::new();
+    let commit = ProvisioningCommit {
+        pairing_id: "pre-rename-failure".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
+        operation_id: "pre-rename-operation".into(),
+        transcript_hash: "pre-rename-transcript".into(),
+        invitation_id: "pre-rename-invitation".into(),
+        workspace_ids: vec!["pre-rename-board".into()],
+        snapshot_hash: "pre-rename-snapshot".into(),
+        future_boards: false,
+        baseline_workspace_ids: vec!["pre-rename-board".into()],
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    let staged = vec![keeper.staged_scope("pre-rename-board")];
+    let original = fs::read(&keeper.config_path).unwrap();
+    let result = keeper.host.activate_provisioned_scopes_with_io(
+        staged,
+        commit,
+        |_, _| Err("injected pre-rename failure".into()),
+        |_| panic!("parent sync must not run before config replacement"),
+    );
+    assert!(result.unwrap_err().contains("pre-rename failure"));
+    assert_eq!(fs::read(&keeper.config_path).unwrap(), original);
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_dir(keeper.directory.join("scopes"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn activation_retry_in_same_process_reuses_preserved_scope_dirs() {
+    let keeper = TestKeeper::new();
+    let commit = ProvisioningCommit {
+        pairing_id: "same-process-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
+        operation_id: "same-process-operation".into(),
+        transcript_hash: "same-process-transcript".into(),
+        invitation_id: "same-process-invitation".into(),
+        workspace_ids: vec!["same-process-board".into()],
+        snapshot_hash: "same-process-snapshot".into(),
+        future_boards: false,
+        baseline_workspace_ids: vec!["same-process-board".into()],
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    let staged = keeper.staged_scope("same-process-board");
+    let retry_staged = staged.clone();
+    let error = keeper
+        .host
+        .activate_provisioned_scopes_with_io(
+            vec![staged],
+            commit.clone(),
+            |path, bytes| {
+                let temp = path.with_extension(format!("test-tmp-{}", rand::random::<u64>()));
+                fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+                fs::File::open(&temp)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|error| error.to_string())?;
+                fs::rename(temp, path).map_err(|error| error.to_string())?;
+                Err("injected post-rename failure".into())
+            },
+            |_| Err("injected parent sync failure".into()),
+        )
+        .unwrap_err();
+    assert!(error.contains("outcome is unknown"));
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+
+    let persisted: Config =
+        serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    let final_scope = persisted
+        .additional_scopes
+        .iter()
+        .find(|scope| scope.workspace_id == "same-process-board")
+        .unwrap();
+    let retry_directory = keeper.directory.join(".provisioning-same-process-retry");
+    fs::create_dir_all(&retry_directory).unwrap();
+    let retry_state_path = retry_directory.join("state.json");
+    fs::copy(&final_scope.state_path, &retry_state_path).unwrap();
+    let mut retry_staged = retry_staged;
+    retry_staged.state_path = retry_state_path;
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![retry_staged], commit)
+        .unwrap();
+    assert_eq!(keeper.host.scopes().unwrap().len(), 2);
+    let activated = keeper
+        .host
+        .configuration()
+        .unwrap()
+        .additional_scopes
+        .into_iter()
+        .find(|scope| scope.workspace_id == "same-process-board")
+        .unwrap();
+    assert!(activated.state_path.is_file());
+    assert!(
+        !activated
+            .state_path
+            .parent()
+            .unwrap()
+            .join(".lighthouse-provisioning.json")
+            .exists()
+    );
+}
+
+#[test]
+fn unexpected_config_after_rename_stays_unpublished_and_preserves_scope_data() {
+    let keeper = TestKeeper::new();
+    let commit = ProvisioningCommit {
+        pairing_id: "unexpected-config-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
+        operation_id: "unexpected-config-operation".into(),
+        transcript_hash: "unexpected-config-transcript".into(),
+        invitation_id: "unexpected-config-invitation".into(),
+        workspace_ids: vec!["unexpected-config-board".into()],
+        snapshot_hash: "unexpected-config-snapshot".into(),
+        future_boards: false,
+        baseline_workspace_ids: vec!["unexpected-config-board".into()],
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    let error = keeper
+        .host
+        .activate_provisioned_scopes_with_io(
+            vec![keeper.staged_scope("unexpected-config-board")],
+            commit.clone(),
+            |path, bytes| {
+                let mut unexpected: Value = serde_json::from_slice(bytes).unwrap();
+                unexpected["externalChange"] = json!(true);
+                let temp = path.with_extension(format!("test-tmp-{}", rand::random::<u64>()));
+                fs::write(&temp, serde_json::to_vec(&unexpected).unwrap())
+                    .map_err(|error| error.to_string())?;
+                fs::rename(temp, path).map_err(|error| error.to_string())?;
+                Err("injected unexpected post-rename state".into())
+            },
+            |_| panic!("unexpected config must not pass durability check"),
+        )
+        .unwrap_err();
+    assert!(error.contains("outcome is unknown"));
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+    let persisted: Value = serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    assert_eq!(persisted["externalChange"], json!(true));
+    assert!(
+        persisted["additionalScopes"][0]["statePath"]
+            .as_str()
+            .is_some_and(|path| { std::path::Path::new(path).is_file() })
+    );
+    let retry = keeper
+        .host
+        .activate_provisioned_scopes(vec![keeper.staged_scope("unexpected-config-board")], commit);
+    assert!(
+        retry
+            .unwrap_err()
+            .contains("changed outside this activation")
+    );
+    let after_retry: Value =
+        serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    assert_eq!(after_retry["externalChange"], json!(true));
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+}
+
+#[test]
 fn failed_scope_validation_never_activates_a_subset_of_provisioned_scopes() {
     let keeper = TestKeeper::new();
     let first = keeper.staged_scope("selected-board-a");

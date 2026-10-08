@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -426,13 +426,7 @@ impl KeeperHost {
     pub(crate) fn open(mut config: Config, config_path: PathBuf) -> Result<Self, String> {
         // Prior releases had one controller identity for all future-board commits.
         // Import that identity before any new per-scope owner metadata is written.
-        if let Some(legacy_owner) = config.controller_person_id.clone() {
-            for commit in &mut config.provisioning_commits {
-                if commit.future_boards && commit.controller_person_id.is_none() {
-                    commit.controller_person_id = Some(legacy_owner.clone());
-                }
-            }
-        }
+        normalize_legacy_provisioning_owners(&mut config);
         let mut scopes = BTreeMap::new();
         for scope in std::iter::once(&config).chain(config.additional_scopes.iter()) {
             if scope.primary_detached || scope_has_pending_removal(&config, &scope.workspace_id) {
@@ -1395,13 +1389,44 @@ impl KeeperHost {
     /// Caller sends the workspace-join ACK only after this returns success.
     pub(crate) fn activate_provisioned_scopes(
         &self,
+        staged: Vec<Config>,
+        commit: ProvisioningCommit,
+    ) -> Result<(), String> {
+        self.activate_provisioned_scopes_with_io(
+            staged,
+            commit,
+            |path, bytes| FileScopeStore::new(path).write_validated(bytes, None, |_, _| Ok(())),
+            sync_directory,
+        )
+    }
+
+    fn activate_provisioned_scopes_with_io(
+        &self,
         mut staged: Vec<Config>,
         mut commit: ProvisioningCommit,
+        write_config: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+        sync_parent: impl Fn(&Path) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut registry = self
             .registry
             .lock()
             .map_err(|_| "Keeper registry lock poisoned")?;
+        let original_bytes = fs::read(&registry.config_path)
+            .map_err(|error| format!("Read prior keeper registry: {error}"))?;
+        let original_value = serde_json::from_slice::<Value>(&original_bytes).ok();
+        let mut original_config = serde_json::from_slice::<Config>(&original_bytes).ok();
+        let parsed_original_value = original_config
+            .as_ref()
+            .and_then(|config| serde_json::to_value(config).ok());
+        if let Some(config) = original_config.as_mut() {
+            normalize_legacy_provisioning_owners(config);
+        }
+        let normalized_original_value = original_config
+            .as_ref()
+            .and_then(|config| serde_json::to_value(config).ok());
+        let registry_value = serde_json::to_value(&registry.config).ok();
+        let registry_matches_disk =
+            original_value == parsed_original_value && normalized_original_value == registry_value;
         let mut next = registry.config.clone();
         if let Some(previous) = next
             .provisioning_commits
@@ -1421,6 +1446,20 @@ impl KeeperHost {
                 && (previous.controller_person_id.is_none()
                     || previous.controller_person_id == commit.controller_person_id);
             return if same_operation {
+                if !registry_matches_disk {
+                    return Err(
+                        "Keeper registry changed outside this activation; reload before retry"
+                            .into(),
+                    );
+                }
+                // A previous write may have reached rename but failed while syncing
+                // the parent directory. Retry that durability boundary before ACK.
+                let parent = registry
+                    .config_path
+                    .parent()
+                    .ok_or("Invalid keeper registry path")?;
+                sync_parent(parent)?;
+                cleanup_activation_markers(&registry.config, &commit);
                 Ok(())
             } else {
                 Err("Provisioning operation conflicts with durable activation".into())
@@ -1512,7 +1551,7 @@ impl KeeperHost {
                 next.additional_scopes.push(scope.clone());
             }
         }
-        next.provisioning_commits.push(commit);
+        next.provisioning_commits.push(commit.clone());
         if let Err(error) = record_activated_integration(&mut next, &staged) {
             rollback_provisioned_scope_dirs(&moved);
             return Err(error);
@@ -1524,21 +1563,62 @@ impl KeeperHost {
                 return Err(error.to_string());
             }
         };
-        if let Err(error) =
-            FileScopeStore::new(&registry.config_path).write_validated(&bytes, None, |_, _| Ok(()))
-        {
-            rollback_provisioned_scope_dirs(&moved);
-            return Err(error);
-        }
-        for scope in &staged {
-            let _ = fs::remove_file(
-                scope
-                    .state_path
-                    .parent()
-                    .unwrap_or(config_directory)
-                    .join(".lighthouse-provisioning.json"),
+        if !registry_matches_disk {
+            let persisted_config = serde_json::from_slice::<Config>(&original_bytes).ok();
+            let expected_value = serde_json::to_value(&next).ok();
+            if original_value == expected_value
+                && persisted_config
+                    .as_ref()
+                    .is_some_and(|config| config_contains_activation(config, &commit))
+            {
+                // Reconcile a prior exact activation left visible by an uncertain
+                // write. Never overwrite a different disk state from stale memory.
+                if let Err(error) = sync_parent(config_directory) {
+                    return Err(format!(
+                        "Provisioning activation outcome is unknown; scope data preserved: {error}"
+                    ));
+                }
+                cleanup_activation_markers(&next, &commit);
+                registry.config = next;
+                registry.scopes.extend(staged_hosts);
+                return Ok(());
+            }
+            return Err(
+                "Keeper registry changed outside this activation; scope data preserved".into(),
             );
         }
+        if let Err(error) = write_config(&registry.config_path, &bytes) {
+            let persisted_bytes = fs::read(&registry.config_path).ok();
+            let persisted_value = persisted_bytes
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+            let expected_value = serde_json::to_value(&next).ok();
+            let persisted_config = persisted_bytes
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<Config>(bytes).ok());
+            if persisted_value == expected_value
+                && persisted_config
+                    .as_ref()
+                    .is_some_and(|config| config_contains_activation(config, &commit))
+            {
+                // Rename may have succeeded while directory fsync failed. Retry
+                // the durability barrier. Never roll back scopes referenced by
+                // a config that already contains this exact activation.
+                if sync_parent(config_directory).is_err() {
+                    return Err(format!(
+                        "Provisioning activation outcome is unknown; scope data preserved: {error}"
+                    ));
+                }
+            } else if persisted_bytes.as_deref() == Some(original_bytes.as_slice()) {
+                rollback_provisioned_scope_dirs(&moved);
+                return Err(error);
+            } else {
+                return Err(format!(
+                    "Provisioning activation outcome is unknown; scope data preserved: {error}"
+                ));
+            }
+        }
+        cleanup_activation_markers(&next, &commit);
         registry.config = next;
         registry.scopes.extend(staged_hosts);
         Ok(())
@@ -1776,6 +1856,16 @@ fn scope_has_superseding_tombstone(config: &Config, scope: &Config) -> bool {
                 && active.state == "active"
                 && active.grant_epoch > tombstone_epoch
         })
+}
+
+fn normalize_legacy_provisioning_owners(config: &mut Config) {
+    if let Some(legacy_owner) = config.controller_person_id.clone() {
+        for commit in &mut config.provisioning_commits {
+            if commit.future_boards && commit.controller_person_id.is_none() {
+                commit.controller_person_id = Some(legacy_owner.clone());
+            }
+        }
+    }
 }
 
 fn random_operation_id() -> String {
@@ -2340,6 +2430,63 @@ impl ScopeActivationMarker {
             workspace_id: workspace_id.to_owned(),
         }
     }
+}
+
+fn config_contains_activation(config: &Config, commit: &ProvisioningCommit) -> bool {
+    if !config
+        .provisioning_commits
+        .iter()
+        .any(|saved| saved == commit)
+    {
+        return false;
+    }
+    commit.workspace_ids.iter().all(|workspace_id| {
+        std::iter::once(config)
+            .chain(config.additional_scopes.iter())
+            .find(|scope| scope.workspace_id == *workspace_id)
+            .is_some_and(|scope| {
+                scope.state_path.is_file()
+                    && scope
+                        .state_path
+                        .parent()
+                        .map(|directory| directory.join(".lighthouse-provisioning.json"))
+                        .and_then(|path| fs::read(path).ok())
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<ScopeActivationMarker>(&bytes).ok()
+                        })
+                        .is_some_and(|marker| {
+                            marker == ScopeActivationMarker::new(commit, workspace_id)
+                        })
+            })
+    })
+}
+
+fn cleanup_activation_markers(config: &Config, commit: &ProvisioningCommit) {
+    for workspace_id in &commit.workspace_ids {
+        let Some(scope) = std::iter::once(config)
+            .chain(config.additional_scopes.iter())
+            .find(|scope| scope.workspace_id == *workspace_id)
+        else {
+            continue;
+        };
+        let Some(directory) = scope.state_path.parent() else {
+            continue;
+        };
+        let marker_path = directory.join(".lighthouse-provisioning.json");
+        let marker_matches = fs::read(&marker_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ScopeActivationMarker>(&bytes).ok())
+            .is_some_and(|marker| marker == ScopeActivationMarker::new(commit, workspace_id));
+        if marker_matches {
+            let _ = fs::remove_file(marker_path);
+        }
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Sync scope directory: {error}"))
 }
 
 fn write_scope_marker(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
