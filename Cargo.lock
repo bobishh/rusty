@@ -3295,7 +3295,7 @@ dependencies = [
 [[package]]
 name = "meta-mesh-core"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/meta-mesh.git?rev=de5095dddbc618368f2976571c476a91a2b76b97#de5095dddbc618368f2976571c476a91a2b76b97"
+source = "git+https://github.com/bobishh/meta-mesh.git?rev=beb9840c15ca79cbc45f8e3c221b2dcbdf941d3e#beb9840c15ca79cbc45f8e3c221b2dcbdf941d3e"
 dependencies = [
  "aes-gcm",
  "automerge",
@@ -3315,7 +3315,7 @@ dependencies = [
 [[package]]
 name = "meta-mesh-native"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/meta-mesh.git?rev=de5095dddbc618368f2976571c476a91a2b76b97#de5095dddbc618368f2976571c476a91a2b76b97"
+source = "git+https://github.com/bobishh/meta-mesh.git?rev=beb9840c15ca79cbc45f8e3c221b2dcbdf941d3e#beb9840c15ca79cbc45f8e3c221b2dcbdf941d3e"
 dependencies = [
  "blake3",
  "bytes",
@@ -5891,7 +5891,7 @@ dependencies = [
 [[package]]
 name = "tincanban-authority"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/tincanban.git?rev=18fc91e82b4f8d23c8ffcc33ebc6c2be2892b121#18fc91e82b4f8d23c8ffcc33ebc6c2be2892b121"
+source = "git+https://github.com/bobishh/tincanban.git?rev=c360bfd5bdb85ca5b2e428f5970b2d8dff51d286#c360bfd5bdb85ca5b2e428f5970b2d8dff51d286"
 dependencies = [
  "automerge",
  "meta-mesh-core",

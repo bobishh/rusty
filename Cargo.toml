@@ -22,9 +22,9 @@ loco-rs = { version = "=1.2.0", default-features = false }
 base64 = "0.22"
 hmac = "0.12"
 jev-sdk = "=0.1.0"
-match-authority = { package = "tincanban-authority", git = "https://github.com/bobishh/tincanban.git", rev = "18fc91e82b4f8d23c8ffcc33ebc6c2be2892b121" }
-meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "de5095dddbc618368f2976571c476a91a2b76b97" }
-meta-mesh-native = { git = "https://github.com/bobishh/meta-mesh.git", rev = "de5095dddbc618368f2976571c476a91a2b76b97" }
+match-authority = { package = "tincanban-authority", git = "https://github.com/bobishh/tincanban.git", rev = "c360bfd5bdb85ca5b2e428f5970b2d8dff51d286" }
+meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "beb9840c15ca79cbc45f8e3c221b2dcbdf941d3e" }
+meta-mesh-native = { git = "https://github.com/bobishh/meta-mesh.git", rev = "beb9840c15ca79cbc45f8e3c221b2dcbdf941d3e" }
 automerge = "0.12"
 iroh = "1.2.0"
 rand = "0.10"
