@@ -1795,23 +1795,54 @@ impl PairingService {
     pub fn complete_provision(
         &self,
         id: &str,
+        operation_id: &str,
         mut scopes: Vec<ProvisionedScope>,
         active: bool,
     ) -> Result<(), PairingError> {
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
-        let mut next = state.clone();
-        let provisioning = next
-            .records
-            .get_mut(id)
-            .ok_or(PairingError::NotFound)?
+        let current = state.records.get(id).ok_or(PairingError::NotFound)?;
+        let current_provisioning = current
             .provisioning
-            .as_mut()
+            .as_ref()
             .ok_or(PairingError::Conflict)?;
+        let same_operation = current_provisioning.operation_id == operation_id;
+        let terminal = matches!(
+            current_provisioning.status.as_str(),
+            "pending_cleanup" | "detached"
+        ) || (current_provisioning.status == "active" && !active)
+            || current
+                .withdrawal
+                .as_ref()
+                .is_some_and(|withdrawal| withdrawal.status == "cancelled");
+        // A completion can arrive after a concurrent status poll has reconciled
+        // durable host state. Ignore stale workers instead of replacing that
+        // authoritative terminal state with their older in-memory result.
+        if !same_operation || terminal {
+            drop(state);
+            if same_operation {
+                self.provisioning_runs
+                    .lock()
+                    .map_err(|_| PairingError::Unavailable)?
+                    .remove(id);
+            }
+            return Ok(());
+        }
+        let mut next = state.clone();
+        let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        let provisioning = record.provisioning.as_mut().ok_or(PairingError::Conflict)?;
         if scopes.len() != provisioning.scopes.len()
             || scopes
                 .iter()
                 .zip(&provisioning.scopes)
                 .any(|(actual, expected)| actual.workspace_id != expected.workspace_id)
+            || scopes
+                .iter()
+                .zip(&provisioning.scopes)
+                .any(|(actual, expected)| {
+                    actual.grant_epoch.is_some()
+                        && expected.grant_epoch.is_some()
+                        && actual.grant_epoch != expected.grant_epoch
+                })
             || (active
                 && scopes
                     .iter()
@@ -1849,12 +1880,22 @@ impl PairingService {
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         let mut next = state.clone();
         let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        if record
+            .withdrawal
+            .as_ref()
+            .is_some_and(|withdrawal| withdrawal.status == "cancelled")
+        {
+            return Ok(());
+        }
         let approved_future_boards = record
             .offer
             .pointer("/body/policy/futureBoards")
             .and_then(Value::as_bool);
         let approved_baseline = pairing_baseline(record).ok();
         let provisioning = record.provisioning.as_mut().ok_or(PairingError::Conflict)?;
+        if matches!(provisioning.status.as_str(), "pending_cleanup" | "detached") {
+            return Ok(());
+        }
         if commit.pairing_id != id
             || commit.operation_id != provisioning.operation_id
             || commit.transcript_hash != record.transcript_hash

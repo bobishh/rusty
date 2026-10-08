@@ -769,7 +769,7 @@ pub(crate) async fn pairing_provision(
             .all(|scope| scope.status == "active" && scope.error.is_none());
         if !provision.policy_only {
             pairings
-                .complete_provision(&id, scope_results, active)
+                .complete_provision(&id, &provision.operation_id, scope_results, active)
                 .map_err(PairingResponseError)?;
         }
     } else if let Some(provisioner) = &state.provisioner {
@@ -1147,6 +1147,7 @@ pub(crate) async fn admin_list(
         "admissionSource":record.admission_source,
         "controllerOrigin":record.offer.get("controllerOrigin"),
         "provisioning":record.provisioning,
+        "withdrawalStatus":record.withdrawal.as_ref().map(|withdrawal| withdrawal.status.as_str()),
     })).collect::<Vec<_>>();
     let mut response = Json(json!({"pairings":rows})).into_response();
     response

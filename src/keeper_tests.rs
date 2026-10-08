@@ -2484,6 +2484,20 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
     )
     .await;
     let client = reqwest::Client::new();
+    let login = client
+        .post(format!("http://{address}/admin/api/session"))
+        .json(&json!({"secret":"test-operator-token-that-is-long-enough"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let mut admin_cookie = login.headers()[reqwest::header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
     let withdrawal_url = format!("http://{address}/v1/pairings/{pairing_id}/withdraw");
     let scopes_before_oversized = keeper.host.scopes().unwrap();
     let oversized_response = client
@@ -2547,6 +2561,24 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
     assert_eq!(pending["status"], "cancel_pending");
     assert_eq!(pending["withdrawal"]["status"], "cancel_pending");
     assert_eq!(pending["withdrawal"]["operationId"], operation_id(61));
+    let pending_admin_rows: Value = client
+        .get(format!("http://{address}/admin/api/pairings"))
+        .header(reqwest::header::COOKIE, &admin_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_admin_rows["pairings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == pairing_id)
+            .unwrap()["withdrawalStatus"],
+        "cancel_pending"
+    );
     let pending_request_hash = pending["withdrawal"]["requestHash"].clone();
     let pending_scopes = pending["provisioning"]["scopes"].clone();
     assert_eq!(pending_scopes[0]["grantEpoch"], 2);
@@ -2582,6 +2614,20 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
         pairings.clone(),
     )
     .await;
+    let login = client
+        .post(format!("http://{address}/admin/api/session"))
+        .json(&json!({"secret":"test-operator-token-that-is-long-enough"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    admin_cookie = login.headers()[reqwest::header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
     let withdrawal_url = format!("http://{address}/v1/pairings/{pairing_id}/withdraw");
     let (status, body) = post_controller_request(
         &client,
@@ -2792,6 +2838,24 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
     let cancelled = verify_service_response(body, &keeper.keeper);
     assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
     assert_eq!(cancelled["withdrawal"]["status"], "cancelled");
+    let cancelled_admin_rows: Value = client
+        .get(format!("http://{address}/admin/api/pairings"))
+        .header(reqwest::header::COOKIE, &admin_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled_admin_rows["pairings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == pairing_id)
+            .unwrap()["withdrawalStatus"],
+        "cancelled"
+    );
     assert_eq!(
         cancelled["withdrawal"]["verifiedRevocations"][0]["workspaceId"],
         "second-board"

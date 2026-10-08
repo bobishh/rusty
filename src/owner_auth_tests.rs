@@ -509,6 +509,7 @@ fn exact_provision_failure_survives_restart_in_signed_status() {
     service
         .complete_provision(
             id,
+            "operation",
             vec![ProvisionedScope {
                 workspace_id: "board".into(),
                 status: "pending".into(),
@@ -536,6 +537,161 @@ fn exact_provision_failure_survives_restart_in_signed_status() {
     assert_eq!(status.payload["status"], "provisioning");
     let key = public_key_from_seed(&[7; 32]).unwrap();
     verify_signed_envelope(&status, &key, CONTROL_DOMAIN).unwrap();
+}
+
+#[test]
+fn late_provision_completion_preserves_durable_active_and_cleanup_states() {
+    let service = pairings();
+    let now = now_seconds();
+    let (_, owner, device_id, certificates) = test_peer("Owner", [3; 32], [4; 32]);
+    let id = "monotonic-provision-completion";
+    let operation_id = "operation";
+    let challenge = sign_json_envelope(
+        &service.service_seed,
+        json!({"kind":"lighthouse-pairing-challenge", "version":1}),
+        &service.service_device_id,
+        CONTROL_DOMAIN,
+    )
+    .unwrap();
+    let record = PairingRecord {
+        id: id.into(),
+        expires_at: now + 600,
+        created_at: now,
+        transcript_hash: "approved-transcript".into(),
+        comparison_code: "123456".into(),
+        operator_approved: Some(true),
+        controller_approved: Some(true),
+        controller_decision_operation: None,
+        controller_decision_hash: None,
+        controller: owner.clone(),
+        controller_device_id: device_id,
+        controller_certificates: certificates,
+        offer: json!({"body":{"scopes":[{"workspaceId":"board"}],"policy":{"futureBoards":false,"baselineWorkspaceIds":["board"]}}}),
+        admission_source: None,
+        challenge,
+        last_operation_id: operation_id.into(),
+        provisioning: Some(ProvisioningRecord {
+            operation_id: operation_id.into(),
+            request_hash: "request".into(),
+            status: "provisioning".into(),
+            scopes: vec![ProvisionedScope {
+                workspace_id: "board".into(),
+                status: "pending".into(),
+                grant_epoch: None,
+                error: None,
+                error_detail: None,
+            }],
+        }),
+        withdrawal: None,
+    };
+    service
+        .state
+        .lock()
+        .unwrap()
+        .records
+        .insert(id.into(), record);
+    let commit = ProvisioningCommit {
+        pairing_id: id.into(),
+        integration_id: "integration".into(),
+        expected_integration_revision: Some(4),
+        operation_id: operation_id.into(),
+        transcript_hash: "approved-transcript".into(),
+        invitation_id: "invitation".into(),
+        workspace_ids: vec!["board".into()],
+        snapshot_hash: "snapshot".into(),
+        future_boards: false,
+        baseline_workspace_ids: vec!["board".into()],
+        controller_person_id: Some(owner.person_id),
+    };
+
+    // A concurrent status request may observe durable activation before the
+    // original provisioning request completes. It may add its grant epoch,
+    // but its later failure result must not undo active status.
+    service
+        .complete_from_durable_activation(id, &commit)
+        .unwrap();
+    service
+        .complete_provision(
+            id,
+            operation_id,
+            vec![ProvisionedScope {
+                workspace_id: "board".into(),
+                status: "active".into(),
+                grant_epoch: Some(5),
+                error: None,
+                error_detail: None,
+            }],
+            true,
+        )
+        .unwrap();
+    service
+        .complete_provision(
+            id,
+            operation_id,
+            vec![ProvisionedScope {
+                workspace_id: "board".into(),
+                status: "pending".into(),
+                grant_epoch: None,
+                error: Some("join_failed".into()),
+                error_detail: Some("late failure".into()),
+            }],
+            false,
+        )
+        .unwrap();
+    let active = service.signed_provision_status(id).unwrap().payload;
+    assert_eq!(active["status"], "active");
+    assert_eq!(active["provisioning"]["scopes"][0]["grantEpoch"], 5);
+
+    service
+        .reconcile_durable_provisioning(id, operation_id, "pending_cleanup")
+        .unwrap();
+    service.provisioning_runs.lock().unwrap().insert(id.into());
+    service
+        .complete_from_durable_activation(id, &commit)
+        .unwrap();
+    service
+        .complete_provision(
+            id,
+            operation_id,
+            vec![ProvisionedScope {
+                workspace_id: "board".into(),
+                status: "active".into(),
+                grant_epoch: Some(5),
+                error: None,
+                error_detail: None,
+            }],
+            true,
+        )
+        .unwrap();
+    assert!(!service.provisioning_runs.lock().unwrap().contains(id));
+    let cleanup = service.signed_provision_status(id).unwrap().payload;
+    assert_eq!(cleanup["status"], "pending_cleanup");
+    assert_eq!(cleanup["provisioning"]["scopes"][0]["status"], "pending");
+
+    service
+        .reconcile_durable_provisioning(id, operation_id, "detached")
+        .unwrap();
+    service
+        .complete_from_durable_activation(id, &commit)
+        .unwrap();
+    service
+        .complete_provision(
+            id,
+            operation_id,
+            vec![ProvisionedScope {
+                workspace_id: "board".into(),
+                status: "active".into(),
+                grant_epoch: Some(5),
+                error: None,
+                error_detail: None,
+            }],
+            true,
+        )
+        .unwrap();
+    let detached = service.signed_provision_status(id).unwrap().payload;
+    assert_eq!(detached["status"], "detached");
+    assert_eq!(detached["provisioning"]["scopes"][0]["status"], "removed");
+    assert_eq!(detached["provisioning"]["scopes"][0]["grantEpoch"], 5);
 }
 
 #[test]
