@@ -1745,6 +1745,9 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
     assert_eq!(pending["status"], "cancel_pending");
     assert_eq!(pending["withdrawal"]["status"], "cancel_pending");
     assert_eq!(pending["withdrawal"]["operationId"], operation_id(61));
+    let pending_request_hash = pending["withdrawal"]["requestHash"].clone();
+    let pending_scopes = pending["provisioning"]["scopes"].clone();
+    assert_eq!(pending_scopes[0]["grantEpoch"], 2);
     let mut late_commit_ran = false;
     assert!(
         pairings
@@ -1755,6 +1758,69 @@ async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed(
             .is_err()
     );
     assert!(!late_commit_ran);
+
+    // Pending cancellation fence, captured legacy grant epoch, and exact
+    // operation hash must survive a service restart before cleanup completes.
+    server.abort();
+    let _ = server.await;
+    drop(pairings);
+    let pairings = PairingService::open(
+        keeper.directory.join("pairings"),
+        &keeper.keeper.bundle("primary-board"),
+        service_origin.into(),
+        keeper.keeper.device_seed,
+        "test-operator-token-that-is-long-enough".into(),
+    )
+    .unwrap();
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings.clone(),
+    )
+    .await;
+    let withdrawal_url = format!("http://{address}/v1/pairings/{pairing_id}/withdraw");
+    let (status, body) = post_controller_request(
+        &client,
+        &format!("http://{address}/v1/pairings/{pairing_id}/status"),
+        &pairing_status_request(
+            &keeper.owner,
+            &keeper.keeper,
+            service_origin,
+            &pairing_id,
+            &transcript_hash,
+            &operation_id(66),
+        ),
+    )
+    .await;
+    assert!(status.is_success());
+    let after_pending_restart = verify_service_response(body, &keeper.keeper);
+    assert_eq!(after_pending_restart["status"], "cancel_pending");
+    assert_eq!(
+        after_pending_restart["withdrawal"]["status"],
+        "cancel_pending"
+    );
+    assert_eq!(
+        after_pending_restart["withdrawal"]["operationId"],
+        operation_id(61)
+    );
+    assert_eq!(
+        after_pending_restart["withdrawal"]["requestHash"],
+        pending_request_hash
+    );
+    assert_eq!(
+        after_pending_restart["provisioning"]["scopes"],
+        pending_scopes
+    );
+    let (status, body) = post_controller_request(&client, &withdrawal_url, &withdrawal).await;
+    assert!(status.is_success());
+    let retried_pending = verify_service_response(body, &keeper.keeper);
+    assert_eq!(retried_pending["status"], "cancel_pending");
+    assert_eq!(
+        retried_pending["withdrawal"]["requestHash"],
+        pending_request_hash
+    );
 
     let provision_url = format!("http://{address}/v1/pairings/{pairing_id}/provision");
     let (status, _) = post_controller_request(&client, &provision_url, &old_provision).await;
