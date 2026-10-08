@@ -38,6 +38,10 @@ CASES = [
     ("SessionCookieCollision", None, "OperatorCookieSlotIsOperatorOnly", "SessionCookieIsolation"),
     ("LocalProjectionCleanup", "ProjectionCleanupEventuallyRetryable", None, "LocalProjectionCleanup"),
     ("LocalProjectionCleanupDropsReceipt", "ProjectionCleanupEventuallyRetryable", "TEMPORAL", "LocalProjectionCleanup"),
+    ("PairingWithdrawal", "WithdrawalEventuallyCompletes", None, "PairingWithdrawal"),
+    ("PairingLateActivation", None, "NoLateActivation", "PairingWithdrawal"),
+    ("PairingRetryAfterWithdrawal", None, "NoRetryAfterFence", "PairingWithdrawal"),
+    ("PairingUnverifiedCompletion", None, "CancelledHasNoGrant", "PairingWithdrawal"),
 ]
 
 

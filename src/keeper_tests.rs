@@ -203,6 +203,7 @@ fn signed_state_with_preset(
     .unwrap();
     MatchLighthouseState {
         document: bytes,
+        admitted_document: None,
         authorization: json!({
             "version": 1,
             "records": [{
@@ -225,6 +226,48 @@ fn signed_state_with_preset(
         chat: json!({"version":1,"messages":[],"profiles":[],"typing":[]}),
         mesh: None,
     }
+}
+
+fn signed_revocation_bundle(
+    owner: &Identity,
+    workspace_id: &str,
+    target_person_id: &str,
+    epoch: u64,
+) -> (Vec<u8>, Value) {
+    let state = signed_state_with_preset(owner, workspace_id, None);
+    let mut document = AutoCommit::load(&state.document).unwrap();
+    let workspace_heads = document
+        .get_heads()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let revoked_at = time::OffsetDateTime::now_utc()
+        .format(
+            &time::format_description::parse_borrowed::<2>(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let revocation = sign_json_envelope(
+        &owner.device_seed,
+        json!({
+            "kind": "workspace-revocation",
+            "version": 1,
+            "workspaceId": workspace_id,
+            "ownerPersonId": owner.person_id,
+            "personId": target_person_id,
+            "epoch": epoch,
+            "workspaceHeads": workspace_heads,
+            "revokedAt": revoked_at,
+        }),
+        &owner.device_id,
+        DEFAULT_SIGNATURE_DOMAIN,
+    )
+    .unwrap();
+    let mut authorization = state.authorization;
+    authorization["authority"]["revocations"] = json!([revocation]);
+    (state.document, authorization)
 }
 
 fn fixture(owner: &Identity, keeper: &Identity, workspace_id: &str) -> ScopeFixture {
@@ -559,6 +602,9 @@ fn approved_active_pairing(
     let provision_request = pairings
         .begin_provision(&record.id, provision.clone())
         .unwrap();
+    pairings
+        .record_issued_grant_epoch(&record.id, "second-board", grant_epoch)
+        .unwrap();
     let commit = ProvisioningCommit {
         pairing_id: record.id.clone(),
         integration_id: provision_request.integration_id.clone(),
@@ -635,6 +681,84 @@ fn pairing_status_request(
             "pairingId": pairing_id,
             "transcriptHash": transcript_hash,
             "operationId": operation_id,
+        }),
+    )
+}
+
+fn pairing_withdrawal_request(
+    controller: &Identity,
+    service: &Identity,
+    service_origin: &str,
+    pairing_id: &str,
+    transcript_hash: &str,
+    challenge_nonce: &str,
+    operation_id: &str,
+) -> ControllerRequest {
+    pairing_withdrawal_request_with_grants(
+        PairingRequestContext {
+            controller,
+            service,
+            service_origin,
+            pairing_id,
+            transcript_hash,
+            challenge_nonce,
+            operation_id,
+        },
+        json!([]),
+    )
+}
+
+struct PairingRequestContext<'a> {
+    controller: &'a Identity,
+    service: &'a Identity,
+    service_origin: &'a str,
+    pairing_id: &'a str,
+    transcript_hash: &'a str,
+    challenge_nonce: &'a str,
+    operation_id: &'a str,
+}
+
+fn pairing_withdrawal_request_with_grants(
+    context: PairingRequestContext<'_>,
+    grant_scopes: Value,
+) -> ControllerRequest {
+    controller_request(
+        context.controller,
+        context.service,
+        context.service_origin,
+        json!({
+            "kind": "lighthouse-pairing-withdrawal",
+            "pairingId": context.pairing_id,
+            "transcriptHash": context.transcript_hash,
+            "challengeNonce": context.challenge_nonce,
+            "operationId": context.operation_id,
+            "grantScopes": grant_scopes,
+        }),
+    )
+}
+
+fn pairing_withdrawal_complete_request(
+    context: PairingRequestContext<'_>,
+    workspace_id: &str,
+    document: &[u8],
+    authorization_bundle: &Value,
+) -> ControllerRequest {
+    controller_request(
+        context.controller,
+        context.service,
+        context.service_origin,
+        json!({
+            "kind": "lighthouse-pairing-withdrawal-complete",
+            "pairingId": context.pairing_id,
+            "transcriptHash": context.transcript_hash,
+            "challengeNonce": context.challenge_nonce,
+            "withdrawalOperationId": context.operation_id,
+            "operationId": context.operation_id,
+            "scopes": [{
+                "workspaceId": workspace_id,
+                "document": URL_SAFE_NO_PAD.encode(document),
+                "authorizationBundle": authorization_bundle,
+            }],
         }),
     )
 }
@@ -1514,6 +1638,553 @@ async fn signed_http_status_disconnect_retry_and_restart_preserve_scope_authorit
         keeper.host.configuration().unwrap().provisioning_commits[0].pairing_id,
         pairing_id
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signed_pairing_withdrawal_fences_provisioning_until_scopes_are_removed() {
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let (pairings, pairing_id, integration_id, _, transcript_hash, old_provision) =
+        approved_active_pairing(&keeper, service_origin, 2);
+    let legacy_grant_fixture =
+        fixture_with_preset_at_epoch(&keeper.owner, &keeper.keeper, "second-board", None, 2);
+    let grant_scopes = json!([{
+        "workspaceId": "second-board",
+        "document": legacy_grant_fixture.entry["bytes"],
+        "authorizationBundle": legacy_grant_fixture.entry["authorization"],
+        "grant": legacy_grant_fixture.grant,
+    }]);
+    // Simulate a persisted pairing written before grant epochs were captured.
+    drop(pairings);
+    let pairings_path = keeper.directory.join("pairings").join("pairings.json");
+    let mut legacy_state: Value =
+        serde_json::from_slice(&fs::read(&pairings_path).unwrap()).unwrap();
+    let scope = legacy_state["records"][&pairing_id]["provisioning"]["scopes"][0]
+        .as_object_mut()
+        .unwrap();
+    scope.remove("grantEpoch");
+    fs::write(&pairings_path, serde_json::to_vec(&legacy_state).unwrap()).unwrap();
+    let pairings = PairingService::open(
+        keeper.directory.join("pairings"),
+        &keeper.keeper.bundle("primary-board"),
+        service_origin.into(),
+        keeper.keeper.device_seed,
+        "test-operator-token-that-is-long-enough".into(),
+    )
+    .unwrap();
+    let nonce = pairings
+        .admin_list(
+            &pairings
+                .login("test-operator-token-that-is-long-enough")
+                .unwrap()
+                .0,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == pairing_id)
+        .unwrap()
+        .challenge
+        .payload["nonce"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let withdrawal = pairing_withdrawal_request_with_grants(
+        PairingRequestContext {
+            controller: &keeper.owner,
+            service: &keeper.keeper,
+            service_origin,
+            pairing_id: &pairing_id,
+            transcript_hash: &transcript_hash,
+            challenge_nonce: &nonce,
+            operation_id: &operation_id(61),
+        },
+        grant_scopes,
+    );
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let withdrawal_url = format!("http://{address}/v1/pairings/{pairing_id}/withdraw");
+    let attacker = Identity::new(81, 82, 83);
+    let wrong_owner = pairing_withdrawal_request(
+        &attacker,
+        &keeper.keeper,
+        service_origin,
+        &pairing_id,
+        &transcript_hash,
+        &nonce,
+        &operation_id(60),
+    );
+    let (status, _) = post_controller_request(&client, &withdrawal_url, &wrong_owner).await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    let wrong_transcript = pairing_withdrawal_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &pairing_id,
+        "wrong-transcript",
+        &nonce,
+        &operation_id(60),
+    );
+    let (status, _) = post_controller_request(&client, &withdrawal_url, &wrong_transcript).await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    let mut forged = withdrawal.clone();
+    forged.signed.signature = "forged-signature".into();
+    let (status, _) = post_controller_request(&client, &withdrawal_url, &forged).await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+
+    let (status, body) = post_controller_request(&client, &withdrawal_url, &withdrawal).await;
+    assert!(status.is_success());
+    let pending = verify_service_response(body, &keeper.keeper);
+    assert_eq!(pending["status"], "cancel_pending");
+    assert_eq!(pending["withdrawal"]["status"], "cancel_pending");
+    assert_eq!(pending["withdrawal"]["operationId"], operation_id(61));
+    let mut late_commit_ran = false;
+    assert!(
+        pairings
+            .commit_activation_if_not_withdrawn(&pairing_id, || {
+                late_commit_ran = true;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(!late_commit_ran);
+
+    let provision_url = format!("http://{address}/v1/pairings/{pairing_id}/provision");
+    let (status, _) = post_controller_request(&client, &provision_url, &old_provision).await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+
+    let changed_withdrawal = pairing_withdrawal_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &pairing_id,
+        &transcript_hash,
+        &nonce,
+        &operation_id(62),
+    );
+    let (status, _) = post_controller_request(&client, &withdrawal_url, &changed_withdrawal).await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+
+    let integration_status_url = format!("http://{address}/v1/integrations/status");
+    let (status, body) = post_controller_request(
+        &client,
+        &integration_status_url,
+        &status_request(
+            &keeper.owner,
+            &keeper.keeper,
+            service_origin,
+            &operation_id(63),
+        ),
+    )
+    .await;
+    assert!(status.is_success());
+    let integration_status = verify_service_response(body, &keeper.keeper);
+    let integration = integration_status["integrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["integrationId"] == integration_id)
+        .unwrap();
+    let revision = integration["revision"].as_u64().unwrap();
+    let epoch = integration["scopes"][0]["grantEpoch"].as_u64().unwrap();
+    let (revocation_document, revocation_authority) = signed_revocation_bundle(
+        &keeper.owner,
+        "second-board",
+        &keeper.keeper.person_id,
+        epoch + 1,
+    );
+    let complete_url = format!("{withdrawal_url}/complete");
+    let completion = pairing_withdrawal_complete_request(
+        PairingRequestContext {
+            controller: &keeper.owner,
+            service: &keeper.keeper,
+            service_origin,
+            pairing_id: &pairing_id,
+            transcript_hash: &transcript_hash,
+            challenge_nonce: &nonce,
+            operation_id: &operation_id(61),
+        },
+        "second-board",
+        &revocation_document,
+        &revocation_authority,
+    );
+    let foreign_owner = Identity::new(91, 92, 93);
+    let (foreign_document, foreign_authority) = signed_revocation_bundle(
+        &foreign_owner,
+        "second-board",
+        &keeper.keeper.person_id,
+        epoch + 1,
+    );
+    let foreign_proof = pairing_withdrawal_complete_request(
+        PairingRequestContext {
+            controller: &keeper.owner,
+            service: &keeper.keeper,
+            service_origin,
+            pairing_id: &pairing_id,
+            transcript_hash: &transcript_hash,
+            challenge_nonce: &nonce,
+            operation_id: &operation_id(61),
+        },
+        "second-board",
+        &foreign_document,
+        &foreign_authority,
+    );
+    let (status, _) = post_controller_request(&client, &complete_url, &foreign_proof).await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    let parsed_completion = pairings
+        .withdrawal_completion_request(&pairing_id, completion.clone())
+        .unwrap();
+    assert_eq!(
+        parsed_completion.issued_grant_epochs.get("second-board"),
+        Some(&Some(epoch))
+    );
+    let verified_proof = match_authority::verify_revocation_completion(
+        &revocation_document,
+        &revocation_authority,
+        &keeper.owner.person_id,
+        &keeper.keeper.person_id,
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+    );
+    assert!(verified_proof.is_ok(), "{verified_proof:?}");
+    let (status, body) = post_controller_request(&client, &complete_url, &completion).await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{body}");
+    let disconnect = disconnect_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        &integration_id,
+        &operation_id(64),
+        revision,
+        epoch,
+    );
+    let disconnect_url = format!("http://{address}/v1/integrations/{integration_id}/disconnect");
+    let (status, body) = post_controller_request(&client, &disconnect_url, &disconnect).await;
+    assert!(status.is_success());
+    assert_eq!(
+        verify_service_response(body, &keeper.keeper)["status"],
+        "removed"
+    );
+
+    let mut missing_epoch = pairings
+        .withdrawal_completion_request(&pairing_id, completion.clone())
+        .unwrap();
+    missing_epoch.issued_grant_epochs.clear();
+    assert!(
+        pairings
+            .record_withdrawal_completion(
+                &pairing_id,
+                missing_epoch,
+                vec![crate::pairing::VerifiedWithdrawalRevocation {
+                    workspace_id: "second-board".into(),
+                    revocation_epoch: epoch + 1,
+                    revocation_hash: "verified-test-proof".into(),
+                }],
+                std::collections::HashMap::new(),
+                true,
+            )
+            .is_err()
+    );
+
+    let (stale_document, stale_authority) = signed_revocation_bundle(
+        &keeper.owner,
+        "second-board",
+        &keeper.keeper.person_id,
+        epoch,
+    );
+    let stale_proof = pairing_withdrawal_complete_request(
+        PairingRequestContext {
+            controller: &keeper.owner,
+            service: &keeper.keeper,
+            service_origin,
+            pairing_id: &pairing_id,
+            transcript_hash: &transcript_hash,
+            challenge_nonce: &nonce,
+            operation_id: &operation_id(61),
+        },
+        "second-board",
+        &stale_document,
+        &stale_authority,
+    );
+    let (status, _) = post_controller_request(&client, &complete_url, &stale_proof).await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+
+    let (status, body) = post_controller_request(&client, &complete_url, &completion).await;
+    assert!(status.is_success());
+    let cancelled = verify_service_response(body, &keeper.keeper);
+    assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+    assert_eq!(cancelled["withdrawal"]["status"], "cancelled");
+    assert_eq!(
+        cancelled["withdrawal"]["verifiedRevocations"][0]["workspaceId"],
+        "second-board"
+    );
+    assert_eq!(
+        cancelled["withdrawal"]["verifiedRevocations"][0]["revocationEpoch"],
+        epoch + 1
+    );
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+    server.abort();
+    let _ = server.await;
+
+    let restarted_pairings = PairingService::open(
+        keeper.directory.join("pairings"),
+        &keeper.keeper.bundle("primary-board"),
+        service_origin.into(),
+        keeper.keeper.device_seed,
+        "test-operator-token-that-is-long-enough".into(),
+    )
+    .unwrap();
+    let (address, _server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        restarted_pairings,
+    )
+    .await;
+    let (status, body) = post_controller_request(
+        &client,
+        &format!("http://{address}/v1/pairings/{pairing_id}/status"),
+        &pairing_status_request(
+            &keeper.owner,
+            &keeper.keeper,
+            service_origin,
+            &pairing_id,
+            &transcript_hash,
+            &operation_id(65),
+        ),
+    )
+    .await;
+    assert!(status.is_success());
+    let after_restart = verify_service_response(body, &keeper.keeper);
+    assert_eq!(after_restart["status"], "cancelled");
+    assert_eq!(after_restart["withdrawal"]["operationId"], operation_id(61));
+    let (status, body) = post_controller_request(
+        &client,
+        &format!("http://{address}/v1/pairings/{pairing_id}/withdraw"),
+        &withdrawal,
+    )
+    .await;
+    assert!(status.is_success());
+    assert_eq!(
+        verify_service_response(body, &keeper.keeper)["withdrawal"]["status"],
+        "cancelled"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_unprovisioned_pairing_does_not_revoke_existing_integration() {
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let (pairings, active_pairing_id, _, _, _, _) =
+        approved_active_pairing(&keeper, service_origin, 2);
+
+    let offer = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind": "lighthouse-pairing-offer",
+            "operationId": operation_id(75),
+            "body": {
+                "policy": {"futureBoards": false},
+                "scopes": [{
+                    "workspaceId": "second-board",
+                    "title": "Second board",
+                    "genesisAnchor": "second-board-genesis",
+                    "mode": "replicate"
+                }]
+            }
+        }),
+    );
+    let record = pairings.create(offer).unwrap();
+    let (cookie, csrf) = pairings
+        .login("test-operator-token-that-is-long-enough")
+        .unwrap();
+    pairings
+        .admin_decision(&record.id, &cookie, &csrf, true)
+        .unwrap();
+    let approval = controller_request(
+        &keeper.owner,
+        &keeper.keeper,
+        service_origin,
+        json!({
+            "kind": "lighthouse-pairing-decision",
+            "operationId": operation_id(76),
+            "pairingId": record.id,
+            "transcriptHash": record.transcript_hash,
+            "challengeNonce": record.challenge.payload["nonce"],
+            "decision": "approve"
+        }),
+    );
+    pairings.controller_decision(&record.id, approval).unwrap();
+
+    let nonce = record.challenge.payload["nonce"].as_str().unwrap();
+    let grant =
+        fixture_with_preset_at_epoch(&keeper.owner, &keeper.keeper, "second-board", None, 2);
+    let withdrawal = pairing_withdrawal_request_with_grants(
+        PairingRequestContext {
+            controller: &keeper.owner,
+            service: &keeper.keeper,
+            service_origin,
+            pairing_id: &record.id,
+            transcript_hash: &record.transcript_hash,
+            challenge_nonce: nonce,
+            operation_id: &operation_id(77),
+        },
+        json!([{
+            "workspaceId": "second-board",
+            "document": grant.entry["bytes"],
+            "authorizationBundle": grant.entry["authorization"],
+            "grant": grant.grant,
+        }]),
+    );
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let (status, body) = post_controller_request(
+        &client,
+        &format!("http://{address}/v1/pairings/{}/withdraw", record.id),
+        &withdrawal,
+    )
+    .await;
+    assert!(status.is_success());
+    let cancelled = verify_service_response(body, &keeper.keeper);
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["withdrawal"]["status"], "cancelled");
+    assert_eq!(
+        keeper
+            .host
+            .provisioning_lifecycle_status(&active_pairing_id)
+            .unwrap(),
+        Some(crate::keeper::ProvisioningLifecycleStatus::Active)
+    );
+    assert_eq!(keeper.host.scopes().unwrap().len(), 2);
+    assert_eq!(
+        pairings.status_json(&active_pairing_id).unwrap()["status"],
+        "active"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_legacy_grant_proof_leaves_withdrawal_pending_and_operation_bound() {
+    let keeper = TestKeeper::new();
+    let service_origin = "https://rusty.example";
+    let (pairings, pairing_id, _, _, transcript_hash, _) =
+        approved_active_pairing(&keeper, service_origin, 2);
+    let nonce = pairings
+        .admin_list(
+            &pairings
+                .login("test-operator-token-that-is-long-enough")
+                .unwrap()
+                .0,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == pairing_id)
+        .unwrap()
+        .challenge
+        .payload["nonce"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fixture =
+        fixture_with_preset_at_epoch(&keeper.owner, &keeper.keeper, "second-board", None, 2);
+    let mut invalid_grant = fixture.grant;
+    invalid_grant["signature"] = Value::String("invalid-signature".into());
+    let proof_scopes = json!([{
+        "workspaceId": "second-board",
+        "document": fixture.entry["bytes"],
+        "authorizationBundle": fixture.entry["authorization"],
+        "grant": invalid_grant,
+    }]);
+    let withdrawal = pairing_withdrawal_request_with_grants(
+        PairingRequestContext {
+            controller: &keeper.owner,
+            service: &keeper.keeper,
+            service_origin,
+            pairing_id: &pairing_id,
+            transcript_hash: &transcript_hash,
+            challenge_nonce: &nonce,
+            operation_id: &operation_id(71),
+        },
+        proof_scopes,
+    );
+    let (address, server) = start_integration_http(
+        &keeper.directory,
+        keeper.host.clone(),
+        &keeper.keeper,
+        service_origin,
+        pairings,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let withdrawal_url = format!("http://{address}/v1/pairings/{pairing_id}/withdraw");
+
+    let (status, _) = post_controller_request(&client, &withdrawal_url, &withdrawal).await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+
+    let (status, body) = post_controller_request(
+        &client,
+        &format!("http://{address}/v1/pairings/{pairing_id}/status"),
+        &pairing_status_request(
+            &keeper.owner,
+            &keeper.keeper,
+            service_origin,
+            &pairing_id,
+            &transcript_hash,
+            &operation_id(72),
+        ),
+    )
+    .await;
+    assert!(status.is_success());
+    let pending = verify_service_response(body, &keeper.keeper);
+    assert_eq!(pending["status"], "cancel_pending");
+    assert_eq!(pending["withdrawal"]["status"], "cancel_pending");
+
+    let (status, _) = post_controller_request(&client, &withdrawal_url, &withdrawal).await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+
+    let valid_proof =
+        fixture_with_preset_at_epoch(&keeper.owner, &keeper.keeper, "second-board", None, 2);
+    let corrected = pairing_withdrawal_request_with_grants(
+        PairingRequestContext {
+            controller: &keeper.owner,
+            service: &keeper.keeper,
+            service_origin,
+            pairing_id: &pairing_id,
+            transcript_hash: &transcript_hash,
+            challenge_nonce: &nonce,
+            operation_id: &operation_id(71),
+        },
+        json!([{
+            "workspaceId": "second-board",
+            "document": valid_proof.entry["bytes"],
+            "authorizationBundle": valid_proof.entry["authorization"],
+            "grant": valid_proof.grant,
+        }]),
+    );
+    let (status, _) = post_controller_request(&client, &withdrawal_url, &corrected).await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    assert_eq!(keeper.host.scopes().unwrap().len(), 2);
+    server.abort();
+    let _ = server.await;
 }
 
 #[test]

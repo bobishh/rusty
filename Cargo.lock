@@ -1241,7 +1241,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.6",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -5891,7 +5891,7 @@ dependencies = [
 [[package]]
 name = "tincanban-authority"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/tincanban.git?rev=d7cf87e18d4d023c002f8944db93662162705720#d7cf87e18d4d023c002f8944db93662162705720"
+source = "git+https://github.com/bobishh/tincanban.git?rev=18fc91e82b4f8d23c8ffcc33ebc6c2be2892b121#18fc91e82b4f8d23c8ffcc33ebc6c2be2892b121"
 dependencies = [
  "automerge",
  "meta-mesh-core",

@@ -10,6 +10,8 @@ pub(crate) fn routes() -> Routes {
         .prefix("/v1/pairings")
         .add("/", post(create))
         .add("/{id}/decision", post(decision))
+        .add("/{id}/withdraw", post(withdraw))
+        .add("/{id}/withdraw/complete", post(withdraw_complete))
         .add("/{id}/status", post(status))
         .add("/{id}/provision", post(provision))
 }
@@ -40,6 +42,20 @@ async fn status(
     Json(request): Json<ControllerRequest>,
 ) -> impl IntoResponse {
     http::pairing_status(state, id, request).await
+}
+async fn withdraw(
+    SharedStore(state): SharedStore<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ControllerRequest>,
+) -> impl IntoResponse {
+    http::pairing_withdraw(state, id, request).await
+}
+async fn withdraw_complete(
+    SharedStore(state): SharedStore<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ControllerRequest>,
+) -> impl IntoResponse {
+    http::pairing_withdraw_complete(state, id, request).await
 }
 async fn provision(
     SharedStore(state): SharedStore<AppState>,

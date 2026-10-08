@@ -17,6 +17,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use jev_sdk::{Question, RetryPolicy, TypeSafeClient};
+use meta_mesh_core::canonicalize_json;
 use rand::Rng;
 use reqwest::{Url, header::LOCATION, redirect::Policy};
 use scraper::{Html, Selector};
@@ -28,7 +29,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use crate::cors_settings::CorsSettings;
 use crate::pairing::{
     ControllerRequest, LoginExchangeRequest, LoginRequest, PairingError, PairingService,
-    ProvisionedScope, SessionResponse,
+    ProvisionedScope, SessionResponse, VerifiedWithdrawalGrant, VerifiedWithdrawalRevocation,
 };
 use crate::provisioning::ProvisioningService;
 use crate::{keeper::KeeperHost, replication::RuntimeOverview};
@@ -408,6 +409,11 @@ pub(crate) async fn pairing_status(
     if let Some(provisioner) = &state.provisioner {
         reconcile_pairing_provisioning(pairings, provisioner, &id)?;
     }
+    if pairings.status_json(&id).map_err(PairingResponseError)?["withdrawal"].is_object() {
+        pairings
+            .finalize_withdrawal(&id)
+            .map_err(PairingResponseError)?;
+    }
     Ok(Json(
         serde_json::to_value(
             pairings
@@ -416,6 +422,202 @@ pub(crate) async fn pairing_status(
         )
         .map_err(|_| PairingResponseError(PairingError::Unavailable))?,
     ))
+}
+
+pub(crate) async fn pairing_withdraw(
+    state: AppState,
+    id: String,
+    request: ControllerRequest,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    // The first call verifies and durably fences provisioning before cleanup
+    // reconciliation can decide whether cancellation is complete.
+    pairings
+        .withdraw(&id, request.clone())
+        .map_err(PairingResponseError)?;
+    let grant_scopes = pairings
+        .withdrawal_grant_scopes(&id, &request)
+        .map_err(PairingResponseError)?;
+    let mut verified_grants = Vec::with_capacity(grant_scopes.len());
+    let now_ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    let operation_id =
+        request.signed.payload["operationId"]
+            .as_str()
+            .ok_or(PairingResponseError(PairingError::Invalid(
+                "Missing withdrawal operation ID",
+            )))?;
+    for scope in &grant_scopes {
+        let grant = match_authority::verify_keeper_grant(
+            &scope.document,
+            &scope.authorization_bundle,
+            &scope.grant,
+            &request.identity.person_id,
+            pairings.service_person_id(),
+            now_ms,
+        )
+        .map_err(|_| PairingResponseError(PairingError::Forbidden))?;
+        if grant.workspace_id != scope.workspace_id
+            || grant.owner_person_id != request.identity.person_id
+            || grant.member_person_id != pairings.service_person_id()
+            || grant.role != "editor"
+            || grant.grant_epoch == 0
+        {
+            return Err(PairingResponseError(PairingError::Forbidden));
+        }
+        let canonical = canonicalize_json(&grant.grant)
+            .map_err(|_| PairingResponseError(PairingError::Forbidden))?;
+        let grant_id = grant.grant["payload"]["grantId"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or(PairingResponseError(PairingError::Forbidden))?
+            .to_owned();
+        verified_grants.push(VerifiedWithdrawalGrant {
+            workspace_id: grant.workspace_id,
+            grant_id,
+            grant_epoch: grant.grant_epoch,
+            grant_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())),
+        });
+    }
+    if !verified_grants.is_empty() {
+        pairings
+            .record_withdrawal_grants(&id, operation_id, verified_grants)
+            .map_err(PairingResponseError)?;
+    }
+    // Reconcile durable cleanup before deciding whether cancellation is terminal.
+    if let Some(provisioner) = &state.provisioner {
+        reconcile_pairing_provisioning(pairings, provisioner, &id)?;
+    }
+    let status = pairings
+        .finalize_withdrawal(&id)
+        .map_err(PairingResponseError)?;
+    Ok(Json(serde_json::to_value(status).map_err(|_| {
+        PairingResponseError(PairingError::Unavailable)
+    })?))
+}
+
+pub(crate) async fn pairing_withdraw_complete(
+    state: AppState,
+    id: String,
+    request: ControllerRequest,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let completion = pairings
+        .withdrawal_completion_request(&id, request)
+        .map_err(PairingResponseError)?;
+    if completion.scopes.is_empty() {
+        let signed = pairings
+            .signed_provision_status(&id)
+            .map_err(PairingResponseError)?;
+        return Ok(Json(
+            serde_json::to_value(signed)
+                .map_err(|_| PairingResponseError(PairingError::Unavailable))?,
+        ));
+    }
+    let mut verified = Vec::with_capacity(completion.scopes.len());
+    let now_ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    for scope in &completion.scopes {
+        let result = match_authority::verify_revocation_completion(
+            &scope.document,
+            &scope.authorization_bundle,
+            &completion.controller_person_id,
+            &completion.service_person_id,
+            now_ms,
+        )
+        .map_err(|_| PairingResponseError(PairingError::Forbidden))?;
+        if result.workspace_id != scope.workspace_id
+            || result.owner_person_id != completion.controller_person_id
+            || result.revoked_person_id != completion.service_person_id
+            || result.revocation_epoch == 0
+        {
+            return Err(PairingResponseError(PairingError::Forbidden));
+        }
+        let canonical = canonicalize_json(&result.revocation)
+            .map_err(|_| PairingResponseError(PairingError::Forbidden))?;
+        let revocation_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
+        verified.push(VerifiedWithdrawalRevocation {
+            workspace_id: result.workspace_id,
+            revocation_epoch: result.revocation_epoch,
+            revocation_hash,
+        });
+    }
+    if let Some(provisioner) = &state.provisioner {
+        reconcile_pairing_provisioning(pairings, provisioner, &id)?;
+    }
+    let keeper = state
+        .keeper
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let integration_detached = match keeper
+        .provisioning_lifecycle_status(&id)
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?
+    {
+        None | Some(crate::keeper::ProvisioningLifecycleStatus::Detached) => true,
+        Some(
+            crate::keeper::ProvisioningLifecycleStatus::Active
+            | crate::keeper::ProvisioningLifecycleStatus::PendingCleanup,
+        ) => false,
+    };
+    if !integration_detached {
+        return Err(PairingResponseError(PairingError::Conflict));
+    }
+    let config = keeper
+        .configuration()
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
+    let mut minimum_grant_epochs = std::collections::HashMap::new();
+    for proof in &verified {
+        let mut minimum_epoch = completion
+            .issued_grant_epochs
+            .get(&proof.workspace_id)
+            .copied()
+            .flatten();
+        for integration in config
+            .integrations
+            .iter()
+            .filter(|record| record.integration_id == completion.integration_id)
+        {
+            if integration
+                .scopes
+                .iter()
+                .any(|scope| scope.workspace_id == proof.workspace_id && scope.state == "active")
+            {
+                return Err(PairingResponseError(PairingError::Conflict));
+            }
+            let tombstone_epoch = integration
+                .tombstones
+                .iter()
+                .filter(|tombstone| tombstone.workspace_id == proof.workspace_id)
+                .map(|tombstone| tombstone.grant_epoch)
+                .max();
+            minimum_epoch = minimum_epoch.into_iter().chain(tombstone_epoch).max();
+        }
+        let Some(minimum_epoch) = minimum_epoch else {
+            // Legacy provisioning records may lack a captured grant epoch.
+            // Require an exact Rusty tombstone or keep withdrawal pending.
+            return Err(PairingResponseError(PairingError::Conflict));
+        };
+        if proof.revocation_epoch <= minimum_epoch {
+            return Err(PairingResponseError(PairingError::Forbidden));
+        }
+        minimum_grant_epochs.insert(proof.workspace_id.clone(), minimum_epoch);
+    }
+    let signed = pairings
+        .record_withdrawal_completion(
+            &id,
+            completion,
+            verified,
+            minimum_grant_epochs,
+            integration_detached,
+        )
+        .map_err(PairingResponseError)?;
+    Ok(Json(serde_json::to_value(signed).map_err(|_| {
+        PairingResponseError(PairingError::Unavailable)
+    })?))
 }
 
 pub(crate) async fn pairing_provision(
@@ -442,6 +644,7 @@ pub(crate) async fn pairing_provision(
                     provision.scopes.clone(),
                     provision.future_boards,
                     provision.baseline_workspace_ids.clone(),
+                    pairings.clone(),
                 )
                 .await
             {
@@ -454,6 +657,7 @@ pub(crate) async fn pairing_provision(
                         .map(|workspace_id| ProvisionedScope {
                             workspace_id: workspace_id.clone(),
                             status: "pending".into(),
+                            grant_epoch: None,
                             error: Some("join_failed".into()),
                             error_detail: Some(error.chars().take(1024).collect()),
                         })
@@ -467,6 +671,7 @@ pub(crate) async fn pairing_provision(
                 .map(|workspace_id| ProvisionedScope {
                     workspace_id: workspace_id.clone(),
                     status: "pending".into(),
+                    grant_epoch: None,
                     error: Some("runtime_unavailable".into()),
                     error_detail: Some("Lighthouse replication runtime is unavailable".into()),
                 })

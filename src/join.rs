@@ -210,6 +210,7 @@ pub async fn provision_existing_identity(
     base: &Config,
     node: &NativeNode,
     service_directory: &Path,
+    mut record_grant_epoch: impl FnMut(&str, u64) -> Result<(), String>,
     activate: impl FnOnce(Vec<Config>, ProvisioningCommit) -> Result<(), String>,
 ) -> Result<Vec<String>, BoxError> {
     let scope_ids = invite
@@ -411,6 +412,16 @@ pub async fn provision_existing_identity(
                 &device_seed,
                 iroh_secret,
             )?;
+            let grant_epoch = scope
+                .local_handshake
+                .peer
+                .pointer("/grant/payload/accessEpoch")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            if grant_epoch == 0 {
+                return Err("Invalid issued workspace grant epoch".into());
+            }
+            record_grant_epoch(&scope.workspace_id, grant_epoch)?;
             scope.controller_person_id = future_boards.then(|| invite.issuer_person_id.clone());
             staged.push(scope);
         }
@@ -639,6 +650,7 @@ pub(crate) fn prepare_config(
     let entry = &entries[0];
     let mut state = MatchLighthouseState {
         document: URL_SAFE_NO_PAD.decode(&entry.bytes)?,
+        admitted_document: None,
         authorization: entry
             .authorization
             .clone()

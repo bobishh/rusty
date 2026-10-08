@@ -29,6 +29,7 @@ const LOGIN_TTL_SECONDS: u64 = 5 * 60;
 const MAX_PENDING_LOGINS: usize = 128;
 const MAX_SCOPES: usize = 16;
 const MAX_BASELINE_WORKSPACES: usize = 4096;
+const MAX_REVOCATION_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct PairingService {
@@ -73,6 +74,64 @@ pub struct PairingRecord {
     pub last_operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provisioning: Option<ProvisioningRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawal: Option<PairingWithdrawal>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingWithdrawal {
+    pub operation_id: String,
+    pub request_hash: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_hash: Option<String>,
+    #[serde(default)]
+    pub verified_revocations: Vec<VerifiedWithdrawalRevocation>,
+    #[serde(default)]
+    pub verified_grants: Vec<VerifiedWithdrawalGrant>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedWithdrawalRevocation {
+    pub workspace_id: String,
+    pub revocation_epoch: u64,
+    pub revocation_hash: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedWithdrawalGrant {
+    pub workspace_id: String,
+    pub grant_id: String,
+    pub grant_epoch: u64,
+    pub grant_hash: String,
+}
+
+pub struct WithdrawalGrantScope {
+    pub workspace_id: String,
+    pub document: Vec<u8>,
+    pub authorization_bundle: Value,
+    pub grant: Value,
+}
+
+pub struct WithdrawalCompletionScope {
+    pub workspace_id: String,
+    pub document: Vec<u8>,
+    pub authorization_bundle: Value,
+}
+
+pub struct VerifiedWithdrawalCompletion {
+    pub request_hash: String,
+    pub operation_id: String,
+    pub integration_id: String,
+    pub controller_person_id: String,
+    pub service_person_id: String,
+    pub scopes: Vec<WithdrawalCompletionScope>,
+    /// Exact grant epochs durably observed during this pairing, if any.
+    /// Missing values require a Rusty integration tombstone before completion.
+    pub issued_grant_epochs: HashMap<String, Option<u64>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -89,6 +148,8 @@ pub struct ProvisioningRecord {
 pub struct ProvisionedScope {
     pub workspace_id: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,6 +311,10 @@ pub struct LoginProofResponse {
 }
 
 impl PairingService {
+    pub fn service_person_id(&self) -> &str {
+        &self.service_identity.person_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         directory: PathBuf,
@@ -449,6 +514,7 @@ impl PairingService {
             challenge,
             last_operation_id: operation_id.to_owned(),
             provisioning: None,
+            withdrawal: None,
         };
         let mut next = state.clone();
         next.records.insert(record.id.clone(), record.clone());
@@ -479,6 +545,9 @@ impl PairingService {
             || request.device_id != record.controller_device_id
         {
             return Err(PairingError::Forbidden);
+        }
+        if record.withdrawal.is_some() {
+            return Err(PairingError::Conflict);
         }
         let payload = &request.signed.payload;
         validate_common(
@@ -539,6 +608,581 @@ impl PairingService {
         Ok(result)
     }
 
+    /// Persist a controller-signed fence before acknowledging pairing withdrawal.
+    /// Active scopes still require the existing signed disconnect protocol.
+    pub fn withdraw(
+        &self,
+        id: &str,
+        request: ControllerRequest,
+    ) -> Result<SignedEnvelope<Value>, PairingError> {
+        self.verify_controller(&request)?;
+        let now = now_seconds();
+        let payload = &request.signed.payload;
+        validate_common(
+            payload,
+            "lighthouse-pairing-withdrawal",
+            &request,
+            &self.service_identity,
+            &self.origin,
+            now,
+        )?;
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let record = state.records.get(id).ok_or(PairingError::NotFound)?;
+        if request.identity.person_id != record.controller.person_id
+            || request.device_id != record.controller_device_id
+            || payload["pairingId"] != id
+            || payload["transcriptHash"] != record.transcript_hash
+            || payload["challengeNonce"] != record.challenge.payload["nonce"]
+        {
+            return Err(PairingError::Forbidden);
+        }
+        let operation_id = string_field(payload, "operationId")?.to_owned();
+        let mut semantic = payload.clone();
+        if let Some(object) = semantic.as_object_mut() {
+            object.remove("issuedAt");
+            object.remove("expiresAt");
+        }
+        let request_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(
+            canonicalize_json(&semantic)
+                .map_err(|_| PairingError::Invalid("Invalid withdrawal payload"))?
+                .as_bytes(),
+        ));
+        let mut next = state.clone();
+        let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        if let Some(previous) = &record.withdrawal {
+            if previous.operation_id != operation_id || previous.request_hash != request_hash {
+                return Err(PairingError::Conflict);
+            }
+        } else {
+            record.withdrawal = Some(PairingWithdrawal {
+                operation_id: operation_id.clone(),
+                request_hash: request_hash.clone(),
+                status: "cancel_pending".into(),
+                completion_hash: None,
+                verified_revocations: Vec::new(),
+                verified_grants: Vec::new(),
+            });
+        }
+        self.persist(&next)?;
+        *state = next;
+        self.sign_status_record(state.records.get(id).ok_or(PairingError::NotFound)?)
+    }
+
+    /// Parse owner-signed grants supplied at withdrawal for legacy pairing
+    /// records whose exact issued epochs were not persisted by older binaries.
+    /// The caller verifies each proof before `record_withdrawal_grants` stores it.
+    pub fn withdrawal_grant_scopes(
+        &self,
+        id: &str,
+        request: &ControllerRequest,
+    ) -> Result<Vec<WithdrawalGrantScope>, PairingError> {
+        self.verify_controller(request)?;
+        let payload = &request.signed.payload;
+        validate_common(
+            payload,
+            "lighthouse-pairing-withdrawal",
+            request,
+            &self.service_identity,
+            &self.origin,
+            now_seconds(),
+        )?;
+        let state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let record = state.records.get(id).ok_or(PairingError::NotFound)?;
+        if request.identity.person_id != record.controller.person_id
+            || request.device_id != record.controller_device_id
+            || payload["pairingId"] != id
+            || payload["transcriptHash"] != record.transcript_hash
+            || payload["challengeNonce"] != record.challenge.payload["nonce"]
+        {
+            return Err(PairingError::Forbidden);
+        }
+        if record
+            .withdrawal
+            .as_ref()
+            .is_some_and(|withdrawal| withdrawal.status == "cancelled")
+        {
+            return Ok(Vec::new());
+        }
+        // A pairing that never entered provisioning issued no grant. Ignore any
+        // stale grant proofs supplied by the client; they may belong to a prior
+        // integration for the same keeper and must not seed or revoke it.
+        if record.provisioning.is_none() {
+            return Ok(Vec::new());
+        }
+        let approved_scopes = record.offer["body"]["scopes"]
+            .as_array()
+            .ok_or(PairingError::Invalid("Pairing has no approved scopes"))?
+            .iter()
+            .map(|scope| {
+                scope["workspaceId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or(PairingError::Invalid("Invalid approved scope"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let proofs = match payload.get("grantScopes") {
+            None => &[][..],
+            Some(Value::Array(proofs)) => proofs.as_slice(),
+            Some(_) => return Err(PairingError::Invalid("Invalid grant proof list")),
+        };
+        if proofs.len() > MAX_SCOPES {
+            return Err(PairingError::Invalid("Too many grant proofs"));
+        }
+        let mut result = Vec::with_capacity(proofs.len());
+        let mut ids = Vec::with_capacity(proofs.len());
+        let mut total_document_bytes = 0usize;
+        for proof in proofs {
+            let workspace_id = proof["workspaceId"]
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+                .ok_or(PairingError::Invalid("Invalid grant proof scope"))?
+                .to_owned();
+            let encoded_document = proof["document"]
+                .as_str()
+                .ok_or(PairingError::Invalid("Missing grant proof document"))?;
+            let document = URL_SAFE_NO_PAD
+                .decode(encoded_document)
+                .map_err(|_| PairingError::Invalid("Invalid grant proof document"))?;
+            total_document_bytes = total_document_bytes.saturating_add(document.len());
+            if document.is_empty() || total_document_bytes > MAX_REVOCATION_DOCUMENT_BYTES {
+                return Err(PairingError::Invalid("Grant evidence is too large"));
+            }
+            let authorization_bundle = proof["authorizationBundle"]
+                .as_object()
+                .map(|_| proof["authorizationBundle"].clone())
+                .ok_or(PairingError::Invalid("Missing grant authority proof"))?;
+            let grant = proof["grant"]
+                .as_object()
+                .map(|_| proof["grant"].clone())
+                .ok_or(PairingError::Invalid("Missing signed grant"))?;
+            ids.push(workspace_id.clone());
+            result.push(WithdrawalGrantScope {
+                workspace_id,
+                document,
+                authorization_bundle,
+                grant,
+            });
+        }
+        if ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || ids
+                .iter()
+                .any(|workspace_id| !approved_scopes.contains(workspace_id))
+        {
+            return Err(PairingError::Invalid(
+                "Grant proofs must be sorted, unique, and selected by this pairing",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Persist cryptographically verified legacy grant generations against the
+    /// immutable first withdrawal operation. Retries cannot replace a generation.
+    pub fn record_withdrawal_grants(
+        &self,
+        id: &str,
+        operation_id: &str,
+        grants: Vec<VerifiedWithdrawalGrant>,
+    ) -> Result<SignedEnvelope<Value>, PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let mut next = state.clone();
+        let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        let withdrawal = record.withdrawal.as_mut().ok_or(PairingError::Conflict)?;
+        if withdrawal.operation_id != operation_id || withdrawal.status == "cancelled" {
+            return Err(PairingError::Conflict);
+        }
+        let provisioning = record.provisioning.as_mut().ok_or(PairingError::Conflict)?;
+        let mut new_ids = grants
+            .iter()
+            .map(|grant| grant.workspace_id.clone())
+            .collect::<Vec<_>>();
+        new_ids.sort();
+        if new_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(PairingError::Invalid("Duplicate verified grant scope"));
+        }
+        for grant in grants {
+            if grant.grant_id.is_empty() || grant.grant_epoch == 0 || grant.grant_hash.is_empty() {
+                return Err(PairingError::Forbidden);
+            }
+            let scope = provisioning
+                .scopes
+                .iter_mut()
+                .find(|scope| scope.workspace_id == grant.workspace_id)
+                .ok_or(PairingError::Forbidden)?;
+            if scope
+                .grant_epoch
+                .is_some_and(|epoch| epoch != grant.grant_epoch)
+            {
+                return Err(PairingError::Conflict);
+            }
+            if let Some(previous) = withdrawal
+                .verified_grants
+                .iter()
+                .find(|previous| previous.workspace_id == grant.workspace_id)
+            {
+                if previous.grant_id != grant.grant_id
+                    || previous.grant_epoch != grant.grant_epoch
+                    || previous.grant_hash != grant.grant_hash
+                {
+                    return Err(PairingError::Conflict);
+                }
+            } else {
+                withdrawal.verified_grants.push(grant.clone());
+            }
+            scope.grant_epoch = Some(grant.grant_epoch);
+        }
+        withdrawal
+            .verified_grants
+            .sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+        self.persist(&next)?;
+        *state = next;
+        self.sign_status_record(state.records.get(id).ok_or(PairingError::NotFound)?)
+    }
+
+    /// Validate exact owner-signed revocation evidence for every pairing scope.
+    /// The caller must pass each returned bundle to the shared Tincanban authority verifier.
+    pub fn withdrawal_completion_request(
+        &self,
+        id: &str,
+        request: ControllerRequest,
+    ) -> Result<VerifiedWithdrawalCompletion, PairingError> {
+        self.verify_controller(&request)?;
+        let now = now_seconds();
+        let payload = &request.signed.payload;
+        validate_common(
+            payload,
+            "lighthouse-pairing-withdrawal-complete",
+            &request,
+            &self.service_identity,
+            &self.origin,
+            now,
+        )?;
+        let operation_id = string_field(payload, "operationId")?.to_owned();
+        let withdrawal_operation_id = string_field(payload, "withdrawalOperationId")?;
+        let transcript_hash = string_field(payload, "transcriptHash")?;
+        let mut semantic = payload.clone();
+        if let Some(object) = semantic.as_object_mut() {
+            object.remove("issuedAt");
+            object.remove("expiresAt");
+        }
+        let request_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(
+            canonicalize_json(&semantic)
+                .map_err(|_| PairingError::Invalid("Invalid withdrawal completion"))?
+                .as_bytes(),
+        ));
+
+        let state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let record = state.records.get(id).ok_or(PairingError::NotFound)?;
+        let withdrawal = record.withdrawal.as_ref().ok_or(PairingError::Conflict)?;
+        if request.identity.person_id != record.controller.person_id
+            || request.device_id != record.controller_device_id
+            || payload["pairingId"] != id
+            || transcript_hash != record.transcript_hash
+            || payload["challengeNonce"] != record.challenge.payload["nonce"]
+            || withdrawal_operation_id != withdrawal.operation_id
+        {
+            return Err(PairingError::Forbidden);
+        }
+        if withdrawal.status == "cancelled" {
+            if withdrawal.completion_hash.as_deref() != Some(request_hash.as_str()) {
+                return Err(PairingError::Conflict);
+            }
+            return Ok(VerifiedWithdrawalCompletion {
+                request_hash,
+                operation_id,
+                integration_id: record.challenge.payload["integrationId"]
+                    .as_str()
+                    .ok_or(PairingError::Invalid("Missing pairing integration ID"))?
+                    .to_owned(),
+                controller_person_id: record.controller.person_id.clone(),
+                service_person_id: self.service_identity.person_id.clone(),
+                scopes: Vec::new(),
+                issued_grant_epochs: HashMap::new(),
+            });
+        }
+
+        let offered = record.offer["body"]["scopes"]
+            .as_array()
+            .ok_or(PairingError::Invalid("Pairing has no approved scopes"))?;
+        let mut expected = offered
+            .iter()
+            .map(|scope| {
+                scope["workspaceId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 256)
+                    .map(str::to_owned)
+                    .ok_or(PairingError::Invalid("Invalid approved scope"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        expected.sort();
+        let provided = payload["scopes"]
+            .as_array()
+            .filter(|scopes| !scopes.is_empty() && scopes.len() <= MAX_SCOPES)
+            .ok_or(PairingError::Invalid("Invalid withdrawal scope proof list"))?;
+        let mut scopes = Vec::with_capacity(provided.len());
+        let mut provided_ids = Vec::with_capacity(provided.len());
+        let mut total_document_bytes = 0usize;
+        for proof in provided {
+            let workspace_id = proof["workspaceId"]
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 256)
+                .ok_or(PairingError::Invalid("Invalid withdrawal scope proof"))?
+                .to_owned();
+            let encoded_document = proof["document"]
+                .as_str()
+                .ok_or(PairingError::Invalid("Missing revocation document"))?;
+            let document = URL_SAFE_NO_PAD
+                .decode(encoded_document)
+                .map_err(|_| PairingError::Invalid("Invalid revocation document"))?;
+            total_document_bytes = total_document_bytes.saturating_add(document.len());
+            if document.is_empty() || total_document_bytes > MAX_REVOCATION_DOCUMENT_BYTES {
+                return Err(PairingError::Invalid("Revocation evidence is too large"));
+            }
+            let authorization_bundle = proof["authorizationBundle"]
+                .as_object()
+                .map(|_| proof["authorizationBundle"].clone())
+                .ok_or(PairingError::Invalid("Missing revocation authority proof"))?;
+            provided_ids.push(workspace_id.clone());
+            scopes.push(WithdrawalCompletionScope {
+                workspace_id,
+                document,
+                authorization_bundle,
+            });
+        }
+        if provided_ids.windows(2).any(|pair| pair[0] >= pair[1]) || provided_ids != expected {
+            return Err(PairingError::Invalid(
+                "Withdrawal proofs must exactly match approved scopes in sorted order",
+            ));
+        }
+        Ok(VerifiedWithdrawalCompletion {
+            request_hash,
+            operation_id,
+            integration_id: record.challenge.payload["integrationId"]
+                .as_str()
+                .ok_or(PairingError::Invalid("Missing pairing integration ID"))?
+                .to_owned(),
+            controller_person_id: record.controller.person_id.clone(),
+            service_person_id: self.service_identity.person_id.clone(),
+            scopes,
+            issued_grant_epochs: record
+                .provisioning
+                .as_ref()
+                .map(|provisioning| {
+                    provisioning
+                        .scopes
+                        .iter()
+                        .map(|scope| (scope.workspace_id.clone(), scope.grant_epoch))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Persist completion only after verified revocation and integration cleanup.
+    pub fn record_withdrawal_completion(
+        &self,
+        id: &str,
+        completion: VerifiedWithdrawalCompletion,
+        revocations: Vec<VerifiedWithdrawalRevocation>,
+        minimum_grant_epochs: HashMap<String, u64>,
+        integration_detached: bool,
+    ) -> Result<SignedEnvelope<Value>, PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let mut next = state.clone();
+        let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        let withdrawal = record.withdrawal.as_mut().ok_or(PairingError::Conflict)?;
+        if withdrawal.status == "cancelled" {
+            if withdrawal.completion_hash.as_deref() != Some(completion.request_hash.as_str()) {
+                return Err(PairingError::Conflict);
+            }
+            return self.sign_status_record(record);
+        }
+        if withdrawal.operation_id != completion.operation_id
+            || record.challenge.payload["integrationId"] != completion.integration_id
+            || completion.controller_person_id != record.controller.person_id
+            || completion.service_person_id != self.service_identity.person_id
+            || !integration_detached
+        {
+            return Err(PairingError::Conflict);
+        }
+        let expected = record.offer["body"]["scopes"]
+            .as_array()
+            .ok_or(PairingError::Invalid("Pairing has no approved scopes"))?
+            .iter()
+            .map(|scope| scope["workspaceId"].as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(PairingError::Invalid("Invalid approved scope"))?;
+        let mut expected = expected;
+        expected.sort();
+        let provided = revocations
+            .iter()
+            .map(|proof| proof.workspace_id.clone())
+            .collect::<Vec<_>>();
+        if provided != expected
+            || minimum_grant_epochs.len() != expected.len()
+            || expected
+                .iter()
+                .any(|workspace_id| !minimum_grant_epochs.contains_key(workspace_id))
+            || revocations.iter().any(|proof| {
+                proof.revocation_epoch == 0
+                    || proof.revocation_hash.is_empty()
+                    || minimum_grant_epochs
+                        .get(&proof.workspace_id)
+                        .is_none_or(|epoch| proof.revocation_epoch <= *epoch)
+            })
+        {
+            return Err(PairingError::Forbidden);
+        }
+        let running = self
+            .provisioning_runs
+            .lock()
+            .map_err(|_| PairingError::Unavailable)?;
+        let in_flight = running.contains(id);
+        drop(running);
+        if in_flight
+            || record
+                .provisioning
+                .as_ref()
+                .is_some_and(|value| value.scopes.iter().any(|scope| scope.status == "active"))
+        {
+            return Err(PairingError::Conflict);
+        }
+        if let Some(provisioning) = &record.provisioning {
+            for scope in &provisioning.scopes {
+                let Some(stored_epoch) = scope.grant_epoch else {
+                    // Legacy/incomplete records cannot use an assumed epoch. A
+                    // verified Rusty tombstone may supply the missing bound.
+                    continue;
+                };
+                if minimum_grant_epochs
+                    .get(&scope.workspace_id)
+                    .is_none_or(|minimum| *minimum < stored_epoch)
+                {
+                    return Err(PairingError::Forbidden);
+                }
+            }
+        }
+        withdrawal.status = "cancelled".into();
+        withdrawal.completion_hash = Some(completion.request_hash);
+        withdrawal.verified_revocations = revocations;
+        if let Some(provisioning) = record.provisioning.as_mut() {
+            provisioning.status = "detached".into();
+            for scope in &mut provisioning.scopes {
+                scope.status = "removed".into();
+            }
+        }
+        self.persist(&next)?;
+        *state = next;
+        self.sign_status_record(state.records.get(id).ok_or(PairingError::NotFound)?)
+    }
+
+    /// Finish cancellation only after durable activation and cleanup reconciliation.
+    pub fn finalize_withdrawal(&self, id: &str) -> Result<SignedEnvelope<Value>, PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let mut next = state.clone();
+        let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        if record.withdrawal.is_none() {
+            return Err(PairingError::Conflict);
+        }
+        if record
+            .withdrawal
+            .as_ref()
+            .is_some_and(|withdrawal| withdrawal.status != "cancelled")
+        {
+            let running = self
+                .provisioning_runs
+                .lock()
+                .map_err(|_| PairingError::Unavailable)?;
+            let in_flight = running.contains(id);
+            drop(running);
+            let provisioning = record.provisioning.as_ref();
+            let has_active_scopes = provisioning
+                .is_some_and(|value| value.scopes.iter().any(|scope| scope.status == "active"));
+            let cleanup_pending =
+                provisioning.is_some_and(|value| value.status == "pending_cleanup");
+            let detached = provisioning.is_some_and(|value| value.status == "detached");
+            let grant_generations_known = provisioning
+                .is_none_or(|value| value.scopes.iter().all(|scope| scope.grant_epoch.is_some()));
+            let safe = !in_flight
+                && !has_active_scopes
+                && !cleanup_pending
+                && grant_generations_known
+                && (provisioning.is_none() || detached);
+            if safe {
+                record.withdrawal.as_mut().unwrap().status = "cancelled".into();
+            }
+        }
+        self.persist(&next)?;
+        *state = next;
+        self.sign_status_record(state.records.get(id).ok_or(PairingError::NotFound)?)
+    }
+
+    /// Serialize activation against withdrawal so a fenced pairing cannot commit late.
+    pub fn commit_activation_if_not_withdrawn(
+        &self,
+        id: &str,
+        commit: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "Pairing state lock poisoned".to_owned())?;
+        let record = state
+            .records
+            .get(id)
+            .ok_or_else(|| "Pairing was not found".to_owned())?;
+        if record.withdrawal.is_some() {
+            return Err("Pairing withdrawal is pending".into());
+        }
+        commit()
+    }
+
+    /// Persist every owner-issued grant epoch as soon as its staged scope is verified.
+    /// This survives a later staging/activation failure so withdrawal can prove revocation
+    /// moved beyond the exact credential issued by this pairing.
+    pub fn record_issued_grant_epoch(
+        &self,
+        id: &str,
+        workspace_id: &str,
+        grant_epoch: u64,
+    ) -> Result<(), String> {
+        if grant_epoch == 0 || workspace_id.is_empty() {
+            return Err("Invalid issued workspace grant".into());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Pairing state lock poisoned".to_owned())?;
+        let mut next = state.clone();
+        let record = next
+            .records
+            .get_mut(id)
+            .ok_or_else(|| "Pairing was not found".to_owned())?;
+        let approved = record.offer["body"]["scopes"]
+            .as_array()
+            .is_some_and(|scopes| {
+                scopes
+                    .iter()
+                    .any(|scope| scope["workspaceId"] == workspace_id)
+            });
+        if !approved {
+            return Err("Issued grant is outside approved pairing scopes".into());
+        }
+        let provisioning = record
+            .provisioning
+            .as_mut()
+            .ok_or_else(|| "Provisioning has not started".to_owned())?;
+        let scope = provisioning
+            .scopes
+            .iter_mut()
+            .find(|scope| scope.workspace_id == workspace_id)
+            .ok_or_else(|| "Issued grant is outside provisioning scopes".to_owned())?;
+        scope.grant_epoch = Some(scope.grant_epoch.unwrap_or(0).max(grant_epoch));
+        self.persist(&next)
+            .map_err(|_| "Could not persist issued grant epoch".to_owned())?;
+        *state = next;
+        Ok(())
+    }
+
     /// Admit only an ordinary workspace invitation for the exact dual-approved
     /// service identity and scope set. The invitation secret stays out of every
     /// durable pairing record and status response.
@@ -588,7 +1232,7 @@ impl PairingService {
 
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         let record = state.records.get(id).ok_or(PairingError::NotFound)?;
-        if record.expires_at <= now {
+        if record.expires_at <= now && record.withdrawal.is_none() {
             return Err(PairingError::Expired);
         }
         if request.identity.person_id != record.controller.person_id
@@ -597,6 +1241,9 @@ impl PairingService {
                 != Some(record.transcript_hash.as_str())
         {
             return Err(PairingError::Forbidden);
+        }
+        if record.withdrawal.is_some() {
+            return Err(PairingError::Conflict);
         }
         if record.controller_approved != Some(true) || record.operator_approved != Some(true) {
             return Err(PairingError::Forbidden);
@@ -744,6 +1391,7 @@ impl PairingService {
                     .map(|workspace_id| ProvisionedScope {
                         workspace_id: workspace_id.clone(),
                         status: "pending".into(),
+                        grant_epoch: None,
                         error: None,
                         error_detail: None,
                     })
@@ -752,12 +1400,13 @@ impl PairingService {
             self.persist(&next)?;
             *state = next;
         }
-        drop(state);
         let mut running = self
             .provisioning_runs
             .lock()
             .map_err(|_| PairingError::Unavailable)?;
         let should_run = running.insert(id.to_owned());
+        drop(running);
+        drop(state);
         Ok(ProvisionRequest {
             invitation,
             scopes: scope_ids,
@@ -773,7 +1422,7 @@ impl PairingService {
     pub fn complete_provision(
         &self,
         id: &str,
-        scopes: Vec<ProvisionedScope>,
+        mut scopes: Vec<ProvisionedScope>,
         active: bool,
     ) -> Result<(), PairingError> {
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
@@ -796,6 +1445,11 @@ impl PairingService {
                     .any(|scope| scope.status != "active" || scope.error.is_some()))
         {
             return Err(PairingError::Conflict);
+        }
+        for (actual, previous) in scopes.iter_mut().zip(&provisioning.scopes) {
+            if actual.grant_epoch.is_none() {
+                actual.grant_epoch = previous.grant_epoch;
+            }
         }
         provisioning.scopes = scopes;
         provisioning.status = if active { "active" } else { "provisioning" }.into();
@@ -851,6 +1505,10 @@ impl PairingService {
         }
         self.persist(&next)?;
         *state = next;
+        self.provisioning_runs
+            .lock()
+            .map_err(|_| PairingError::Unavailable)?
+            .remove(id);
         Ok(())
     }
 
@@ -903,7 +1561,7 @@ impl PairingService {
         let now = now_seconds();
         let state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         let record = state.records.get(id).ok_or(PairingError::NotFound)?;
-        if record.expires_at <= now {
+        if record.expires_at <= now && record.withdrawal.is_none() {
             return Err(PairingError::Expired);
         }
         validate_common(
@@ -1125,9 +1783,15 @@ impl PairingService {
             "pending"
         };
         let status = record
-            .provisioning
+            .withdrawal
             .as_ref()
-            .map(|provisioning| provisioning.status.as_str())
+            .map(|withdrawal| withdrawal.status.as_str())
+            .or_else(|| {
+                record
+                    .provisioning
+                    .as_ref()
+                    .map(|provisioning| provisioning.status.as_str())
+            })
             .unwrap_or(approval_status);
         let provisioning = record
             .provisioning
@@ -1143,7 +1807,8 @@ impl PairingService {
             "serviceDeviceId":self.service_device_id, "serviceOrigin":self.origin,
             "expiresAt":record.expires_at, "operatorApproved":record.operator_approved,
             "controllerApproved":record.controller_approved, "status":status,
-            "provisioning":provisioning, "issuedAt":now,
+            "provisioning":provisioning, "withdrawal":record.withdrawal,
+            "issuedAt":now,
         }), &self.service_device_id, CONTROL_DOMAIN).map_err(|_| PairingError::Unavailable)
     }
 
@@ -1435,6 +2100,10 @@ impl PairingService {
                 owner.is_none_or(|person_id| record.controller.person_id == person_id)
                     && (record.expires_at > now_seconds()
                         || record
+                            .withdrawal
+                            .as_ref()
+                            .is_some_and(|withdrawal| withdrawal.status == "cancel_pending")
+                        || record
                             .provisioning
                             .as_ref()
                             .is_some_and(|provisioning| provisioning.status == "active"))
@@ -1500,12 +2169,18 @@ impl PairingService {
             "pending"
         };
         let status = record
-            .provisioning
+            .withdrawal
             .as_ref()
-            .map(|provisioning| provisioning.status.as_str())
+            .map(|withdrawal| withdrawal.status.as_str())
+            .or_else(|| {
+                record
+                    .provisioning
+                    .as_ref()
+                    .map(|provisioning| provisioning.status.as_str())
+            })
             .unwrap_or(approval_status);
         Ok(
-            json!({ "id":record.id, "status":status, "expiresAt":record.expires_at, "controllerApproved":record.controller_approved, "operatorApproved":record.operator_approved, "provisioning":record.provisioning }),
+            json!({ "id":record.id, "status":status, "expiresAt":record.expires_at, "controllerApproved":record.controller_approved, "operatorApproved":record.operator_approved, "provisioning":record.provisioning, "withdrawal":record.withdrawal }),
         )
     }
 

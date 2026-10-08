@@ -77,6 +77,16 @@ a cross-repository state contract, not a proof of Tincanban storage behavior;
 the corresponding implementation is `tincanban/src/sync/deviceSyncKeeper.ts`
 (`persistRemovalReceipt`, `finishAlreadyRemoved`).
 
+`PairingWithdrawal.tla` covers a controller-signed withdrawal fence while
+provisioning may be in flight. A grant may already have been issued before
+activation; cancellation therefore requires either no provisioning attempt or
+verified owner revocation beyond the issued grant. Rusty cannot revoke grants
+itself. The model checks late activation, retry fencing, cleanup/restart, and
+the case where detached service files are incorrectly treated as proof that
+the owner grant was revoked. That mutant violates `CancelledHasNoGrant`. The
+model abstracts envelope signatures and grant epochs to booleans; Rust tests
+cover signed owner proof and strict epoch comparison.
+
 | Requirement | Check |
 | --- | --- |
 | Editor invitation and signed Editor grant required | `EditorRoleProofs`; `VisitorActivation.cfg` mutant |
@@ -92,6 +102,7 @@ the corresponding implementation is `tincanban/src/sync/deviceSyncKeeper.ts`
 | Legacy offline removal persists local intent, blocks sync/offers, and waits for exact signed remote completion | `LegacyOfflineRemoval.cfg` retry witness; `LegacyOfflineNoDescriptor.cfg` pending witness; `LegacyOfferDuringPending.cfg` mutant |
 | Operator and identity sessions survive independent sign-in and logout | `SessionCookieIsolation.cfg`; `SessionCookieCollision.cfg` models the overwrite defect |
 | Local OwnerKeeper projection cleanup retries after a verified removal receipt and restart | `LocalProjectionCleanup.cfg`; `LocalProjectionCleanupDropsReceipt.cfg` models lost retry evidence |
+| Pairing withdrawal fences late provision/retry and waits for owner revocation beyond issued grants | `PairingWithdrawal.cfg`; `PairingLateActivation.cfg`, `PairingRetryAfterWithdrawal.cfg`, and `PairingUnverifiedCompletion.cfg` are expected counterexamples |
 | Ambiguous JobSearch routing is blocked | `AmbiguousRouteBlocked`; `AmbiguousRouteMutation.cfg` mutant |
 
 Source mapping:

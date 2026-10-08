@@ -5,7 +5,7 @@ use meta_mesh_native::NativeNode;
 use crate::{
     Config, ProvisioningCommit, join,
     keeper::{KeeperHost, ProvisioningLifecycleStatus},
-    pairing::{IntegrationCandidate, ProvisionedScope, VerifiedDisconnectRequest},
+    pairing::{IntegrationCandidate, PairingService, ProvisionedScope, VerifiedDisconnectRequest},
 };
 
 #[derive(Clone)]
@@ -59,6 +59,7 @@ impl ProvisioningService {
         workspace_ids: Vec<String>,
         future_boards: bool,
         baseline_workspace_ids: Vec<String>,
+        pairings: PairingService,
     ) -> Result<Vec<ProvisionedScope>, String> {
         let invitation_id = invitation.invitation_id.clone();
         let controller_person_id = invitation.issuer_person_id.clone();
@@ -112,6 +113,12 @@ impl ProvisioningService {
             &config,
             &self.node,
             &service_directory,
+            {
+                let pairings = pairings.clone();
+                move |workspace_id, grant_epoch| {
+                    pairings.record_issued_grant_epoch(pairing_id, workspace_id, grant_epoch)
+                }
+            },
             move |staged, mut commit| {
                 if commit
                     .controller_person_id
@@ -121,7 +128,9 @@ impl ProvisioningService {
                     return Err("Provisioning controller differs from accepted invitation".into());
                 }
                 commit.controller_person_id = Some(controller_person_id);
-                host.activate_provisioned_scopes(staged, commit)
+                pairings.commit_activation_if_not_withdrawn(pairing_id, || {
+                    host.activate_provisioned_scopes(staged, commit)
+                })
             },
         )
         .await
@@ -136,6 +145,7 @@ fn active_scopes(workspace_ids: Vec<String>) -> Vec<ProvisionedScope> {
         .map(|workspace_id| ProvisionedScope {
             workspace_id,
             status: "active".into(),
+            grant_epoch: None,
             error: None,
             error_detail: None,
         })
