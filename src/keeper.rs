@@ -1324,7 +1324,10 @@ impl KeeperHost {
             return Err("Policy-only approval does not match active integration".into());
         }
         if current.revision != expected_revision {
-            return Err("Integration revision changed after dual approval".into());
+            return Err(format!(
+                "Integration revision changed after dual approval (expected {expected_revision}, current {})",
+                current.revision
+            ).into());
         }
         let mut required_baseline = current
             .scopes
@@ -1642,7 +1645,10 @@ fn record_activated_integration(next: &mut Config, staged: &[Config]) -> Result<
                 );
             }
             if commit.expected_integration_revision != Some(record.revision) {
-                return Err("Integration revision changed after dual approval".into());
+                return Err(format!(
+                    "Integration revision changed after dual approval (expected {:?}, current {})",
+                    commit.expected_integration_revision, record.revision
+                ));
             }
             if record.pending_disconnect.is_some() || record.pending_settings.is_some() {
                 return Err("Integration has pending removal or settings cleanup".into());
