@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -31,6 +31,9 @@ use proof_cache::ProofPageCache;
 #[serde(rename_all = "camelCase")]
 pub struct MatchLighthouseState {
     pub document: Vec<u8>,
+    /// Verified product projection. `document` remains full causal evidence.
+    #[serde(default)]
+    pub admitted_document: Option<Vec<u8>>,
     pub authorization: Value,
     #[serde(default = "empty_chat")]
     pub chat: Value,
@@ -87,6 +90,8 @@ impl MatchScopeStore {
                 .map_err(|error| format!("Invalid lighthouse state: {error}"))?,
             None => initial,
         };
+        // Never trust the cached projection when reopening persisted raw evidence.
+        state.admitted_document = None;
         // A restored aggregate is storage, not a legacy network frame. New
         // enrollment evidence still passes its original wire format limits.
         let admission = if stored.is_some() {
@@ -122,7 +127,7 @@ impl MatchScopeStore {
                 .map(|change| change.hash().to_string())
                 .collect::<Vec<_>>();
             let admission = authorization_admission_bundle(&guard.state.authorization)?;
-            admit_tincanban_candidate(
+            let admission = admit_tincanban_candidate(
                 None,
                 &guard.state.document,
                 &hashes,
@@ -130,7 +135,11 @@ impl MatchScopeStore {
                 snapshot,
                 now_ms()?,
             )?;
-            if guard.file.read()?.is_none() {
+            let projection_changed = guard.state.admitted_document.as_deref()
+                != Some(admission.authorized_document.as_slice());
+            guard.state.admitted_document = Some(admission.authorized_document);
+            guard.authority_cache = None;
+            if guard.file.read()?.is_none() || projection_changed {
                 write_state(&guard.file, &guard.state)?;
             }
         }
@@ -153,7 +162,9 @@ impl MatchScopeStore {
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?
             .state
-            .document
+            .admitted_document
+            .as_ref()
+            .ok_or("Missing admitted Tincanban document")?
             .clone();
         let mut document = AutoCommit::load(&bytes).map_err(|_| "Invalid Tincanban document")?;
         let title = match document
@@ -184,7 +195,9 @@ impl MatchScopeStore {
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?
             .state
-            .document
+            .admitted_document
+            .as_ref()
+            .ok_or("Missing admitted Tincanban document")?
             .clone();
         let document = AutoCommit::load(&bytes)
             .map_err(|error| format!("Invalid Tincanban document: {error}"))?;
@@ -256,7 +269,7 @@ impl MatchScopeStore {
             return Err("Lighthouse needs an editor grant to create leads".into());
         }
         let state = self.snapshot()?;
-        let mut document = AutoCommit::load(&state.document)
+        let mut document = AutoCommit::load(&self.admitted_document()?)
             .map_err(|error| format!("Invalid Tincanban document: {error}"))?;
         document.set_actor(ActorId::from(member.payload.device_id.as_bytes().to_vec()));
         let view =
@@ -267,6 +280,9 @@ impl MatchScopeStore {
             .ok_or("Invalid Tincanban entities")?;
         if entities.contains_key(lead_id) {
             return Ok(lead_id.to_owned());
+        }
+        if document_contains_entity(&state_document(&self.inner)?, lead_id)? {
+            return Err("A quarantined Tincanban change already uses this lead ID".into());
         }
         let board =
             board_with_preset(entities, "job-search").ok_or("No job-search board in workspace")?;
@@ -365,7 +381,11 @@ impl MatchScopeStore {
                 "grant":member.grant,"ownerPublicKey":member.owner_public_key,
                 "ownerCertificates":member.owner_certificates}));
         let proof = authorization_admission_bundle(&proof)?;
-        self.persist_document(&document.save(), Some(&proof), &[hash])?;
+        let mut raw = AutoCommit::load(&state_document(&self.inner)?)
+            .map_err(|error| format!("Invalid Tincanban document: {error}"))?;
+        raw.merge(&mut document)
+            .map_err(|error| error.to_string())?;
+        self.persist_document(&raw.save(), Some(&proof), &[hash])?;
         Ok(id)
     }
 
@@ -396,8 +416,7 @@ impl MatchScopeStore {
         if member.role == meta_mesh_core::WorkspaceRole::Visitor {
             return Err("Lighthouse needs chat.write permission".into());
         }
-        let state = self.snapshot()?;
-        let chat_scope = match_chat_scope(&state.document)?;
+        let chat_scope = match_chat_scope(&self.admitted_document()?)?;
         let created_at = time::OffsetDateTime::from_unix_timestamp_nanos(now_ms()? * 1_000_000)
             .map_err(|error| error.to_string())?
             .format(time::macros::format_description!(
@@ -517,7 +536,10 @@ impl MatchScopeStore {
             .and_then(Value::as_array)
             .ok_or("Missing lighthouse write authorizations")?;
         let (snapshot, merged) = prepare_tincanban_write_authority(
-            &state.document,
+            state
+                .admitted_document
+                .as_deref()
+                .unwrap_or(&state.document),
             evidence,
             None,
             records,
@@ -532,6 +554,7 @@ impl MatchScopeStore {
 
     fn save(&self, guard: &mut Inner, next: MatchLighthouseState) -> Result<(), String> {
         let authority_changed = guard.state.document != next.document
+            || guard.state.admitted_document != next.admitted_document
             || guard.state.authorization != next.authorization;
         write_state(&guard.file, &next)?;
         if authority_changed {
@@ -541,6 +564,34 @@ impl MatchScopeStore {
         guard.state = next;
         Ok(())
     }
+
+    fn admitted_document(&self) -> Result<Vec<u8>, String> {
+        self.inner
+            .lock()
+            .map_err(|_| "Lighthouse state lock poisoned".to_string())?
+            .state
+            .admitted_document
+            .clone()
+            .ok_or_else(|| "Missing admitted Tincanban document".into())
+    }
+}
+
+fn state_document(inner: &Arc<Mutex<Inner>>) -> Result<Vec<u8>, String> {
+    inner
+        .lock()
+        .map_err(|_| "Lighthouse state lock poisoned".to_string())
+        .map(|guard| guard.state.document.clone())
+}
+
+fn document_contains_entity(bytes: &[u8], id: &str) -> Result<bool, String> {
+    let document =
+        AutoCommit::load(bytes).map_err(|error| format!("Invalid Tincanban document: {error}"))?;
+    let view =
+        serde_json::to_value(AutoSerde::from(&document)).map_err(|error| error.to_string())?;
+    Ok(view
+        .pointer("/entities")
+        .and_then(Value::as_object)
+        .is_some_and(|entities| entities.contains_key(id)))
 }
 
 fn match_chat_scope(document: &[u8]) -> Result<String, String> {
@@ -659,24 +710,47 @@ impl NativeScopeHost for MatchScopeStore {
             &self.genesis_person_id,
             now_ms()?,
         )?;
+        let known_records = authorization_records(&guard.state.authorization)?;
+        let merged_records = merge_records(Some(&known_records), &incoming_records)?;
+        let admission_proof = authorization_admission_bundle(&json!({
+            "version": 1,
+            "records": merged_records,
+            "authority": merged.clone(),
+        }))
+        .map_err(|error| format!("Invalid merged authorization proof: {error}"))?;
+        let admitted_document = guard
+            .state
+            .admitted_document
+            .as_deref()
+            .ok_or("Missing admitted Tincanban document")?;
+        let classifiable_hashes = unadmitted_change_hashes(admitted_document, candidate)?;
+        let classifiable_set = classifiable_hashes.iter().collect::<BTreeSet<_>>();
+        if accepted_hashes
+            .iter()
+            .any(|hash| !classifiable_set.contains(hash))
+        {
+            return Err("Accepted Tincanban changes do not match candidate history".into());
+        }
         let verified = admit_tincanban_candidate(
-            Some(&guard.state.document),
+            Some(admitted_document),
             candidate,
-            accepted_hashes,
-            proof,
+            &classifiable_hashes,
+            Some(&admission_proof),
             snapshot,
             now_ms()?,
-        )?;
+        )
+        .map_err(|error| format!("Unable to admit Tincanban write: {error}"))?;
         let records = merge_records(
             guard
                 .state
                 .authorization
                 .get("records")
                 .and_then(Value::as_array),
-            &verified,
-        );
+            &verified.verified_authorizations,
+        )?;
         let mut next = guard.state.clone();
         next.document = candidate.to_vec();
+        next.admitted_document = Some(verified.authorized_document);
         next.authorization = json!({"version": 1, "records": records, "authority": merged});
         self.save(&mut guard, next)
     }
@@ -698,11 +772,25 @@ impl NativeScopeHost for MatchScopeStore {
             &self.genesis_person_id,
             now_ms()?,
         )?;
+        let known_records = authorization_records(&guard.state.authorization)?;
+        let merged_records = merge_records(Some(&known_records), &incoming_records)?;
+        let admission_proof = authorization_admission_bundle(&json!({
+            "version": 1,
+            "records": merged_records,
+            "authority": merged.clone(),
+        }))?;
+        let admitted_document = guard
+            .state
+            .admitted_document
+            .as_deref()
+            .ok_or("Missing admitted Tincanban document")?;
+        let classifiable_hashes =
+            unadmitted_change_hashes(admitted_document, &guard.state.document)?;
         let verified = admit_tincanban_candidate(
-            Some(&guard.state.document),
+            Some(admitted_document),
             &guard.state.document,
-            &[],
-            Some(incoming),
+            &classifiable_hashes,
+            Some(&admission_proof),
             snapshot,
             now_ms()?,
         )?;
@@ -712,9 +800,10 @@ impl NativeScopeHost for MatchScopeStore {
                 .authorization
                 .get("records")
                 .and_then(Value::as_array),
-            &verified,
-        );
+            &verified.verified_authorizations,
+        )?;
         let mut next = guard.state.clone();
+        next.admitted_document = Some(verified.authorized_document);
         next.authorization = json!({"version": 1, "records": records, "authority": merged});
         self.save(&mut guard, next)
     }
@@ -831,15 +920,49 @@ fn write_state(file: &FileScopeStore, state: &MatchLighthouseState) -> Result<()
     file.write_validated(&bytes, None, |_, _| Ok(()))
 }
 
-fn merge_records(existing: Option<&Vec<Value>>, incoming: &[Value]) -> Vec<Value> {
-    let mut seen = BTreeSet::new();
-    existing
-        .into_iter()
-        .flatten()
-        .chain(incoming)
-        .filter(|record| seen.insert(record.to_string()))
-        .cloned()
-        .collect()
+fn merge_records(existing: Option<&Vec<Value>>, incoming: &[Value]) -> Result<Vec<Value>, String> {
+    let mut records = BTreeMap::<String, Value>::new();
+    for record in existing.into_iter().flatten() {
+        let signed = record
+            .get("signed")
+            .ok_or("Invalid stored authorization envelope")?;
+        records.insert(signed.to_string(), record.clone());
+    }
+    for record in incoming {
+        let signed = record
+            .get("signed")
+            .ok_or("Invalid incoming authorization envelope")?;
+        // Existing records already passed admission. Prefer their validated
+        // sidecars when the same exact signed envelope is returned enriched.
+        records
+            .entry(signed.to_string())
+            .or_insert_with(|| record.clone());
+    }
+    let aggregate = authorization_admission_bundle(&json!({
+        "version": 1,
+        "authority": {},
+        "records": records.into_values().collect::<Vec<_>>(),
+    }))?;
+    authorization_records(&aggregate)
+}
+
+fn unadmitted_change_hashes(local: &[u8], candidate: &[u8]) -> Result<Vec<String>, String> {
+    let mut local = AutoCommit::load(local).map_err(|error| error.to_string())?;
+    let mut candidate = AutoCommit::load(candidate).map_err(|error| error.to_string())?;
+    let known = local
+        .get_changes(&[])
+        .iter()
+        .map(|change| change.hash().to_string())
+        .collect::<BTreeSet<_>>();
+    let candidate = candidate
+        .get_changes(&[])
+        .iter()
+        .map(|change| change.hash().to_string())
+        .collect::<BTreeSet<_>>();
+    if !known.is_subset(&candidate) {
+        return Err("Candidate Tincanban history omits admitted local changes".into());
+    }
+    Ok(candidate.difference(&known).cloned().collect())
 }
 
 fn board_with_preset<'a>(
@@ -1173,6 +1296,7 @@ mod tests {
             .collect();
         let initial = MatchLighthouseState {
             document: baseline.clone(),
+            admitted_document: None,
             authorization: proof_for(initial_hashes),
             chat: empty_chat(),
             mesh: None,
@@ -1211,7 +1335,11 @@ mod tests {
             0,
             "opening a verified state starts at its initial authority revision"
         );
-        assert!(store.inner.lock().unwrap().authority_cache.is_some());
+        let initial_revision = store.inner.lock().unwrap().authority_revision;
+        assert!(
+            store.inner.lock().unwrap().authority_cache.is_none(),
+            "recomputed admitted projection invalidates the pre-projection authority cache"
+        );
         assert!(
             store
                 .snapshot()
@@ -1222,22 +1350,41 @@ mod tests {
                 .is_some(),
             "paged enrollment normalizes to internal aggregate storage"
         );
+        assert_eq!(
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .authority_cache
+                .as_ref()
+                .unwrap()
+                .revision,
+            initial_revision,
+            "refreshing cache after projection does not create an authority write"
+        );
         document.put(ROOT, "title", "Updated").unwrap();
         let candidate = document.save();
         let new_hash = document.get_heads()[0].to_string();
-        assert!(
-            store
-                .persist_document(
-                    &candidate,
-                    Some(&json!({
-                        "version": 1, "records": [], "authority": evidence,
-                    })),
-                    std::slice::from_ref(&new_hash)
-                )
-                .is_err()
+        store
+            .persist_document(
+                &candidate,
+                Some(&json!({
+                    "version": 1, "records": [], "authority": evidence,
+                })),
+                std::slice::from_ref(&new_hash),
+            )
+            .unwrap();
+        assert_eq!(store.snapshot().unwrap().document, candidate);
+        assert_eq!(
+            store.document_overview().unwrap().0.as_deref(),
+            Some("Original"),
+            "unsigned raw changes persist as evidence but stay outside the admitted projection"
         );
-        assert_eq!(store.snapshot().unwrap().document, baseline);
-        assert_eq!(store.inner.lock().unwrap().authority_revision, 0);
+        assert_eq!(
+            store.inner.lock().unwrap().authority_revision,
+            1,
+            "durable raw quarantine evidence advances the storage revision"
+        );
         assert!(store.inner.lock().unwrap().authority_cache.is_some());
         let paged_proof =
             authorization_admission_bundle(&proof_for(vec![new_hash.clone()])).unwrap();
@@ -1252,18 +1399,20 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(store.snapshot().unwrap().document, baseline);
-        assert_eq!(store.inner.lock().unwrap().authority_revision, 0);
-        store
-            .persist_document(
-                &candidate,
-                Some(&paged_proof),
-                &[document.get_heads()[0].to_string()],
-            )
-            .unwrap();
+        assert_eq!(store.snapshot().unwrap().document, candidate);
+        assert_eq!(
+            store.document_overview().unwrap().0.as_deref(),
+            Some("Original")
+        );
+        assert_eq!(
+            store.inner.lock().unwrap().authority_revision,
+            1,
+            "a forged proof cannot advance the raw or admitted revision"
+        );
+        store.merge_authorization(&paged_proof).unwrap();
         {
             let inner = store.inner.lock().unwrap();
-            assert_eq!(inner.authority_revision, 1);
+            assert_eq!(inner.authority_revision, 2);
             assert!(inner.authority_cache.is_none());
         }
         assert_eq!(store.authority().unwrap().document, candidate);
@@ -1276,7 +1425,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .revision,
-            1
+            2
         );
         assert!(
             store
@@ -1284,6 +1433,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.snapshot().unwrap().document, candidate);
+        let revision_before_chat = store.inner.lock().unwrap().authority_revision;
         let issued_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
@@ -1301,7 +1451,11 @@ mod tests {
         let message_id = store
             .create_chat_message(&peer, &[2; 32], "intake-test", "New lead")
             .unwrap();
-        assert_eq!(store.inner.lock().unwrap().authority_revision, 1);
+        assert_eq!(
+            store.inner.lock().unwrap().authority_revision,
+            revision_before_chat,
+            "chat writes do not change workspace authority"
+        );
         assert!(store.inner.lock().unwrap().authority_cache.is_some());
         let chat = store.snapshot().unwrap().chat.unwrap();
         assert_eq!(
@@ -1379,6 +1533,145 @@ mod tests {
             reopened.authorized_peer_endpoints().unwrap(),
             vec!["signed-route"]
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopen_preserves_quarantined_source_and_projects_only_its_signed_clone() {
+        let public_key = public_key_from_seed(&[31; 32]).unwrap();
+        let person_id = public_key_id(&public_key).unwrap();
+        let device_public_key = public_key_from_seed(&[32; 32]).unwrap();
+        let device_id = public_key_id(&device_public_key).unwrap();
+        let certificate = sign_device_certificate(
+            &[31; 32],
+            DeviceCertificatePayload {
+                kind: "device-certificate".into(),
+                version: 1,
+                person_id: person_id.clone(),
+                device_id: device_id.clone(),
+                device_public_key,
+                issuer_certificate_hash: None,
+                can_enroll_devices: true,
+            },
+            &person_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let owner = WorkspaceAuthority {
+            person_id: person_id.clone(),
+            public_key: public_key.clone(),
+            certificates: vec![certificate.clone()],
+        };
+        let evidence = json!({"genesisOwner":owner,"genesisEpoch":1,"currentOwner":owner,"currentEpoch":1,
+            "ownershipTransfers":[],"successionClaims":[],"revocations":[],"deviceRevocations":[],"departures":[]});
+        let mut baseline = AutoCommit::new();
+        baseline.put(ROOT, "id", "board-recovery").unwrap();
+        baseline
+            .put(ROOT, "ownerPersonId", person_id.clone())
+            .unwrap();
+        baseline.put(ROOT, "title", "Original").unwrap();
+        let baseline_bytes = baseline.save();
+        let baseline_hashes = baseline
+            .get_changes(&[])
+            .iter()
+            .map(|change| change.hash().to_string())
+            .collect::<Vec<_>>();
+        let mut unsafe_source = AutoCommit::load(&baseline_bytes).unwrap();
+        unsafe_source
+            .put(ROOT, "untrustedSource", "quarantined evidence")
+            .unwrap();
+        let source_hash = unsafe_source
+            .get_changes(&baseline.get_heads())
+            .iter()
+            .map(|change| change.hash().to_string())
+            .next()
+            .unwrap();
+        let mut trusted_clone = AutoCommit::load(&baseline_bytes).unwrap();
+        trusted_clone.put(ROOT, "title", "Verified clone").unwrap();
+        let clone_hash = trusted_clone
+            .get_changes(&baseline.get_heads())
+            .iter()
+            .map(|change| change.hash().to_string())
+            .next()
+            .unwrap();
+        let mut raw = AutoCommit::load(&baseline_bytes).unwrap();
+        raw.merge(&mut unsafe_source).unwrap();
+        raw.merge(&mut trusted_clone).unwrap();
+        let raw_bytes = raw.save();
+        let mut authorized_hashes = baseline_hashes;
+        authorized_hashes.push(clone_hash);
+        let signed = sign_json_envelope(
+            &[32; 32],
+            json!(WorkspaceChangeAuthorizationPayload {
+                kind: "workspace-changes".into(),
+                version: 1,
+                workspace_id: "board-recovery".into(),
+                hashes: authorized_hashes,
+                person_id: person_id.clone(),
+                device_id: device_id.clone()
+            }),
+            &device_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let state = MatchLighthouseState {
+            document: raw_bytes.clone(),
+            admitted_document: None,
+            authorization: json!({"version":1,"records":[{"signed":signed,"publicKey":public_key,
+                "certificates":[certificate]}],"authority":evidence}),
+            chat: empty_chat(),
+            mesh: None,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "match-lighthouse-quarantine-{}-{}.json",
+            std::process::id(),
+            now_ms().unwrap()
+        ));
+        write_state(&FileScopeStore::new(path.clone()), &state).unwrap();
+
+        let mut reopened = MatchScopeStore::open(
+            "board-recovery".into(),
+            person_id.clone(),
+            path.clone(),
+            state.clone(),
+        )
+        .unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(
+            snapshot.document, raw_bytes,
+            "raw evidence must remain byte-for-byte available"
+        );
+        assert!(
+            snapshot.authorization.unwrap()["records"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 1,
+            "verified authorization evidence must survive reopening"
+        );
+        let mut raw_doc = AutoCommit::load(&snapshot.document).unwrap();
+        assert!(raw_doc.get(ROOT, "untrustedSource").unwrap().is_some());
+        assert!(
+            raw_doc
+                .get_changes(&[])
+                .iter()
+                .any(|change| change.hash().to_string() == source_hash)
+        );
+        assert_eq!(
+            reopened.document_overview().unwrap().0.as_deref(),
+            Some("Verified clone"),
+            "native consumers must see the admitted signed clone, not quarantined source state"
+        );
+        drop(reopened);
+
+        let mut reopened_again =
+            MatchScopeStore::open("board-recovery".into(), person_id, path.clone(), state).unwrap();
+        assert_eq!(reopened_again.snapshot().unwrap().document, raw_bytes);
+        assert_eq!(
+            reopened_again.document_overview().unwrap().0.as_deref(),
+            Some("Verified clone")
+        );
+        drop(reopened_again);
         std::fs::remove_file(path).unwrap();
     }
 }

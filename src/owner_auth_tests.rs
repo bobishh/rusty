@@ -492,10 +492,12 @@ fn exact_provision_failure_survives_restart_in_signed_status() {
             scopes: vec![ProvisionedScope {
                 workspace_id: "board".into(),
                 status: "pending".into(),
+                grant_epoch: None,
                 error: None,
                 error_detail: None,
             }],
         }),
+        withdrawal: None,
     };
     service
         .state
@@ -509,6 +511,7 @@ fn exact_provision_failure_survives_restart_in_signed_status() {
             vec![ProvisionedScope {
                 workspace_id: "board".into(),
                 status: "pending".into(),
+                grant_epoch: None,
                 error: Some("join_failed".into()),
                 error_detail: Some("Mesh snapshot rejected: stale authorization epoch".into()),
             }],

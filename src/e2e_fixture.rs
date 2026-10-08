@@ -143,6 +143,7 @@ fn initial_workspace(
     Ok((
         MatchLighthouseState {
             document: document.save(),
+            admitted_document: None,
             authorization,
             chat: json!({"version":1,"messages":[],"profiles":[],"typing":[]}),
             mesh: None,
