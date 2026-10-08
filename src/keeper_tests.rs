@@ -4339,6 +4339,88 @@ fn activation_preserves_scope_data_when_config_rename_is_visible_but_parent_sync
 }
 
 #[test]
+fn activation_accepts_legacy_omission_of_new_nullable_config_fields() {
+    let keeper = TestKeeper::new();
+    let original: Value = serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    let mut legacy = original.clone();
+    legacy["initialState"]
+        .as_object_mut()
+        .unwrap()
+        .remove("admittedDocument");
+    legacy["localHandshake"]
+        .as_object_mut()
+        .unwrap()
+        .remove("ownerWorkspaceIds");
+    fs::write(&keeper.config_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    let commit = ProvisioningCommit {
+        pairing_id: "legacy-default-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
+        operation_id: "legacy-default-operation".into(),
+        transcript_hash: "legacy-default-transcript".into(),
+        invitation_id: "legacy-default-invitation".into(),
+        workspace_ids: vec!["legacy-default-board".into()],
+        snapshot_hash: "legacy-default-snapshot".into(),
+        future_boards: false,
+        baseline_workspace_ids: vec!["legacy-default-board".into()],
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+    keeper
+        .host
+        .activate_provisioned_scopes(vec![keeper.staged_scope("legacy-default-board")], commit)
+        .expect("omitted nullable fields parse to the same typed config");
+
+    let persisted: Value = serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    assert_eq!(persisted["initialState"]["admittedDocument"], Value::Null);
+    assert_eq!(
+        persisted["localHandshake"]["ownerWorkspaceIds"],
+        Value::Null
+    );
+    assert_eq!(keeper.host.scopes().unwrap().len(), 2);
+}
+
+#[test]
+fn activation_rejects_explicit_value_drift_for_legacy_nullable_field() {
+    let keeper = TestKeeper::new();
+    let mut changed: Value =
+        serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    changed["initialState"]["admittedDocument"] = json!([1, 2, 3]);
+    let original = serde_json::to_vec(&changed).unwrap();
+    fs::write(&keeper.config_path, &original).unwrap();
+    let commit = ProvisioningCommit {
+        pairing_id: "legacy-drift-pairing".into(),
+        integration_id: crate::integration_id(&keeper.owner.person_id, &keeper.keeper.person_id),
+        expected_integration_revision: None,
+        operation_id: "legacy-drift-operation".into(),
+        transcript_hash: "legacy-drift-transcript".into(),
+        invitation_id: "legacy-drift-invitation".into(),
+        workspace_ids: vec!["legacy-drift-board".into()],
+        snapshot_hash: "legacy-drift-snapshot".into(),
+        future_boards: false,
+        baseline_workspace_ids: vec!["legacy-drift-board".into()],
+        controller_person_id: Some(keeper.owner.person_id.clone()),
+    };
+
+    let staged = vec![keeper.staged_scope("legacy-drift-board")];
+    let error = keeper
+        .host
+        .activate_provisioned_scopes(staged, commit)
+        .unwrap_err();
+    assert!(error.contains("registry changed outside this activation"));
+    assert_eq!(fs::read(&keeper.config_path).unwrap(), original);
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+    assert!(
+        keeper
+            .host
+            .configuration()
+            .unwrap()
+            .additional_scopes
+            .is_empty()
+    );
+}
+
+#[test]
 fn activation_rolls_back_scope_dirs_when_config_write_never_replaces_file() {
     let keeper = TestKeeper::new();
     let commit = ProvisioningCommit {

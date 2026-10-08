@@ -1425,8 +1425,11 @@ impl KeeperHost {
             .as_ref()
             .and_then(|config| serde_json::to_value(config).ok());
         let registry_value = serde_json::to_value(&registry.config).ok();
-        let registry_matches_disk =
-            original_value == parsed_original_value && normalized_original_value == registry_value;
+        let registry_matches_disk = original_value
+            .as_ref()
+            .zip(parsed_original_value.as_ref())
+            .is_some_and(|(raw, parsed)| raw_config_matches_typed_roundtrip(raw, parsed))
+            && normalized_original_value == registry_value;
         let mut next = registry.config.clone();
         if let Some(previous) = next
             .provisioning_commits
@@ -1865,6 +1868,49 @@ fn normalize_legacy_provisioning_owners(config: &mut Config) {
                 commit.controller_person_id = Some(legacy_owner.clone());
             }
         }
+    }
+}
+
+/// Accept known optional fields added after older config files were written,
+/// while still rejecting unknown or changed raw JSON before replacing it.
+fn raw_config_matches_typed_roundtrip(raw: &Value, roundtrip: &Value) -> bool {
+    let mut normalized = roundtrip.clone();
+    normalize_missing_null_config_defaults(raw, &mut normalized);
+    raw == &normalized
+}
+
+fn normalize_missing_null_config_defaults(raw: &Value, roundtrip: &mut Value) {
+    for (parent_key, field_key) in [
+        ("initialState", "admittedDocument"),
+        ("localHandshake", "ownerWorkspaceIds"),
+    ] {
+        let raw_parent = raw.get(parent_key);
+        let roundtrip_parent = roundtrip.get_mut(parent_key);
+        if raw_parent
+            .and_then(|parent| parent.get(field_key))
+            .is_none()
+            && roundtrip_parent
+                .as_ref()
+                .and_then(|parent| parent.get(field_key))
+                == Some(&Value::Null)
+        {
+            roundtrip_parent
+                .and_then(Value::as_object_mut)
+                .expect("object path checked")
+                .remove(field_key);
+        }
+    }
+
+    let (Some(raw_scopes), Some(roundtrip_scopes)) = (
+        raw.get("additionalScopes").and_then(Value::as_array),
+        roundtrip
+            .get_mut("additionalScopes")
+            .and_then(Value::as_array_mut),
+    ) else {
+        return;
+    };
+    for (raw_scope, roundtrip_scope) in raw_scopes.iter().zip(roundtrip_scopes) {
+        normalize_missing_null_config_defaults(raw_scope, roundtrip_scope);
     }
 }
 
