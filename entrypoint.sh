@@ -1,9 +1,6 @@
 #!/bin/sh
 set -eu
 
-if [ -f /data/config.json ]; then
-  export LIGHTHOUSE_HTTP_BIND=0.0.0.0:8080
-  exec mesh-lighthouse /data/config.json
-fi
-
-exec mesh-lighthouse serve-http /data 0.0.0.0:8080
+# A legacy volume must be exported by an authorized client, never loaded by Rusty.
+# Choose a fresh mounted directory when /data contains old readable state.
+exec mesh-lighthouse "${RUSTY_STATE_DIR:-/data}" "${RUSTY_HTTP_BIND:-0.0.0.0:8080}"
