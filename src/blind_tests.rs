@@ -540,6 +540,81 @@ async fn two_http_clients_replicate_ciphertext_and_plaintext_intake_is_absent() 
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[tokio::test]
+async fn anonymous_public_board_route_serves_a_confirmed_projection() {
+    use meta_mesh_core::sign_json_envelope;
+    let directory =
+        std::env::temp_dir().join(format!("rusty-public-board-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let (identity, device_id, certificate, _) = owner_controller_fixture();
+    let trusted = TrustedOwner {
+        identity: serde_json::from_value(identity.clone()).unwrap(),
+        allowed_controller_device_ids: vec![device_id.clone()],
+    };
+    let app = router(
+        store.clone(),
+        "https://rusty.example".into(),
+        Some(trusted),
+        vec![],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let board = "public-board-fixture";
+    let projection = json!({
+        "kind":"tincanban-public-board", "version":1,
+        "board":{"id":board,"title":"Confirmed public board"},
+        "columns":[],"fields":[],"cards":[],"discussions":[],"files":[]
+    });
+    let challenge_request = json!({"version":1,"boardId":board,"identity":identity,"deviceId":device_id,"certificates":[certificate]});
+    let challenge_response = send_public_json(
+        client.post(format!("{origin}/v1/public/challenges")),
+        challenge_request,
+    )
+    .await;
+    assert_eq!(challenge_response.status(), StatusCode::OK);
+    let challenge: Value =
+        serde_json::from_slice(&challenge_response.bytes().await.unwrap()).unwrap();
+    let challenge = challenge["challenge"].clone();
+    let payload = &challenge["payload"];
+    let projection_hash = digest(canonicalize_json(&projection).unwrap().as_bytes());
+    let authorization = sign_json_envelope(&[32; 32], json!({
+        "kind":"rusty-publication-command","version":1,"challengeId":payload["challengeId"],"nonce":payload["nonce"],
+        "serviceId":payload["serviceId"],"publicOrigin":"https://rusty.example","boardId":board,"action":"publish",
+        "projectionHash":projection_hash,"expectedRevision":0,"expiresAt":payload["expiresAt"]
+    }), &device_id, "MATCH/1").unwrap();
+    let publication = json!({"challenge":challenge,"identity":identity,"deviceId":device_id,"certificates":[certificate],"action":"publish","projection":projection,"authorization":authorization});
+    let published = send_public_json(
+        client.put(format!("{origin}/v1/public/boards/{board}")),
+        publication,
+    )
+    .await;
+    assert_eq!(
+        published.status(),
+        StatusCode::OK,
+        "{}",
+        published.text().await.unwrap_or_default()
+    );
+    let response = client
+        .get(format!("{origin}/v1/public/boards/{board}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(value["projection"]["board"]["id"], board);
+    assert_eq!(
+        value["projection"]["board"]["title"],
+        "Confirmed public board"
+    );
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn legacy_plaintext_state_cannot_be_started_as_blind() {
     let directory = std::env::temp_dir().join(format!("rusty-legacy-{}", rand::random::<u64>()));
@@ -595,4 +670,206 @@ fn failed_durable_commit_cannot_issue_a_receipt_and_retry_can_recover() {
     assert_eq!(recovered.payload["sequence"], 1);
     assert_eq!(recovered.payload["requestId"], "recovered-request");
     fs::remove_dir_all(directory).unwrap();
+}
+
+// Given staged selected-board bytes and an authenticated publication controller,
+// when Rusty activates then restarts then withdraws a snapshot, anonymous readers
+// receive exact content only while its revision remains active.
+#[tokio::test]
+async fn public_assets_and_discussions_survive_restart_and_withdrawal() {
+    use meta_mesh_core::sign_json_envelope;
+    let directory =
+        std::env::temp_dir().join(format!("rusty-public-assets-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let (identity, device_id, certificate, _) = owner_controller_fixture();
+    let trusted = TrustedOwner {
+        identity: serde_json::from_value(identity.clone()).unwrap(),
+        allowed_controller_device_ids: vec![device_id.clone()],
+    };
+    let app = router(
+        store.clone(),
+        "https://rusty.example".into(),
+        Some(trusted.clone()),
+        vec![],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let certificates = vec![certificate];
+    let board = "public-board-fixture";
+    let bytes = b"independent public attachment";
+    let sha256 = digest(bytes);
+    let projection = json!({
+        "kind":"tincanban-public-board", "version":1,
+        "board":{"id":board,"title":"Public board"},
+        "columns":[],"fields":[],"cards":[],
+        "discussions":[{"id":"opaque-thread","threadId":"opaque-thread","replyTo":null,"targets":[{"type":"board","id":board}],"author":"Published author","createdAt":"2026-10-10T10:00:00Z","body":"Selected board discussion"}],
+        "files":[{"id":"opaque-file","parentId":board,"title":"Handout","fileName":"handout.txt","mediaType":"text/plain","byteLength":bytes.len(),"sha256":sha256}]
+    });
+    let challenge_request = json!({"version":1,"boardId":board,"identity":identity,"deviceId":device_id,"certificates":certificates});
+    let request_challenge = || {
+        let client = client.clone();
+        let origin = origin.clone();
+        let body = challenge_request.clone();
+        async move {
+            let response =
+                send_public_json(client.post(format!("{origin}/v1/public/challenges")), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<Value>(&response.bytes().await.unwrap()).unwrap()["challenge"]
+                .clone()
+        }
+    };
+    let stage_challenge = request_challenge().await;
+    let stage_payload = &stage_challenge["payload"];
+    let asset_authorization = sign_json_envelope(&[32; 32], json!({
+        "kind":"rusty-publication-command","version":1,"challengeId":stage_payload["challengeId"],"nonce":stage_payload["nonce"],
+        "serviceId":stage_payload["serviceId"],"publicOrigin":"https://rusty.example","boardId":board,"action":"stage-file",
+        "projectionHash":sha256,"expectedRevision":stage_payload["expectedRevision"],"expiresAt":stage_payload["expiresAt"],"byteLength":bytes.len()
+    }), &device_id, "MATCH/1").unwrap();
+    let staged_body = json!({
+        "challenge":stage_challenge,"identity":identity,"deviceId":device_id,"certificates":certificates,
+        "sha256":sha256,"byteLength":bytes.len(),"bytes":URL_SAFE_NO_PAD.encode(bytes),"authorization":asset_authorization
+    });
+    let staged = send_public_json(
+        client.put(format!("{origin}/v1/public/boards/{board}/files")),
+        staged_body,
+    )
+    .await;
+    assert_eq!(staged.status(), StatusCode::OK);
+    assert_eq!(
+        client
+            .get(format!(
+                "{origin}/v1/public/boards/{board}/files/1/{sha256}"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let publish_challenge = request_challenge().await;
+    let publish_payload = &publish_challenge["payload"];
+    let projection_hash = digest(canonicalize_json(&projection).unwrap().as_bytes());
+    let authorization = sign_json_envelope(&[32; 32], json!({
+        "kind":"rusty-publication-command","version":1,"challengeId":publish_payload["challengeId"],"nonce":publish_payload["nonce"],
+        "serviceId":publish_payload["serviceId"],"publicOrigin":"https://rusty.example","boardId":board,"action":"publish",
+        "projectionHash":projection_hash,"expectedRevision":0,"expiresAt":publish_payload["expiresAt"]
+    }), &device_id, "MATCH/1").unwrap();
+    let publish_body = json!({
+        "challenge":publish_challenge,"identity":identity,"deviceId":device_id,"certificates":certificates,"action":"publish","projection":projection,"authorization":authorization
+    });
+    let published = send_public_json(
+        client.put(format!("{origin}/v1/public/boards/{board}")),
+        publish_body,
+    )
+    .await;
+    assert_eq!(
+        published.status(),
+        StatusCode::OK,
+        "{}",
+        published.text().await.unwrap_or_default()
+    );
+    let body: Value = serde_json::from_slice(
+        &client
+            .get(format!("{origin}/v1/public/boards/{board}"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body["projection"]["discussions"][0]["body"],
+        "Selected board discussion"
+    );
+    assert_eq!(body["revision"], 1);
+    server.abort();
+    let _ = server.await;
+    drop(store);
+
+    let restarted = BlindStore::open(directory.clone()).unwrap();
+    let app = router(
+        restarted.clone(),
+        "https://rusty.example".into(),
+        Some(trusted),
+        vec![],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let download = client
+        .get(format!(
+            "{origin}/v1/public/boards/{board}/files/1/{sha256}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(download.headers()["x-content-type-options"], "nosniff");
+    assert!(
+        download.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;")
+    );
+    assert_eq!(download.bytes().await.unwrap().as_ref(), bytes);
+    let challenge_response = send_public_json(
+        client.post(format!("{origin}/v1/public/challenges")),
+        challenge_request.clone(),
+    )
+    .await;
+    let challenge_response: Value =
+        serde_json::from_slice(&challenge_response.bytes().await.unwrap()).unwrap();
+    let challenge = challenge_response["challenge"].clone();
+    let payload = &challenge["payload"];
+    let authorization = sign_json_envelope(&[32; 32], json!({
+        "kind":"rusty-publication-command","version":1,"challengeId":payload["challengeId"],"nonce":payload["nonce"],
+        "serviceId":payload["serviceId"],"publicOrigin":"https://rusty.example","boardId":board,"action":"unpublish",
+        "projectionHash":digest(b"null"),"expectedRevision":1,"expiresAt":payload["expiresAt"]
+    }), &device_id, "MATCH/1").unwrap();
+    let withdrawal = json!({"challenge":challenge,"identity":identity,"deviceId":device_id,"certificates":certificates,"action":"unpublish","projection":null,"authorization":authorization});
+    let withdrawn = send_public_json(
+        client.put(format!("{origin}/v1/public/boards/{board}")),
+        withdrawal,
+    )
+    .await;
+    assert_eq!(withdrawn.status(), StatusCode::OK);
+    assert_eq!(
+        client
+            .get(format!("{origin}/v1/public/boards/{board}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        client
+            .get(format!(
+                "{origin}/v1/public/boards/{board}/files/1/{sha256}"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    server.abort();
+    let _ = server.await;
+    drop(restarted);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+async fn send_public_json(request: reqwest::RequestBuilder, value: Value) -> reqwest::Response {
+    request
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&value).unwrap())
+        .send()
+        .await
+        .unwrap()
 }

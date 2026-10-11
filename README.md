@@ -2,6 +2,16 @@
 
 Rusty stores and serves immutable encrypted objects over HTTP. It does not load Automerge documents, receive readable invitations, participate as a board Editor, classify submissions, fetch job pages, write cards, or process email. Its service signing key authenticates durable storage receipts; it cannot decrypt stored objects or authorize application changes.
 
+Rusty also supports a separate public-board publication namespace. Authorized clients
+send a strictly validated, selected-board projection and separate public file copies
+after confirming source-board owner rights locally. Rusty verifies its configured
+controller root/device, challenge-bound signatures, expected revision and snapshot
+hash; it does not claim to inspect private workspace history. Public copies include
+selected-board/card discussions and attachments, and remain unchanged until explicit
+update or withdrawal. Configure the public frontend origin in `RUSTY_CORS_ORIGINS`
+and `VITE_PUBLIC_BOARD_ORIGIN`. Never put private storage tokens, workspace reading
+keys or user board content in service configuration.
+
 ```sh
 cargo build --release --locked
 RUSTY_TRUSTED_OWNER='{"identity":{"personId":"…","publicKey":"…","displayName":"Owner"},"allowedControllerDeviceIds":["…"]}' \
@@ -29,9 +39,28 @@ Discovery: `GET /.well-known/mesh-lighthouse`, protocol 2, mode `blind`, `applic
 - `GET /v2/scopes/{scope}/objects/{id}`: read bearer token; encrypted object JSON.
 - `GET /health`: reports blind mode.
 
+Public publication API (requires `RUSTY_TRUSTED_OWNER`; anonymous readers use only
+the GET endpoints):
+
+- `POST /v1/public/challenges`: controller identity, device certificate chain and
+  board entity ID. Returns a signed, short-lived challenge carrying the controller-
+  bound current revision/withdrawal state.
+- `PUT /v1/public/boards/{boardId}/files`: authenticated idempotent staging of one
+  bounded public file copy, with a challenge-bound SHA-256 and size. Staged files
+  remain unreadable until included in a confirmed board manifest.
+- `PUT /v1/public/boards/{boardId}`: signed publish, update or unpublish command with
+  exact projection hash and expected revision. Rusty verifies every referenced staged
+  file before durably activating the snapshot or withdrawal tombstone and signing a
+  receipt.
+- `GET /v1/public/boards/{boardId}`: anonymous no-store snapshot read. Withdrawn or
+  unknown boards return 404.
+- `GET /v1/public/boards/{boardId}/files/{revision}/{sha256}`: anonymous binary read
+  only when that exact revision remains active and references the digest. Responses
+  use safe attachment disposition and `nosniff`.
+
 Encrypted objects contain exactly `version`, `scopeId`, `keyEpoch`, `nonce`, and `ciphertext`. AES-GCM uses a random 12-byte nonce, 128-bit tag, and authenticated binding `RUSTY/2/object\0{scopeId}\0{keyEpoch}`. Server accepts at most 16 MiB ciphertext per object, 10,000 objects and approximately 1 GiB encoded storage per scope. No automatic retention/compaction exists. The browser uploads only changed snapshots, retries identical ciphertext after uncertain delivery, and polls every 15 seconds while open. No client online is required for Rusty to retain data.
 
-Files use private permissions; atomic rename, file/directory fsync precede receipts. Tokens are stored as keyed hashes. Pending enrollment challenges are persisted for replay protection and expire after 120 seconds. A filesystem lock excludes another Rusty writer on the same directory. Back up the service key, policies, challenges, and objects together. Losing the service key prevents authorization and invalidates the pinned identity. Inventory retains object metadata in memory, not all ciphertext.
+Files use private permissions; atomic rename, file/directory fsync precede receipts. Tokens are stored as keyed hashes. Pending enrollment and publication challenges are persisted for replay protection and expire after 120 seconds. A filesystem lock excludes another Rusty writer on the same directory. Public snapshots and withdrawal tombstones survive restart. Public assets are separate from blind ciphertext; active revisions alone authorize their download, and stale orphan cleanup is bounded. Back up the service key, policies, challenges, objects and publication records together. Losing the service key prevents authorization and invalidates the pinned identity. Inventory retains object metadata in memory, not all ciphertext.
 
 ## Migration
 

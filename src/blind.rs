@@ -3,6 +3,7 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
     http::{HeaderMap, StatusCode},
+    response::IntoResponse,
     routing::{get, put},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -26,6 +27,7 @@ use tower_http::cors::CorsLayer;
 
 pub const DOMAIN: &str = "RUSTY/2";
 const MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PUBLICATION_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SCOPE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SCOPE_OBJECTS: usize = 10_000;
 const ENROLLMENT_CHALLENGE_TTL_MS: u64 = 120_000;
@@ -42,6 +44,533 @@ fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+fn exact_keys(value: &Value, expected: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
+}
+fn public_string(value: &Value, max: usize) -> bool {
+    value
+        .as_str()
+        .is_some_and(|text| text.encode_utf16().count() <= max)
+}
+fn public_rank(value: &Value) -> bool {
+    let Some(rank) = value.as_str().filter(|rank| rank.len() <= 128) else {
+        return false;
+    };
+    let Some((numerator, denominator)) = rank.split_once('/') else {
+        return false;
+    };
+    if denominator.contains('/') {
+        return false;
+    }
+    let (Ok(numerator), Ok(denominator)) = (numerator.parse::<i128>(), denominator.parse::<i128>())
+    else {
+        return false;
+    };
+    if denominator <= 0 {
+        return false;
+    }
+    let mut left = numerator.unsigned_abs();
+    let mut right = denominator as u128;
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+    if numerator == 0 {
+        denominator == 1
+    } else {
+        left == 1
+    }
+}
+fn validate_public_projection(value: &Value) -> Result<(), String> {
+    if !exact_keys(
+        value,
+        &[
+            "kind",
+            "version",
+            "board",
+            "columns",
+            "fields",
+            "cards",
+            "discussions",
+            "files",
+        ],
+    ) || value["kind"] != "tincanban-public-board"
+        || value["version"] != 1
+        || !exact_keys(&value["board"], &["id", "title"])
+        || !valid_id(value["board"]["id"].as_str().unwrap_or(""))
+        || !public_string(&value["board"]["title"], 4096)
+    {
+        return Err("Invalid public projection envelope".into());
+    }
+    let columns = value["columns"]
+        .as_array()
+        .ok_or("Invalid public columns")?;
+    let fields = value["fields"].as_array().ok_or("Invalid public fields")?;
+    let cards = value["cards"].as_array().ok_or("Invalid public cards")?;
+    if columns.len() > 100 || fields.len() > 200 || cards.len() > 5000 {
+        return Err("Public projection collection limit exceeded".into());
+    }
+    let mut ids = HashSet::new();
+    ids.insert(value["board"]["id"].as_str().unwrap().to_owned());
+    let mut column_ids = HashSet::new();
+    for column in columns {
+        if !exact_keys(column, &["id", "title", "rank"])
+            || !valid_id(column["id"].as_str().unwrap_or(""))
+            || !public_string(&column["title"], 4096)
+            || !public_rank(&column["rank"])
+            || !ids.insert(column["id"].as_str().unwrap().to_owned())
+        {
+            return Err("Invalid or duplicate public column".into());
+        }
+        column_ids.insert(column["id"].as_str().unwrap().to_owned());
+    }
+    let mut field_ids = HashSet::new();
+    let mut field_definitions: HashMap<String, (String, HashSet<String>)> = HashMap::new();
+    for field in fields {
+        if !exact_keys(
+            field,
+            &["id", "title", "valueType", "required", "rank", "options"],
+        ) || !valid_id(field["id"].as_str().unwrap_or(""))
+            || !public_string(&field["title"], 4096)
+            || !public_rank(&field["rank"])
+            || !field["required"].is_boolean()
+            || !ids.insert(field["id"].as_str().unwrap().to_owned())
+        {
+            return Err("Invalid or duplicate public field".into());
+        }
+        let value_type = field["valueType"].as_str().unwrap_or("");
+        if ![
+            "text", "url", "date", "datetime", "boolean", "number", "select",
+        ]
+        .contains(&value_type)
+        {
+            return Err("Invalid public field type".into());
+        }
+        let options = field["options"]
+            .as_array()
+            .ok_or("Invalid public field options")?;
+        if options.len() > 200 || value_type != "select" && !options.is_empty() {
+            return Err("Invalid public field options".into());
+        }
+        let mut options_seen = HashSet::new();
+        for option in options {
+            if !exact_keys(option, &["id", "title", "rank"])
+                || !valid_id(option["id"].as_str().unwrap_or(""))
+                || !public_string(&option["title"], 4096)
+                || !public_rank(&option["rank"])
+                || !ids.insert(option["id"].as_str().unwrap().to_owned())
+                || !options_seen.insert(option["id"].as_str().unwrap().to_owned())
+            {
+                return Err("Invalid or duplicate public field option".into());
+            }
+        }
+        field_definitions.insert(
+            field["id"].as_str().unwrap().to_owned(),
+            (value_type.to_owned(), options_seen),
+        );
+        field_ids.insert(field["id"].as_str().unwrap().to_owned());
+    }
+    let mut cards_seen: HashMap<String, (Option<String>, String)> = HashMap::new();
+    for card in cards {
+        if !exact_keys(
+            card,
+            &[
+                "id", "parentId", "columnId", "title", "body", "values", "rank",
+            ],
+        ) || !valid_id(card["id"].as_str().unwrap_or(""))
+            || !valid_id(card["columnId"].as_str().unwrap_or(""))
+            || !column_ids.contains(card["columnId"].as_str().unwrap_or(""))
+            || !public_string(&card["title"], 4096)
+            || !public_string(&card["body"], 200_000)
+            || !public_rank(&card["rank"])
+            || !ids.insert(card["id"].as_str().unwrap().to_owned())
+        {
+            return Err("Invalid or duplicate public card".into());
+        }
+        let parent = match &card["parentId"] {
+            Value::Null => None,
+            Value::String(value) if valid_id(value) => Some(value.clone()),
+            _ => return Err("Invalid public card parent".into()),
+        };
+        let values = card["values"]
+            .as_object()
+            .ok_or("Invalid public card values")?;
+        if values.len() > field_ids.len()
+            || values.iter().any(|(key, value)| {
+                let Some((kind, options)) = field_definitions.get(key) else {
+                    return true;
+                };
+                if value.is_null() {
+                    return false;
+                }
+                match kind.as_str() {
+                    "number" => value.as_number().is_none_or(|number| {
+                        number.as_f64().is_none_or(|number| !number.is_finite())
+                    }),
+                    "boolean" => !value.is_boolean(),
+                    "select" => value
+                        .as_str()
+                        .is_none_or(|option| !options.contains(option)),
+                    _ => !value
+                        .as_str()
+                        .is_some_and(|text| text.encode_utf16().count() <= 200_000),
+                }
+            })
+        {
+            return Err("Invalid public card field values".into());
+        }
+        cards_seen.insert(
+            card["id"].as_str().unwrap().to_owned(),
+            (parent, card["columnId"].as_str().unwrap().to_owned()),
+        );
+    }
+    for (card_id, (_, column)) in &cards_seen {
+        let mut seen = HashSet::new();
+        let mut current = Some(card_id.as_str());
+        while let Some(id) = current {
+            if !seen.insert(id) {
+                return Err("Public card hierarchy contains a cycle".into());
+            }
+            current = cards_seen.get(id).and_then(|(parent, parent_column)| {
+                if parent_column != column {
+                    Some("__cross_column__")
+                } else {
+                    parent.as_deref()
+                }
+            });
+            if current == Some("__cross_column__") {
+                return Err("Public card parent is in another column".into());
+            }
+            if current.is_some_and(|id| !cards_seen.contains_key(id)) {
+                return Err("Public card parent is missing".into());
+            }
+        }
+    }
+    let discussions = value["discussions"]
+        .as_array()
+        .ok_or("Invalid public discussions")?;
+    let files = value["files"].as_array().ok_or("Invalid public files")?;
+    if discussions.len() > 2000 || files.len() > 500 {
+        return Err("Public projection collection limit exceeded".into());
+    }
+    let mut total_file_bytes = 0u64;
+    let mut discussion_ids = HashSet::new();
+    let mut discussion_threads: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for discussion in discussions {
+        if !exact_keys(
+            discussion,
+            &[
+                "id",
+                "threadId",
+                "replyTo",
+                "targets",
+                "author",
+                "createdAt",
+                "body",
+            ],
+        ) || !valid_id(discussion["id"].as_str().unwrap_or(""))
+            || !ids.insert(discussion["id"].as_str().unwrap().to_owned())
+            || !valid_id(discussion["threadId"].as_str().unwrap_or(""))
+            || !public_string(&discussion["author"], 500)
+            || !public_string(&discussion["createdAt"], 128)
+            || !public_string(&discussion["body"], 8000)
+        {
+            return Err("Invalid public discussion".into());
+        }
+        if !discussion["replyTo"].is_null()
+            && !valid_id(discussion["replyTo"].as_str().unwrap_or(""))
+        {
+            return Err("Invalid public discussion reply".into());
+        }
+        let targets = discussion["targets"]
+            .as_array()
+            .filter(|targets| !targets.is_empty() && targets.len() <= 8)
+            .ok_or("Invalid public discussion targets")?;
+        for target in targets {
+            let Some(target_type) = target["type"].as_str() else {
+                return Err("Invalid public discussion target".into());
+            };
+            let valid = match target_type {
+                "board" => {
+                    exact_keys(target, &["type", "id"]) && target["id"] == value["board"]["id"]
+                }
+                "card" => {
+                    exact_keys(target, &["type", "id"])
+                        && cards_seen.contains_key(target["id"].as_str().unwrap_or(""))
+                }
+                "field" => {
+                    exact_keys(target, &["type", "id", "cardId"])
+                        && field_ids.contains(target["id"].as_str().unwrap_or(""))
+                        && target
+                            .get("cardId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| cards_seen.contains_key(id))
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err("Public discussion target is outside this board".into());
+            }
+        }
+        discussion_ids.insert(discussion["id"].as_str().unwrap().to_owned());
+        discussion_threads.insert(
+            discussion["id"].as_str().unwrap().to_owned(),
+            (
+                discussion["threadId"].as_str().unwrap().to_owned(),
+                discussion["replyTo"].as_str().map(str::to_owned),
+            ),
+        );
+    }
+    for discussion in discussions {
+        if discussion["replyTo"]
+            .as_str()
+            .is_some_and(|id| !discussion_ids.contains(id))
+        {
+            return Err("Public discussion reply is missing".into());
+        }
+        let id = discussion["id"].as_str().unwrap();
+        let thread = discussion["threadId"].as_str().unwrap();
+        let parent = discussion["replyTo"].as_str();
+        let root = discussion_threads.get(thread);
+        if parent.is_none() && id != thread
+            || root.is_none_or(|(root_thread, root_parent)| {
+                root_thread != thread || root_parent.is_some()
+            })
+            || parent.is_some_and(|parent_id| {
+                discussion_threads
+                    .get(parent_id)
+                    .is_none_or(|(parent_thread, _)| parent_thread != thread)
+            })
+        {
+            return Err("Invalid public discussion thread structure".into());
+        }
+        let mut seen = HashSet::new();
+        let mut current = Some(id);
+        while let Some(message_id) = current {
+            if !seen.insert(message_id) {
+                return Err("Public discussion reply cycle".into());
+            }
+            current = discussion_threads
+                .get(message_id)
+                .and_then(|(_, parent_id)| parent_id.as_deref());
+        }
+    }
+    let mut file_ids = HashSet::new();
+    for file in files {
+        if !exact_keys(
+            file,
+            &[
+                "id",
+                "parentId",
+                "title",
+                "fileName",
+                "mediaType",
+                "byteLength",
+                "sha256",
+            ],
+        ) || !valid_id(file["id"].as_str().unwrap_or(""))
+            || !ids.insert(file["id"].as_str().unwrap().to_owned())
+            || !valid_id(file["parentId"].as_str().unwrap_or(""))
+            || file["parentId"] != value["board"]["id"]
+                && !cards_seen.contains_key(file["parentId"].as_str().unwrap_or(""))
+            || !public_string(&file["title"], 4096)
+            || !public_string(&file["fileName"], 512)
+            || !public_string(&file["mediaType"], 256)
+            || !file["byteLength"]
+                .as_u64()
+                .is_some_and(|size| size <= 16 * 1024 * 1024)
+            || !file["sha256"].as_str().is_some_and(|hash| {
+                hash.len() == 43
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+            || !file_ids.insert(file["id"].as_str().unwrap().to_owned())
+        {
+            return Err("Invalid public attachment manifest".into());
+        }
+        total_file_bytes = total_file_bytes
+            .checked_add(file["byteLength"].as_u64().unwrap_or(u64::MAX))
+            .ok_or("Public attachment total exceeds limit")?;
+        if total_file_bytes > 64 * 1024 * 1024 {
+            return Err("Public attachment total exceeds limit".into());
+        }
+    }
+    Ok(())
+}
+fn recover_publication_temps(directory: &Path) -> Result<(), String> {
+    let root = directory.join("publications");
+    if !root.exists() {
+        return Ok(());
+    }
+    for namespace in ["records", "challenges", "files"] {
+        let path = root.join(namespace);
+        if !path.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&path).map_err(|_| "Publication storage unavailable")? {
+            let entry = entry.map_err(|_| "Publication storage unavailable")?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or("Invalid publication state filename")?;
+            if name.strip_prefix(".pending-").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            }) {
+                if !entry
+                    .file_type()
+                    .map_err(|_| "Invalid publication state file")?
+                    .is_file()
+                {
+                    return Err("Invalid publication state file".into());
+                }
+                fs::remove_file(entry.path()).map_err(|_| "Publication recovery failed")?;
+            }
+        }
+    }
+    Ok(())
+}
+fn cleanup_orphan_public_files(directory: &Path) -> Result<(), String> {
+    let root = directory.join("publications");
+    let records = root.join("records");
+    let files = root.join("files");
+    if !records.exists() || !files.exists() {
+        return Ok(());
+    }
+    let mut active = HashSet::new();
+    for entry in fs::read_dir(records).map_err(|_| "Publication storage unavailable")? {
+        let entry = entry.map_err(|_| "Publication storage unavailable")?;
+        if !entry
+            .file_type()
+            .map_err(|_| "Invalid publication state file")?
+            .is_file()
+        {
+            continue;
+        }
+        let record: PublicPublication = serde_json::from_slice(
+            &fs::read(entry.path()).map_err(|_| "Publication storage unavailable")?,
+        )
+        .map_err(|_| "Invalid public publication")?;
+        if let Some(projection) = record.projection.filter(|_| !record.withdrawn) {
+            if let Some(manifest) = projection.get("files").and_then(Value::as_array) {
+                for file in manifest {
+                    if let Some(hash) = file.get("sha256").and_then(Value::as_str) {
+                        active.insert(hash.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for entry in fs::read_dir(&files).map_err(|_| "Publication storage unavailable")? {
+        if removed >= 32 {
+            break;
+        }
+        let entry = entry.map_err(|_| "Publication storage unavailable")?;
+        if !entry
+            .file_type()
+            .map_err(|_| "Invalid publication file")?
+            .is_file()
+        {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(hash) = file_name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".bin"))
+        else {
+            continue;
+        };
+        if active.contains(hash) {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|_| "Publication file unavailable")?;
+        if now
+            .duration_since(metadata.modified().unwrap_or(now))
+            .unwrap_or_default()
+            .as_secs()
+            < 24 * 60 * 60
+        {
+            continue;
+        }
+        fs::remove_file(entry.path()).map_err(|_| "Publication cleanup failed")?;
+        removed += 1;
+    }
+    if removed > 0 {
+        File::open(files)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+    }
+    Ok(())
+}
+fn validate_publication_namespace(directory: &Path) -> Result<(), String> {
+    let root = directory.join("publications");
+    if !root.exists() {
+        return Ok(());
+    }
+    if !fs::symlink_metadata(&root)
+        .map_err(|_| "Publication storage unavailable")?
+        .file_type()
+        .is_dir()
+    {
+        return Err("Invalid publication storage".into());
+    }
+    for entry in fs::read_dir(&root).map_err(|_| "Publication storage unavailable")? {
+        let entry = entry.map_err(|_| "Publication storage unavailable")?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or("Invalid publication storage entry")?;
+        if !["records", "challenges", "files"].contains(&name)
+            || !entry
+                .file_type()
+                .map_err(|_| "Invalid publication storage entry")?
+                .is_dir()
+        {
+            return Err("Unknown publication storage entry".into());
+        }
+        for file in fs::read_dir(entry.path()).map_err(|_| "Publication storage unavailable")? {
+            let file = file.map_err(|_| "Publication storage unavailable")?;
+            let file_name = file.file_name();
+            let file_name = file_name
+                .to_str()
+                .ok_or("Invalid publication state filename")?;
+            if let Some(suffix) = file_name.strip_prefix(".pending-") {
+                if !suffix.is_empty()
+                    && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    && file
+                        .file_type()
+                        .map_err(|_| "Invalid publication state file")?
+                        .is_file()
+                {
+                    continue;
+                }
+            }
+            let files_namespace = name == "files";
+            let valid_file = if files_namespace {
+                file_name.strip_suffix(".bin").is_some_and(|digest| {
+                    digest.len() == 43
+                        && digest
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                })
+            } else {
+                file_name.ends_with(".json") && valid_id(file_name.trim_end_matches(".json"))
+            };
+            if !file
+                .file_type()
+                .map_err(|_| "Invalid publication state file")?
+                .is_file()
+                || !valid_file
+            {
+                return Err("Unknown publication state file".into());
+            }
+        }
+    }
+    Ok(())
 }
 fn digest(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
@@ -168,6 +697,57 @@ struct PendingChallenge {
     expires_at: u64,
     envelope: SignedEnvelope<Value>,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicChallengeRequest {
+    version: u8,
+    board_id: String,
+    identity: PublicIdentity,
+    device_id: String,
+    certificates: Vec<DeviceCertificate>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingPublicChallenge {
+    board_id: String,
+    person_id: String,
+    device_id: String,
+    expires_at: u64,
+    envelope: SignedEnvelope<Value>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicMutationRequest {
+    challenge: SignedEnvelope<Value>,
+    identity: PublicIdentity,
+    device_id: String,
+    certificates: Vec<DeviceCertificate>,
+    action: String,
+    projection: Option<Value>,
+    authorization: SignedEnvelope<Value>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicAssetRequest {
+    challenge: SignedEnvelope<Value>,
+    identity: PublicIdentity,
+    device_id: String,
+    certificates: Vec<DeviceCertificate>,
+    sha256: String,
+    byte_length: u64,
+    bytes: String,
+    authorization: SignedEnvelope<Value>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicPublication {
+    board_id: String,
+    controller_person_id: String,
+    revision: u64,
+    withdrawn: bool,
+    projection: Option<Value>,
+    projection_hash: String,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredObject {
@@ -197,19 +777,29 @@ impl BlindStore {
                     .map_err(|_| "Storage directory unavailable")?
                     .file_name();
                 let name = name.to_str().ok_or("Unknown file in storage directory")?;
-                if !["service-key", "scopes", "storage.lock", "enrollment"].contains(&name)
+                if ![
+                    "service-key",
+                    "scopes",
+                    "storage.lock",
+                    "enrollment",
+                    "publications",
+                ]
+                .contains(&name)
                     && !name.starts_with(".pending-")
                 {
                     return Err("Legacy or unknown state requires client re-encryption into a fresh directory".into());
                 }
             }
-            if directory.join("scopes").exists() && !directory.join("service-key").exists() {
+            if (directory.join("scopes").exists() || directory.join("publications").exists())
+                && !directory.join("service-key").exists()
+            {
                 return Err(
                     "Existing blind storage lost its service key; restore the key before startup"
                         .into(),
                 );
             }
         }
+        validate_publication_namespace(&directory)?;
         fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
@@ -227,6 +817,7 @@ impl BlindStore {
         process_lock
             .try_lock()
             .map_err(|_| "Another Rusty process owns this storage directory")?;
+        recover_publication_temps(&directory)?;
         let seed_path = directory.join("service-key");
         let seed = if seed_path.exists() {
             fs::read(&seed_path)
@@ -249,6 +840,513 @@ impl BlindStore {
     }
     pub fn public_key(&self) -> Result<String, String> {
         public_key_from_seed(&self.seed)
+    }
+    fn publication_paths(&self, board_id: &str) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+        if !valid_id(board_id) {
+            return Err("Invalid board ID".into());
+        }
+        let root = self.directory.join("publications");
+        Ok((
+            root.join("records").join(format!("{board_id}.json")),
+            root.join("challenges"),
+            root,
+        ))
+    }
+    fn current_publication(&self, board_id: &str) -> Result<Option<PublicPublication>, String> {
+        let (record_path, _, _) = self.publication_paths(board_id)?;
+        if !record_path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(record_path).map_err(|_| "Public publication unavailable")?;
+        let record: PublicPublication =
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid public publication")?;
+        if record.board_id != board_id
+            || record.revision == 0
+            || (record.withdrawn && record.projection.is_some())
+            || (!record.withdrawn && record.projection.is_none())
+            || record.projection.as_ref().is_some_and(|value| {
+                validate_public_projection(value).is_err() || value["board"]["id"] != board_id
+            })
+        {
+            return Err("Public publication integrity failure".into());
+        }
+        if let Some(projection) = &record.projection {
+            if digest(canonicalize_json(projection)?.as_bytes()) != record.projection_hash {
+                return Err("Public publication hash mismatch".into());
+            }
+        }
+        Ok(Some(record))
+    }
+    fn publication_file(
+        &self,
+        board_id: &str,
+        revision: u64,
+        sha256: &str,
+    ) -> Result<(Vec<u8>, String, String), String> {
+        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        let record = self
+            .current_publication(board_id)?
+            .filter(|record| !record.withdrawn)
+            .ok_or("Public board unavailable")?;
+        if record.revision != revision {
+            return Err("Public file revision is no longer active".into());
+        }
+        let manifest = record
+            .projection
+            .as_ref()
+            .and_then(|projection| projection["files"].as_array())
+            .ok_or("Public file manifest unavailable")?;
+        let entry = manifest
+            .iter()
+            .find(|entry| entry["sha256"] == sha256)
+            .ok_or("Public file is not in the active manifest")?;
+        let bytes = fs::read(
+            self.directory
+                .join("publications")
+                .join("files")
+                .join(format!("{sha256}.bin")),
+        )
+        .map_err(|_| "Public file unavailable")?;
+        let size = entry["byteLength"]
+            .as_u64()
+            .ok_or("Invalid public file manifest")?;
+        if bytes.len() as u64 != size || digest(&bytes) != sha256 {
+            return Err("Public file integrity failure".into());
+        }
+        let media_type = entry["mediaType"]
+            .as_str()
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let filename = entry["fileName"]
+            .as_str()
+            .ok_or("Invalid public file name")?
+            .to_owned();
+        Ok((bytes, media_type, filename))
+    }
+    fn create_public_challenge(
+        &self,
+        board_id: &str,
+        person_id: &str,
+        device_id: &str,
+        device_key_id: &str,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        let (record_path, challenge_dir, root) = self.publication_paths(board_id)?;
+        fs::create_dir_all(&challenge_dir).map_err(|_| "Publication storage unavailable")?;
+        File::open(&root)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        File::open(root.parent().ok_or("Publication storage unavailable")?)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        let now = now_ms()?;
+        let mut pending_count = 0usize;
+        for entry in fs::read_dir(&challenge_dir).map_err(|_| "Publication storage unavailable")? {
+            let path = entry.map_err(|_| "Publication storage unavailable")?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                return Err("Invalid publication challenge state".into());
+            }
+            let pending: PendingPublicChallenge = serde_json::from_slice(
+                &fs::read(&path).map_err(|_| "Invalid publication challenge state")?,
+            )
+            .map_err(|_| "Invalid publication challenge state")?;
+            if pending.expires_at <= now {
+                fs::remove_file(path).map_err(|_| "Publication storage unavailable")?;
+            } else {
+                pending_count += 1;
+            }
+        }
+        if pending_count >= MAX_PENDING_CHALLENGES {
+            return Err("Publication challenge capacity exceeded".into());
+        }
+        let current = if record_path.exists() {
+            self.current_publication(board_id)?
+                .ok_or("Public publication unavailable")?
+        } else {
+            PublicPublication {
+                board_id: board_id.into(),
+                controller_person_id: String::new(),
+                revision: 0,
+                withdrawn: false,
+                projection: None,
+                projection_hash: digest(b"null"),
+            }
+        };
+        let revision = current.revision;
+        let issued_at = now;
+        let expires_at = issued_at
+            .checked_add(ENROLLMENT_CHALLENGE_TTL_MS)
+            .ok_or("Publication time overflow")?;
+        let challenge_id = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+        let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+        let service_id = public_key_id(&self.public_key()?)?;
+        let envelope = sign_json_envelope(
+            &self.seed,
+            json!({
+                "kind":"rusty-publication-challenge", "version":1, "challengeId":challenge_id, "nonce":nonce,
+                "serviceId":service_id, "publicOrigin":origin, "boardId":board_id, "personId":person_id,
+                "deviceId":device_id, "deviceKeyId":device_key_id, "expectedRevision":revision,
+                "issuedAt":issued_at, "expiresAt":expires_at, "withdrawn":current.withdrawn, "projectionHash":current.projection_hash
+            }),
+            service_id,
+            DOMAIN,
+        )?;
+        let pending = PendingPublicChallenge {
+            board_id: board_id.into(),
+            person_id: person_id.into(),
+            device_id: device_id.into(),
+            expires_at,
+            envelope: envelope.clone(),
+        };
+        atomic_write(
+            &challenge_dir.join(format!("{challenge_id}.json")),
+            &serde_json::to_vec(&pending).map_err(|_| "Publication challenge invalid")?,
+        )?;
+        File::open(&root)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        Ok(envelope)
+    }
+    fn stage_public_file(
+        &self,
+        board_id: &str,
+        request: PublicAssetRequest,
+        trusted_owner: &TrustedOwner,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        if !valid_id(board_id)
+            || !trusted_identity_matches(&request.identity, &trusted_owner.identity)
+            || request.certificates.is_empty()
+            || !trusted_owner
+                .allowed_controller_device_ids
+                .iter()
+                .any(|id| id == &request.device_id)
+        {
+            return Err("Untrusted publication controller or device".into());
+        }
+        if request.sha256.len() != 43
+            || !request
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || request.byte_length > 16 * 1024 * 1024
+        {
+            return Err("Invalid public asset digest or size".into());
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(&request.bytes)
+            .map_err(|_| "Invalid public asset bytes")?;
+        if bytes.len() as u64 != request.byte_length || digest(&bytes) != request.sha256 {
+            return Err("Public asset digest or size mismatch".into());
+        }
+        let device_public_key = verify_device_certificate_chain(
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+            "MATCH/1",
+        )?;
+        let device_key_id = public_key_id(&device_public_key)?;
+        let (record_path, challenge_dir, root) = self.publication_paths(board_id)?;
+        let challenge_id = request
+            .challenge
+            .payload
+            .get("challengeId")
+            .and_then(Value::as_str)
+            .filter(|id| valid_id(id))
+            .ok_or("Invalid publication challenge")?;
+        let challenge_path = challenge_dir.join(format!("{challenge_id}.json"));
+        let pending: PendingPublicChallenge = serde_json::from_slice(
+            &fs::read(&challenge_path).map_err(|_| "Publication challenge expired or consumed")?,
+        )
+        .map_err(|_| "Publication challenge invalid")?;
+        let service_id = public_key_id(&self.public_key()?)?;
+        if pending.envelope != request.challenge
+            || request.challenge.signer_key_id != service_id
+            || !verify_signed_envelope(&request.challenge, &self.public_key()?, DOMAIN)?
+            || pending.board_id != board_id
+            || pending.person_id != request.identity.person_id
+            || pending.device_id != request.device_id
+            || pending.expires_at <= now_ms()?
+        {
+            return Err("Publication challenge binding, signature, or expiry invalid".into());
+        }
+        let challenge = &request.challenge.payload;
+        let command = &request.authorization.payload;
+        if !exact_keys(
+            command,
+            &[
+                "kind",
+                "version",
+                "challengeId",
+                "nonce",
+                "serviceId",
+                "publicOrigin",
+                "boardId",
+                "action",
+                "projectionHash",
+                "expectedRevision",
+                "expiresAt",
+                "byteLength",
+            ],
+        ) || command["kind"] != "rusty-publication-command"
+            || command["version"] != 1
+            || command["challengeId"] != challenge["challengeId"]
+            || command["nonce"] != challenge["nonce"]
+            || command["serviceId"] != service_id
+            || command["publicOrigin"] != origin
+            || command["boardId"] != board_id
+            || command["action"] != "stage-file"
+            || command["projectionHash"] != request.sha256
+            || command["expectedRevision"] != challenge["expectedRevision"]
+            || command["expiresAt"] != challenge["expiresAt"]
+            || command["byteLength"].as_u64() != Some(request.byte_length)
+            || request.authorization.signer_key_id != device_key_id
+            || !verify_signed_envelope(&request.authorization, &device_public_key, "MATCH/1")?
+        {
+            return Err("Public asset command signature or binding invalid".into());
+        }
+        let current_revision = if record_path.exists() {
+            self.current_publication(board_id)?
+                .ok_or("Publication unavailable")?
+                .revision
+        } else {
+            0
+        };
+        if challenge["expectedRevision"].as_u64() != Some(current_revision) {
+            return Err("Publication revision conflict".into());
+        }
+        let files = root.join("files");
+        fs::create_dir_all(&files).map_err(|_| "Publication storage unavailable")?;
+        File::open(&root)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        File::open(root.parent().ok_or("Publication storage unavailable")?)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        let path = files.join(format!("{}.bin", request.sha256));
+        if path.exists() {
+            let existing = fs::read(&path).map_err(|_| "Staged public asset unavailable")?;
+            if existing != bytes {
+                return Err("Staged public asset digest collision".into());
+            }
+            File::open(&path)
+                .and_then(|file| {
+                    file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))?;
+                    file.sync_all()
+                })
+                .map_err(|_| "Staged public asset unavailable")?;
+        } else {
+            atomic_write(&path, &bytes)?;
+        }
+        fs::remove_file(&challenge_path).map_err(|_| "Publication challenge consume failed")?;
+        File::open(&challenge_dir)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        File::open(&root)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        let authorization_value = serde_json::to_value(&request.authorization)
+            .map_err(|_| "Publication command invalid")?;
+        let authorization_hash = digest(canonicalize_json(&authorization_value)?.as_bytes());
+        sign_json_envelope(
+            &self.seed,
+            json!({"kind":"rusty-public-asset-receipt", "version":1, "serviceId":service_id, "boardId":board_id,
+            "sha256":request.sha256,"byteLength":request.byte_length,"challengeId":challenge_id,"authorizationHash":authorization_hash}),
+            service_id,
+            DOMAIN,
+        )
+    }
+    fn mutate_publication(
+        &self,
+        board_id: &str,
+        request: PublicMutationRequest,
+        trusted_owner: &TrustedOwner,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        if !valid_id(board_id)
+            || !trusted_identity_matches(&request.identity, &trusted_owner.identity)
+            || request.certificates.is_empty()
+            || !trusted_owner
+                .allowed_controller_device_ids
+                .iter()
+                .any(|id| id == &request.device_id)
+        {
+            return Err("Untrusted publication controller or device".into());
+        }
+        let device_public_key = verify_device_certificate_chain(
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+            "MATCH/1",
+        )?;
+        let device_key_id = public_key_id(&device_public_key)?;
+        if device_key_id != request.device_id {
+            return Err("Publication controller key mismatch".into());
+        }
+        if !["publish", "update", "unpublish"].contains(&request.action.as_str()) {
+            return Err("Invalid publication action".into());
+        }
+        if request.action == "unpublish" && request.projection.is_some()
+            || request.action != "unpublish" && request.projection.is_none()
+        {
+            return Err("Publication action and projection mismatch".into());
+        }
+        let projection = request.projection;
+        let projection_hash = if let Some(value) = &projection {
+            validate_public_projection(value)?;
+            if value["board"]["id"] != board_id {
+                return Err("Publication board ID does not match route".into());
+            }
+            let bytes = canonicalize_json(value)?.into_bytes();
+            if bytes.len() > MAX_PUBLICATION_BYTES {
+                return Err("Public projection exceeds size limit".into());
+            }
+            digest(&bytes)
+        } else {
+            digest(b"null")
+        };
+        let (record_path, challenge_dir, root) = self.publication_paths(board_id)?;
+        fs::create_dir_all(root.join("records")).map_err(|_| "Publication storage unavailable")?;
+        File::open(&root)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        File::open(root.parent().ok_or("Publication storage unavailable")?)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        let challenge_id = request
+            .challenge
+            .payload
+            .get("challengeId")
+            .and_then(Value::as_str)
+            .filter(|value| valid_id(value))
+            .ok_or("Invalid publication challenge")?;
+        let challenge_path = challenge_dir.join(format!("{challenge_id}.json"));
+        let pending: PendingPublicChallenge = serde_json::from_slice(
+            &fs::read(&challenge_path).map_err(|_| "Publication challenge expired or consumed")?,
+        )
+        .map_err(|_| "Publication challenge invalid")?;
+        let service_public_key = self.public_key()?;
+        let service_id = public_key_id(&service_public_key)?;
+        if pending.envelope != request.challenge
+            || request.challenge.signer_key_id != service_id
+            || !verify_signed_envelope(&request.challenge, &service_public_key, DOMAIN)?
+            || pending.board_id != board_id
+            || pending.person_id != request.identity.person_id
+            || pending.device_id != request.device_id
+            || pending.expires_at <= now_ms()?
+        {
+            return Err("Publication challenge binding, signature, or expiry invalid".into());
+        }
+        let command = &request.authorization.payload;
+        let challenge_payload = &request.challenge.payload;
+        if !exact_keys(
+            command,
+            &[
+                "kind",
+                "version",
+                "challengeId",
+                "nonce",
+                "serviceId",
+                "publicOrigin",
+                "boardId",
+                "action",
+                "projectionHash",
+                "expectedRevision",
+                "expiresAt",
+            ],
+        ) || command.get("kind").and_then(Value::as_str) != Some("rusty-publication-command")
+            || command.get("version").and_then(Value::as_u64) != Some(1)
+            || command.get("challengeId").and_then(Value::as_str) != Some(challenge_id)
+            || command.get("nonce") != challenge_payload.get("nonce")
+            || command.get("serviceId").and_then(Value::as_str) != Some(service_id.as_str())
+            || command.get("publicOrigin").and_then(Value::as_str) != Some(origin)
+            || command.get("boardId").and_then(Value::as_str) != Some(board_id)
+            || command.get("action").and_then(Value::as_str) != Some(request.action.as_str())
+            || command.get("projectionHash").and_then(Value::as_str)
+                != Some(projection_hash.as_str())
+            || command.get("expectedRevision") != challenge_payload.get("expectedRevision")
+            || command.get("expiresAt") != challenge_payload.get("expiresAt")
+            || request.authorization.signer_key_id != device_key_id
+            || !verify_signed_envelope(&request.authorization, &device_public_key, "MATCH/1")?
+        {
+            return Err("Publication command signature or binding invalid".into());
+        }
+        let expected_revision = challenge_payload
+            .get("expectedRevision")
+            .and_then(Value::as_u64)
+            .ok_or("Invalid publication revision")?;
+        let current = self.current_publication(board_id)?;
+        let current_revision = current.as_ref().map(|record| record.revision).unwrap_or(0);
+        if current_revision != expected_revision {
+            return Err("Publication revision conflict".into());
+        }
+        if current
+            .as_ref()
+            .is_some_and(|record| record.controller_person_id != request.identity.person_id)
+        {
+            return Err("Publication controller conflict".into());
+        }
+        if expected_revision == 0 && request.action != "publish"
+            || expected_revision > 0
+                && request.action == "publish"
+                && !current.as_ref().is_some_and(|record| record.withdrawn)
+            || current.as_ref().is_some_and(|record| record.withdrawn) && request.action == "update"
+        {
+            return Err("Publication action does not match current state".into());
+        }
+        if let Some(value) = &projection {
+            for file in value["files"].as_array().ok_or("Invalid public files")? {
+                let sha256 = file["sha256"]
+                    .as_str()
+                    .ok_or("Invalid public attachment digest")?;
+                let name = file["fileName"].as_str().unwrap_or("attachment");
+                let bytes = fs::read(
+                    self.directory
+                        .join("publications")
+                        .join("files")
+                        .join(format!("{sha256}.bin")),
+                )
+                .map_err(|_| format!("Public attachment {name} has not been staged"))?;
+                if bytes.len() as u64 != file["byteLength"].as_u64().unwrap_or(u64::MAX)
+                    || digest(&bytes) != sha256
+                {
+                    return Err("Staged public attachment failed integrity validation".into());
+                }
+            }
+        }
+        let revision = expected_revision
+            .checked_add(1)
+            .ok_or("Publication revision exhausted")?;
+        let withdrawn = request.action == "unpublish";
+        let record = PublicPublication {
+            board_id: board_id.into(),
+            controller_person_id: request.identity.person_id.clone(),
+            revision,
+            withdrawn,
+            projection,
+            projection_hash: projection_hash.clone(),
+        };
+        let bytes = serde_json::to_vec(&record).map_err(|_| "Public publication invalid")?;
+        atomic_write(&record_path, &bytes)?;
+        fs::remove_file(&challenge_path).map_err(|_| "Publication challenge consume failed")?;
+        File::open(&challenge_dir)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "Publication durability failed")?;
+        let _ = cleanup_orphan_public_files(&self.directory);
+        let authorization_value = serde_json::to_value(&request.authorization)
+            .map_err(|_| "Publication command invalid")?;
+        let authorization_hash = digest(canonicalize_json(&authorization_value)?.as_bytes());
+        sign_json_envelope(
+            &self.seed,
+            json!({"kind":"rusty-publication-receipt", "version":1, "serviceId":service_id,
+            "boardId":board_id,"controllerPersonId":request.identity.person_id,"revision":revision,"action":request.action,
+            "projectionHash":projection_hash,"challengeId":challenge_id,"authorizationHash":authorization_hash,"withdrawn":withdrawn}),
+            service_id,
+            DOMAIN,
+        )
     }
     fn token_mac(&self, scope: &str, token: &str) -> Result<String, String> {
         if token.len() < 43 || token.len() > 128 || !valid_id(token) {
@@ -781,6 +1879,19 @@ pub fn router(
             "/v2/scopes/{scope}/objects/{object_id}",
             get(download).put(upload),
         )
+        .route(
+            "/v1/public/challenges",
+            axum::routing::post(public_challenge),
+        )
+        .route(
+            "/v1/public/boards/{board_id}",
+            get(public_board).put(public_mutation),
+        )
+        .route("/v1/public/boards/{board_id}/files", put(public_asset))
+        .route(
+            "/v1/public/boards/{board_id}/files/{revision}/{sha256}",
+            get(public_file),
+        )
         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES * 2))
         .layer(
             CorsLayer::new()
@@ -814,8 +1925,317 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
     Ok(Json(
         json!({"protocolVersions": [2], "publicOrigin": state.origin, "displayName": "Rusty",
         "service": {"serviceId": service_id, "publicKey": public_key},
-        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false}}),
+        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1}}}),
     ))
+}
+
+async fn public_challenge(
+    State(state): State<HttpState>,
+    Json(request): Json<PublicChallengeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if request.version != 1 || !valid_id(&request.board_id) {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Invalid publication challenge request",
+        ));
+    }
+    let owner = state.trusted_owner.as_ref().ok_or_else(|| {
+        failure(
+            StatusCode::FORBIDDEN,
+            "No publication controller configured",
+        )
+    })?;
+    if !trusted_identity_matches(&request.identity, &owner.identity)
+        || !owner
+            .allowed_controller_device_ids
+            .iter()
+            .any(|id| id == &request.device_id)
+    {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "Untrusted publication controller or device",
+        ));
+    }
+    let key = verify_device_certificate_chain(
+        &request.identity,
+        &request.device_id,
+        &request.certificates,
+        "MATCH/1",
+    )
+    .map_err(|_| {
+        failure(
+            StatusCode::FORBIDDEN,
+            "Untrusted publication controller certificate",
+        )
+    })?;
+    let device_key_id = public_key_id(&key)
+        .map_err(|_| failure(StatusCode::FORBIDDEN, "Invalid publication controller key"))?;
+    if device_key_id != request.device_id {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "Publication controller key mismatch",
+        ));
+    }
+    let challenge = tokio::task::spawn_blocking({
+        let store = state.store.clone();
+        let board_id = request.board_id;
+        let person_id = request.identity.person_id;
+        let device_id = request.device_id;
+        let origin = state.origin;
+        move || {
+            store.create_public_challenge(
+                &board_id,
+                &person_id,
+                &device_id,
+                &device_key_id,
+                &origin,
+            )
+        }
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Publication storage unavailable",
+        )
+    })?
+    .map_err(|message| {
+        failure(
+            if message.contains("capacity") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::CONFLICT
+            },
+            &message,
+        )
+    })?;
+    Ok(Json(json!({"challenge":challenge})))
+}
+
+async fn public_mutation(
+    State(state): State<HttpState>,
+    RoutePath(board_id): RoutePath<String>,
+    Json(request): Json<PublicMutationRequest>,
+) -> Result<Json<SignedEnvelope<Value>>, ApiError> {
+    let owner = state.trusted_owner.clone().ok_or_else(|| {
+        failure(
+            StatusCode::FORBIDDEN,
+            "No publication controller configured",
+        )
+    })?;
+    let origin = state.origin.clone();
+    let receipt = tokio::task::spawn_blocking(move || {
+        state
+            .store
+            .mutate_publication(&board_id, request, &owner, &origin)
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Publication storage unavailable",
+        )
+    })?
+    .map_err(|message| {
+        let status = if message.contains("expired") || message.contains("consumed") {
+            StatusCode::GONE
+        } else if message.contains("Untrusted")
+            || message.contains("signature")
+            || message.contains("binding")
+            || message.contains("key mismatch")
+        {
+            StatusCode::FORBIDDEN
+        } else if message.contains("revision conflict")
+            || message.contains("action does not match")
+            || message.contains("controller conflict")
+        {
+            StatusCode::CONFLICT
+        } else if message.contains("size limit") {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        failure(status, &message)
+    })?;
+    Ok(Json(receipt))
+}
+async fn public_asset(
+    State(state): State<HttpState>,
+    RoutePath(board_id): RoutePath<String>,
+    Json(request): Json<PublicAssetRequest>,
+) -> Result<Json<SignedEnvelope<Value>>, ApiError> {
+    let owner = state.trusted_owner.clone().ok_or_else(|| {
+        failure(
+            StatusCode::FORBIDDEN,
+            "No publication controller configured",
+        )
+    })?;
+    let origin = state.origin.clone();
+    let receipt = tokio::task::spawn_blocking(move || {
+        state
+            .store
+            .stage_public_file(&board_id, request, &owner, &origin)
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Publication storage unavailable",
+        )
+    })?
+    .map_err(|message| {
+        let status = if message.contains("expired") || message.contains("consumed") {
+            StatusCode::GONE
+        } else if message.contains("Untrusted")
+            || message.contains("signature")
+            || message.contains("binding")
+            || message.contains("key mismatch")
+        {
+            StatusCode::FORBIDDEN
+        } else if message.contains("revision conflict") {
+            StatusCode::CONFLICT
+        } else if message.contains("size") {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        failure(status, &message)
+    })?;
+    Ok(Json(receipt))
+}
+fn safe_content_disposition(filename: &str) -> String {
+    let fallback: String = filename
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || " ._-".contains(ch) {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let encoded: String = filename
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(byte) {
+                (*byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        fallback.chars().take(120).collect::<String>(),
+        encoded
+    )
+}
+async fn public_file(
+    State(state): State<HttpState>,
+    RoutePath((board_id, revision, sha256)): RoutePath<(String, u64, String)>,
+) -> axum::response::Response {
+    if !valid_id(&board_id)
+        || revision == 0
+        || sha256.len() != 43
+        || !sha256
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return public_json(
+            StatusCode::BAD_REQUEST,
+            json!({"message":"Invalid public file URL"}),
+        );
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        state.store.publication_file(&board_id, revision, &sha256)
+    })
+    .await;
+    let Ok(Ok((bytes, media_type, filename))) = result else {
+        return public_json(
+            StatusCode::NOT_FOUND,
+            json!({"message":"Public file unavailable"}),
+        );
+    };
+    let mut response = (StatusCode::OK, axum::body::Body::from(bytes)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        "no-store, max-age=0".parse().unwrap(),
+    );
+    response
+        .headers_mut()
+        .insert(axum::http::header::PRAGMA, "no-cache".parse().unwrap());
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        "nosniff".parse().unwrap(),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        media_type
+            .parse()
+            .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        safe_content_disposition(&filename)
+            .parse()
+            .unwrap_or_else(|_| "attachment".parse().unwrap()),
+    );
+    response
+}
+
+fn public_json(status: StatusCode, value: Value) -> axum::response::Response {
+    let mut response = (status, Json(value)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        "no-store, max-age=0".parse().unwrap(),
+    );
+    response
+        .headers_mut()
+        .insert(axum::http::header::PRAGMA, "no-cache".parse().unwrap());
+    response
+}
+async fn public_board(
+    State(state): State<HttpState>,
+    RoutePath(board_id): RoutePath<String>,
+) -> axum::response::Response {
+    if !valid_id(&board_id) {
+        return public_json(
+            StatusCode::BAD_REQUEST,
+            json!({"message":"Invalid board ID"}),
+        );
+    }
+    let publication = match tokio::task::spawn_blocking({
+        let store = state.store.clone();
+        let id = board_id.clone();
+        move || store.current_publication(&id)
+    })
+    .await
+    {
+        Ok(Ok(record)) => record,
+        _ => {
+            return public_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"message":"Public publication could not be validated"}),
+            );
+        }
+    };
+    let Some(record) = publication else {
+        return public_json(
+            StatusCode::NOT_FOUND,
+            json!({"message":"Public board unavailable","revision":0,"withdrawn":false}),
+        );
+    };
+    if record.withdrawn {
+        return public_json(
+            StatusCode::NOT_FOUND,
+            json!({"message":"Public board unavailable","revision":record.revision,"withdrawn":true}),
+        );
+    }
+    public_json(
+        StatusCode::OK,
+        json!({"boardId":record.board_id,"revision":record.revision,"projection":record.projection,"hash":record.projection_hash}),
+    )
 }
 async fn enrollment_challenge(
     State(state): State<HttpState>,
@@ -1043,3 +2463,7 @@ async fn download(
 #[cfg(test)]
 #[path = "blind_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "publication_security_tests.rs"]
+mod publication_security_tests;
