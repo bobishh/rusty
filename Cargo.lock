@@ -831,7 +831,7 @@ dependencies = [
 [[package]]
 name = "meta-mesh-core"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/meta-mesh.git?rev=cc4403f69b0f40d0f331c2c6ab63e090e56b8229#cc4403f69b0f40d0f331c2c6ab63e090e56b8229"
+source = "git+https://github.com/bobishh/meta-mesh.git?rev=c320cfea74432c1584960a4de6e63a4ceabb31bc#c320cfea74432c1584960a4de6e63a4ceabb31bc"
 dependencies = [
  "aes-gcm",
  "automerge",

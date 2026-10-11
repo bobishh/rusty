@@ -66,12 +66,20 @@ Files use private permissions; atomic rename, file/directory fsync precede recei
 
 Use a **fresh durable directory/volume**. Startup rejects legacy configs, inboxes, results, and unknown files without deleting them. Existing plaintext volumes are not converted or erased automatically. Keep old volumes private, export boards/inbox/results through an authorized migration process, and remove old Keeper Editor/Visitor grants in each board before retiring the old service. Do not hand old invitations or workspace content keys to new Rusty.
 
-The container invokes the same blind binary. `RUSTY_STATE_DIR` defaults to `/data`; `RUSTY_HTTP_BIND` defaults to `0.0.0.0:8080`. An old `/data` volume fails closed. Cloudflare Worker + Clef website intake, forwarded-mail correlation, and scoped automation remain a separate implementation tracked in tincanban's `blind-keeper-and-scoped-automation` OpenSpec. Old ingestion and plaintext authority modules have been removed. Existing uncommitted `keeper.rs` and `replication.rs` changes are preserved outside the module graph; they are not compiled into Rusty.
+The container invokes the same blind binary. `RUSTY_STATE_DIR` defaults to `/data`; `RUSTY_HTTP_BIND` defaults to `0.0.0.0:8080`. An old readable `/data` volume fails closed; existing blind volumes retain their service key and encrypted scopes. Cloudflare Worker + Clef website intake, forwarded-mail correlation, and scoped automation remain a separate implementation tracked in tincanban's `blind-keeper-and-scoped-automation` OpenSpec. Old ingestion and plaintext authority modules have been removed.
 
 ## Verification
 
 ```sh
 cargo test --locked
+python3 scripts/smoke_service.py target/debug/mesh-lighthouse
 ```
 
 The tests cover two HTTP clients, opaque replication, signed durable receipts, retry, restart, concurrent-writer exclusion, read/write separation, revoked storage, and refusal of plaintext state. Tincanban's `e2e/blind-keeper.spec.ts` starts the standalone debug binary with its own temporary directory/port and checks actual browser encryption, native signature verification, restart settings, and unavailable-server behavior.
+
+`main` is the canonical blind-storage and public-publication release. GitHub Actions
+checks formatting, the storage/publication protocol suite, and discovery and durable
+identity across real service-process restarts. Tincanban CI pins a commit from this
+branch and exercises its publication lifecycle with browsers. The former readable
+Keeper runtime, pairing console and application grants are superseded; merging their
+history does not reactivate them or change existing encrypted storage.
