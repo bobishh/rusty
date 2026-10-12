@@ -71,7 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .collect();
-    let store = blind::BlindStore::open(directory.into())?;
+    let max_scope_bytes = match std::env::var("RUSTY_MAX_SCOPE_BYTES") {
+        Ok(value) => value.parse::<u64>()?,
+        Err(std::env::VarError::NotPresent) => 1024 * 1024 * 1024,
+        Err(error) => return Err(error.into()),
+    };
+    let store = blind::BlindStore::open_with_scope_limit(directory.into(), max_scope_bytes)?;
     println!(
         "Rusty blind storage listening on {address}; public key {}",
         store.public_key()?

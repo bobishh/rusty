@@ -1,5 +1,55 @@
 use super::*;
 
+// Given a full scope, when its deployment quota increases and storage restarts,
+// then immutable retries and existing objects survive and new writes resume.
+#[test]
+fn configured_scope_quota_preserves_objects_and_recovers_after_increase() {
+    let directory = std::env::temp_dir().join(format!("rusty-quota-{}", rand::random::<u64>()));
+    let first = encrypted_fixture();
+    let limit = serde_json::to_vec(&first).unwrap().len() as u64 + 1024;
+    let store = BlindStore::open_with_scope_limit(directory.clone(), limit).unwrap();
+    approve_fixture(&store);
+    store
+        .save(
+            "opaque-scope",
+            &"w".repeat(43),
+            first.clone(),
+            "request-one",
+        )
+        .unwrap();
+    let mut second = first.clone();
+    second.nonce = URL_SAFE_NO_PAD.encode([3u8; 12]);
+    assert_eq!(
+        store
+            .save(
+                "opaque-scope",
+                &"w".repeat(43),
+                second.clone(),
+                "request-two"
+            )
+            .unwrap_err(),
+        "Storage capacity exceeded"
+    );
+    assert!(
+        store
+            .save("opaque-scope", &"w".repeat(43), first, "request-retry")
+            .is_ok()
+    );
+    let key = store.public_key().unwrap();
+    drop(store);
+    let store = BlindStore::open_with_scope_limit(directory.clone(), limit * 4).unwrap();
+    assert_eq!(store.public_key().unwrap(), key);
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
+    assert!(
+        store
+            .save("opaque-scope", &"w".repeat(43), second, "request-two")
+            .is_ok()
+    );
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 2);
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 // Given a new independent storage directory, when Rusty starts its blind store,
 // then it initializes without reading a legacy board config or any content key.
 #[test]

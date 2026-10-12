@@ -763,6 +763,7 @@ struct ObjectMetadata {
 
 #[derive(Clone)]
 pub struct BlindStore {
+    max_scope_bytes: u64,
     directory: Arc<PathBuf>,
     seed: [u8; 32],
     lock: Arc<Mutex<()>>,
@@ -771,6 +772,12 @@ pub struct BlindStore {
 }
 impl BlindStore {
     pub fn open(directory: PathBuf) -> Result<Self, String> {
+        Self::open_with_scope_limit(directory, MAX_SCOPE_BYTES)
+    }
+    pub fn open_with_scope_limit(directory: PathBuf, max_scope_bytes: u64) -> Result<Self, String> {
+        if max_scope_bytes == 0 {
+            return Err("Storage scope byte limit must be positive".into());
+        }
         if directory.exists() {
             for entry in fs::read_dir(&directory).map_err(|_| "Storage directory unavailable")? {
                 let name = entry
@@ -836,6 +843,7 @@ impl BlindStore {
             lock: Arc::new(Mutex::new(())),
             _process_lock: Arc::new(process_lock),
             inventories: Arc::new(Mutex::new(HashMap::new())),
+            max_scope_bytes,
         })
     }
     pub fn public_key(&self) -> Result<String, String> {
@@ -1756,7 +1764,7 @@ impl BlindStore {
                 .map_err(|e| e.to_string())?;
             let bytes = serde_json::to_vec(&object).map_err(|e| e.to_string())?;
             if objects.len() >= MAX_SCOPE_OBJECTS
-                || used.saturating_add(bytes.len() as u64 + 1024) > MAX_SCOPE_BYTES
+                || used.saturating_add(bytes.len() as u64 + 1024) > self.max_scope_bytes
             {
                 return Err("Storage capacity exceeded".into());
             }
