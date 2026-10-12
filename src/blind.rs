@@ -1905,6 +1905,7 @@ pub fn router_with_telemetry(
             "/",
             get(|| async { axum::response::Html(include_str!("service.html")) }),
         )
+        .route("/assets/{name}", get(crate::service_ui::asset))
         .route(
             "/health",
             get(|| async { Json(json!({"status": "ok", "mode": "blind"})) }),

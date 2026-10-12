@@ -1,5 +1,34 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rusty · Board storage</title>
-<link rel="stylesheet" href="https://analytics.meta-uber-engineer.dev/admin.css">
-<style>body{margin:0;background:#f4f1e8;color:#191919}header{border-bottom:1px solid;padding:1rem 2rem}main{max-width:42rem;margin:3rem auto;padding:0 1.5rem}nav{display:flex;flex-wrap:wrap;gap:1rem;margin-top:2rem}a{color:inherit}p{line-height:1.6}</style></head>
-<body><header><h1>Rusty</h1></header><main><h2>Board storage is available</h2><p>Rusty keeps encrypted copies of your boards while devices are offline.</p><p>To connect a board, open tincanban → Sync → Rusty, then enter this page's address.</p><nav><a class="button" href="https://match.meta-uber-engineer.dev">Open tincanban</a><a class="button" href="https://analytics.meta-uber-engineer.dev/admin/logs/rusty">View Rusty logs</a></nav></main></body></html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>rusty</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="/assets/rusty-head-32.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/assets/rusty-head-180.png">
+    <link rel="stylesheet" href="/assets/design-system.css">
+    <link rel="stylesheet" href="/assets/typography.css">
+  </head>
+  <body>
+    <div class="shell keeper-admin">
+      <header class="topbar">
+        <div class="brand">
+          <img class="rusty-mark" src="/assets/rusty-logo.webp" alt="Rusty" width="64" height="80">
+          <div><h1>RUSTY</h1></div>
+        </div>
+      </header>
+      <main class="admin-content">
+        <section class="keeper-card" aria-labelledby="storage-title">
+          <h2 id="storage-title">Board storage is available</h2>
+          <p>Rusty keeps encrypted copies of your boards while devices are offline.</p>
+          <p>To connect a board, open tincanban → Sync → Rusty, then enter this page's address.</p>
+          <nav class="dialog-actions" aria-label="Rusty services">
+            <a class="button" href="https://match.meta-uber-engineer.dev">Open tincanban</a>
+            <a class="button" href="https://analytics.meta-uber-engineer.dev/admin/logs/rusty">View Rusty logs</a>
+          </nav>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

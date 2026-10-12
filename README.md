@@ -90,15 +90,34 @@ does not prove distinct application data: correlate client `mesh.rusty.upload.*`
 diagnostics by opaque scope to inspect initial/change/retry decisions.
 
 The domain root serves connection instructions and a link to the protected logs.
+Its robot, header and Fira Code/Caveat typography preserve the original Rusty UI.
+Styles, fonts and artwork are embedded in the service binary and served from
+`/assets/`; rendering does not depend on TinSink being available. The asset handler
+serves an explicit embedded allowlist, never files from the storage directory.
+
+`src/ui/design-system.css` contains the unmodified, flattened tincanban design
+system from `7f546526bfcc7610f25f771a2288df3784e2abc6` (`src/styles/design-system/index.css`
+and its imports). Rusty typography, robot, favicon, font/paint files and font
+licenses come from Rusty's original UI at
+`4c0d15dc06ec5d2c0b93fc02ed91a67eb52f262e` (`frontend/src/typography.css`,
+`frontend/src/assets/rusty-logo.webp`, `frontend/public/brand/` and
+`frontend/public/assets/`). Updating these assets does not restore retired readable
+Keeper controls.
 
 ## Verification
 
 ```sh
 cargo test --locked
 python3 scripts/smoke_service.py target/debug/mesh-lighthouse
+node scripts/service-ui.mjs target/debug/mesh-lighthouse
 ```
 
 The tests cover two HTTP clients, opaque replication, signed durable receipts, retry, restart, concurrent-writer exclusion, read/write separation, revoked storage, and refusal of plaintext state. Tincanban's `e2e/blind-keeper.spec.ts` starts the standalone debug binary with its own temporary directory/port and checks actual browser encryption, native signature verification, restart settings, and unavailable-server behavior.
+
+The service UI browser check uses the adjacent tincanban checkout's installed
+Playwright. It starts an isolated Rusty process on an unused port, verifies loaded
+local fonts and the original robot/header on desktop and mobile, and exercises an
+unavailable Sink link. Screenshots are written under ignored `target/`.
 
 `main` is the canonical blind-storage and public-publication release. GitHub Actions
 checks formatting, the storage/publication protocol suite, and discovery and durable

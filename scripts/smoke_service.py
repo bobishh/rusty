@@ -41,6 +41,30 @@ def run_once(binary, directory):
                         raise AssertionError("Service readiness timed out")
                     time.sleep(0.05)
             assert health["mode"] == "blind", health
+            # Given a fresh Rusty, its original branding must be self-contained.
+            with urllib.request.urlopen(origin + "/", timeout=2) as response:
+                page = response.read().decode("utf-8")
+            assert 'class="topbar"' in page and 'class="rusty-mark"' in page, page
+            assert 'href="/assets/design-system.css"' in page, page
+            assert "https://analytics.meta-uber-engineer.dev/admin.css" not in page
+            for asset, mime in (
+                ("design-system.css", "text/css"),
+                ("typography.css", "text/css"),
+                ("rusty-logo.webp", "image/webp"),
+                ("rusty-head-32.png", "image/png"),
+                ("fira-code-latin-wght.woff2", "font/woff2"),
+                ("caveat-latin-wght.woff2", "font/woff2"),
+                ("ink-surface-0.svg", "image/svg+xml"),
+            ):
+                with urllib.request.urlopen(origin + "/assets/" + asset, timeout=2) as response:
+                    assert response.headers.get_content_type() == mime, asset
+                    assert response.headers["X-Content-Type-Options"] == "nosniff", asset
+                    assert response.read(), asset
+            try:
+                urllib.request.urlopen(origin + "/assets/service-key.json", timeout=2)
+                raise AssertionError("Unknown assets must not expose storage files")
+            except urllib.error.HTTPError as error:
+                assert error.code == 404, error
             with urllib.request.urlopen(origin + "/.well-known/mesh-lighthouse", timeout=2) as response:
                 descriptor = json.load(response)
             capabilities = descriptor["capabilities"]
