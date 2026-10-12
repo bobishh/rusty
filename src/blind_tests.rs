@@ -903,6 +903,61 @@ fn failed_durable_commit_cannot_issue_a_receipt_and_retry_can_recover() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn visible_object_retry_requires_directory_durability_before_receipt() {
+    struct ClearFailure;
+    impl Drop for ClearFailure {
+        fn drop(&mut self) {
+            FAILED_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = None);
+        }
+    }
+    let directory =
+        std::env::temp_dir().join(format!("rusty-rename-failure-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let object = encrypted_fixture();
+    let objects = directory.join("scopes/opaque-scope/objects");
+    let path = objects.join(format!("{}.json", object.id().unwrap()));
+    let _reset = ClearFailure;
+    FAILED_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(objects));
+    assert!(
+        store
+            .save(
+                "opaque-scope",
+                &"w".repeat(43),
+                object.clone(),
+                "failed-rename"
+            )
+            .is_err()
+    );
+    assert!(
+        path.is_file(),
+        "Rename happened before the directory sync failed"
+    );
+    let bytes = fs::read(&path).unwrap();
+    let modified = path.metadata().unwrap().modified().unwrap();
+    assert!(
+        store
+            .save(
+                "opaque-scope",
+                &"w".repeat(43),
+                object.clone(),
+                "failed-retry"
+            )
+            .is_err(),
+        "Visible bytes must not produce a durable receipt while directory sync still fails"
+    );
+    FAILED_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = None);
+    let receipt = store
+        .save("opaque-scope", &"w".repeat(43), object, "durable-retry")
+        .unwrap();
+    assert_eq!(receipt.payload["sequence"], 1);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(path.metadata().unwrap().modified().unwrap(), modified);
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 // Given staged selected-board bytes and an authenticated publication controller,
 // when Rusty activates then restarts then withdraws a snapshot, anonymous readers
 // receive exact content only while its revision remains active.

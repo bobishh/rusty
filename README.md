@@ -186,3 +186,8 @@ identity across real service-process restarts. Tincanban CI pins a commit from t
 branch and exercises its publication lifecycle with browsers. The former readable
 Keeper runtime, pairing console and application grants are superseded; merging their
 history does not reactivate them or change existing encrypted storage.
+
+[Blind-storage TLA+ models](formal/tla/README.md) run in CI alongside native tests.
+Duplicate upload and recovered checkpoint retries confirm directory durability
+before issuing a receipt or pruning prior objects, including after a failed rename
+commit. Object IDs, sequences and encrypted storage format remain unchanged.

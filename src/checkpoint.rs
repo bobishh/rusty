@@ -83,6 +83,9 @@ impl BlindStore {
             let scope = entry.file_name().to_string_lossy().into_owned();
             if let Some(manifest) = self.checkpoint_manifest(&scope)? {
                 self.objects(&scope)?; // Verify retained checkpoint before deleting any previous bytes.
+                sync_directory(&entry.path().join("objects"))
+                    .and_then(|_| sync_directory(&entry.path()))
+                    .map_err(|_| "Checkpoint recovery durability failed")?;
                 self.prune_checkpoint_objects(&scope, manifest.floor)?;
             }
         }
@@ -307,6 +310,9 @@ impl BlindStore {
                     .map_err(|_| "Inventory cache unavailable")?
                     .remove(scope);
                 atomic_write(&path, &encoded)?;
+            } else {
+                sync_directory(path.parent().ok_or("Invalid checkpoint path")?)
+                    .map_err(|_| "Checkpoint object durability failed")?;
             }
             self.inventories
                 .lock()
@@ -333,6 +339,12 @@ impl BlindStore {
                 .lock()
                 .map_err(|_| "Inventory cache unavailable")?
                 .remove(scope);
+        }
+        if completed {
+            let directory = self.scope_dir(scope)?;
+            sync_directory(&directory.join("objects"))
+                .and_then(|_| sync_directory(&directory))
+                .map_err(|_| "Checkpoint manifest durability failed")?;
         }
         let (freed_bytes, pruned_count) =
             self.prune_checkpoint_objects(scope, proof.expected_sequence)?;

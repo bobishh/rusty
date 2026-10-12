@@ -14,6 +14,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  formal-models:
+    name: Blind storage formal models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Install pinned TLC
+        env:
+          TLC_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+        run: |
+          jar="$RUNNER_TEMP/tla2tools-1.7.4.jar"
+          curl -fL https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar -o "$jar"
+          printf '%s  %s\n' "$TLC_SHA256" "$jar" | sha256sum --check --status
+      - name: Check models and required counterexamples
+        env:
+          TLC_JAR: ${{ runner.temp }}/tla2tools-1.7.4.jar
+        run: python3 formal/tla/run_models.py --logs "$RUNNER_TEMP/rusty-tlc"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: rusty-tlc-${{ github.sha }}
+          path: ${{ runner.temp }}/rusty-tlc/
+          if-no-files-found: ignore
+          retention-days: 7
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

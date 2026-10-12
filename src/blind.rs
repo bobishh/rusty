@@ -1802,6 +1802,10 @@ impl BlindStore {
             if stored.object != object || stored.object_id != object_id {
                 return Err("Stored object mismatch".into());
             }
+            // A failed atomic write may have renamed the file before directory
+            // fsync failed. Visibility alone cannot authorize a durable receipt.
+            sync_directory(path.parent().ok_or("Invalid object path")?)
+                .map_err(|_| "Durable storage commit failed")?;
             self.telemetry.emit(
                 Level::Debug,
                 "storage.object.reused",
@@ -1879,6 +1883,19 @@ impl BlindStore {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAILED_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAILED_DIRECTORY_SYNC.with(|failure| failure.borrow().as_deref() == Some(path)) {
+        return Err(std::io::Error::other("Injected directory sync failure"));
+    }
+    File::open(path)?.sync_all()
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("Invalid storage path")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1895,7 +1912,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        sync_directory(parent)?;
         Ok::<(), std::io::Error>(())
     })();
     if result.is_err() {

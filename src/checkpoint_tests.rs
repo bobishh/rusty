@@ -266,6 +266,69 @@ fn checkpoint_manifest_failure_retains_old_objects_and_recovers_the_same_durable
 }
 
 #[test]
+fn checkpoint_retry_confirms_visible_replacement_and_manifest_before_pruning() {
+    struct ClearFailure;
+    impl Drop for ClearFailure {
+        fn drop(&mut self) {
+            FAILED_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = None);
+        }
+    }
+    for replacement_failure in [false, true] {
+        let (directory, store, trusted, request) = checkpoint_fixture();
+        let scope = store.scope_dir("opaque-scope").unwrap();
+        let old_paths: Vec<_> = store
+            .objects("opaque-scope")
+            .unwrap()
+            .iter()
+            .map(|object| {
+                scope
+                    .join("objects")
+                    .join(format!("{}.json", object.object_id))
+            })
+            .collect();
+        let _reset = ClearFailure;
+        FAILED_DIRECTORY_SYNC.with(|failure| {
+            *failure.borrow_mut() = Some(if replacement_failure {
+                scope.join("objects")
+            } else {
+                scope
+            })
+        });
+        for _ in 0..2 {
+            assert!(
+                store
+                    .checkpoint(
+                        "opaque-scope",
+                        &"w".repeat(43),
+                        serde_json::from_value(request.clone()).unwrap(),
+                        &trusted,
+                        "https://rusty.example"
+                    )
+                    .is_err(),
+                "A visible checkpoint cannot bypass failed durability on retry"
+            );
+            assert!(
+                old_paths.iter().all(|path| path.is_file()),
+                "Unconfirmed checkpoint must retain previous objects"
+            );
+        }
+        FAILED_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = None);
+        let receipt = store
+            .checkpoint(
+                "opaque-scope",
+                &"w".repeat(43),
+                serde_json::from_value(request).unwrap(),
+                &trusted,
+                "https://rusty.example",
+            )
+            .unwrap();
+        assert_eq!(receipt.payload["sequence"], 3);
+        assert!(old_paths.iter().all(|path| !path.exists()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
 fn completed_checkpoint_retry_survives_expiry_but_never_bypasses_current_device_authority() {
     let (directory, store, trusted, mut request) = checkpoint_fixture();
     let now = now_ms().unwrap();
