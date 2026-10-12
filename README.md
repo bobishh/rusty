@@ -39,6 +39,60 @@ Discovery: `GET /.well-known/mesh-lighthouse`, protocol 2, mode `blind`, `applic
 - `GET /v2/scopes/{scope}/objects/{id}`: read bearer token; encrypted object JSON.
 - `GET /health`: reports blind mode.
 
+### Confirmed snapshot retention
+
+Discovery advertises `capabilities.snapshotCheckpoints.version: 1`. An owner
+device may replace already merged snapshots with one complete encrypted
+checkpoint. Ordinary writers, including scoped automation, retain append-only
+storage access; a write token alone cannot prune a scope.
+
+`POST /v2/scopes/{scope}/checkpoint` takes the write bearer token and
+`{object, identity, deviceId, certificates, authorization}`. The `MATCH/1`
+device-signed authorization payload contains `kind: rusty-snapshot-checkpoint`,
+`version: 1`, `serviceId`, `origin`, `scopeId`, `keyEpoch`, `policyRevision`,
+`expectedSequence`, `objectId`, `requestId`, `issuedAt`, and `expiresAt`.
+Times are epoch milliseconds; expiry may be at most 120 seconds after issuance,
+and issuance may be at most 30 seconds ahead of server time. Rusty verifies the
+configured root/controller certificate chain and the scope policy's owner.
+
+The device must first durably merge the full inventory and confirm that its raw
+Automerge history has no pending or quarantined changes, retaining all required
+authorization evidence. It encrypts the resulting full history and current chat
+state, including signed records. Chat follows tincanban's existing local retention
+policy (2000 messages / 4 MiB); this is not an archive of all historical chat.
+Ephemeral typing is excluded. Rusty remains blind and trusts the certified
+owner's checkpoint attestation rather than inspecting plaintext.
+
+Under the storage lock, `expectedSequence=N` must equal the current inventory
+frontier. A conflict returns HTTP 409 with `code: checkpoint_conflict`; the client
+must pull and admit new objects before preparing another checkpoint. Rusty fsyncs
+the new object at `N+1`, atomically fsyncs `compaction.json` with retained floor
+`N`, then removes older objects and fsyncs their directory. A bounded replacement
+object can use temporary scratch space while an old scope is full, but the
+retained object must fit the configured quota. Old objects are never deleted
+before the new checkpoint is durable.
+
+The `RUSTY/2` signed receipt has `kind: rusty-snapshot-checkpoint-receipt`,
+`version: 1`, `serviceId`, `scopeId`, `keyEpoch`, `objectId`, `sequence`,
+`supersedesThrough`, `policyRevision`, `requestId`, and `authorizationHash`.
+The hash is base64url SHA-256 of canonical JSON of the full authorization
+envelope. Exact completed retries return this receipt even after expiry, while
+still requiring current write access, policy revision and valid owner proof;
+they never prune newer writes. A durable object bearing the original checkpoint
+marker may finish its manifest after a crash while keeping every later sequence;
+it never lowers an already newer retained floor. Fresh owner proof can renew the
+same incomplete ciphertext after expiry. Clients retain ciphertext and
+authorization across uncertain delivery.
+
+Inventory retains its existing pagination fields and adds `compactedThrough`,
+`checkpointSequence` (null before the first checkpoint), `maxSequence`, and
+`objectCount`. Sequences never reset. Older clients and workers can still read
+the retained checkpoint and append later snapshots. A download that races
+pruning retries inventory on its next pass. Startup validates the manifest,
+checkpoint hash/path and contiguous retained range before completing cleanup.
+Back up the volume before rollout: an older Rusty binary cannot read a compacted
+volume because it expects object sequences to start at 1.
+
 Public publication API (requires `RUSTY_TRUSTED_OWNER`; anonymous readers use only
 the GET endpoints):
 
@@ -88,6 +142,13 @@ Headers, tokens, ciphertext and decrypted board contents are excluded.
 `storage.quota.exceeded` records the actual refused budget. Distinct ciphertext
 does not prove distinct application data: correlate client `mesh.rusty.upload.*`
 diagnostics by opaque scope to inspect initial/change/retry decisions.
+
+`storage.checkpoint.requested`, `.completed` and `.rejected` report retention
+attempts; completion includes `freed_bytes`, `pruned_count` and remaining
+`object_count`. HTTP diagnostics accept optional `X-Rusty-Client` (`tincanban` or
+`automation`) and `X-Rusty-Build` (40 or 64 hexadecimal characters) labels.
+These labels are untrusted diagnostic metadata and grant no permissions. Tokens,
+signed proofs, encrypted snapshots and readable board contents remain excluded.
 
 The domain root serves connection instructions and a link to the protected logs.
 Its robot, header and Fira Code/Caveat typography preserve the original Rusty UI.

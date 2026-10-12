@@ -51,9 +51,50 @@ async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
             .save("opaque-scope", &"w".repeat(43), next, "write-two")
             .is_err()
     );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let app = router_with_telemetry(
+        store.clone(),
+        origin.clone(),
+        None,
+        vec![],
+        store.telemetry.clone(),
+    )
+    .unwrap();
+    let native_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for (producer, build) in [
+        ("tincanban", "a".repeat(40)),
+        ("private-must-not-log", "private-must-not-log".into()),
+    ] {
+        let response = reqwest::Client::new()
+            .put(format!(
+                "{origin}/v2/scopes/opaque-scope/objects/{}",
+                object.id().unwrap()
+            ))
+            .bearer_auth("private-must-not-log")
+            .header("x-rusty-request-id", "metadata-only")
+            .header("x-rusty-client", producer)
+            .header("x-rusty-build", build)
+            .json(&object)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "Diagnostic labels cannot grant write access"
+        );
+    }
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
-            if received.lock().unwrap().len() >= 3 {
+            if received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event["event"] == "http.request.failed")
+                .count()
+                >= 2
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -62,6 +103,24 @@ async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
     .await
     .unwrap();
     let records = received.lock().unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["attrs"]["client"] == "tincanban"
+                && record["attrs"]["client_build"] == "a".repeat(40))
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"] == "http.request.failed"
+                && record["attrs"].get("client").is_none()
+                && record["attrs"].get("client_build").is_none())
+    );
+    assert!(
+        !serde_json::to_string(&*records)
+            .unwrap()
+            .contains("private-must-not-log")
+    );
     let stored = records
         .iter()
         .find(|value| value["event"] == "storage.object.stored")
@@ -90,6 +149,8 @@ async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
             .contains(&"w".repeat(43))
     );
     drop(records);
+    native_server.abort();
+    let _ = native_server.await;
     drop(store);
     server.abort();
     fs::remove_dir_all(directory).unwrap();
@@ -181,7 +242,7 @@ fn blind_store_starts_without_a_document_or_content_key() {
     assert!(result.is_ok(), "Blind store must initialize independently");
 }
 
-fn encrypted_fixture() -> BlindObject {
+pub(super) fn encrypted_fixture() -> BlindObject {
     BlindObject {
         version: 1,
         scope_id: "opaque-scope".into(),
@@ -191,7 +252,7 @@ fn encrypted_fixture() -> BlindObject {
     }
 }
 
-fn owner_controller_fixture() -> (Value, String, Value, String) {
+pub(super) fn owner_controller_fixture() -> (Value, String, Value, String) {
     use meta_mesh_core::{
         DEFAULT_SIGNATURE_DOMAIN, DeviceCertificatePayload, public_key_from_seed, public_key_id,
         sign_device_certificate,
@@ -545,7 +606,7 @@ async fn enrollment_rejects_foreign_controller_expired_nonce_and_excess_pending_
     let _ = server.await;
     fs::remove_dir_all(directory).unwrap();
 }
-fn approve_fixture(store: &BlindStore) {
+pub(super) fn approve_fixture(store: &BlindStore) {
     store
         .approve(
             "opaque-scope",

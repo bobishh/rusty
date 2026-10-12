@@ -25,6 +25,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tower_http::cors::CorsLayer;
+#[path = "checkpoint.rs"]
+mod checkpoint;
 
 pub const DOMAIN: &str = "RUSTY/2";
 const MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
@@ -755,6 +757,8 @@ struct StoredObject {
     sequence: u64,
     object_id: String,
     object: BlindObject,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<checkpoint::CheckpointMarker>,
 }
 #[derive(Clone)]
 struct ObjectMetadata {
@@ -839,7 +843,7 @@ impl BlindStore {
             seed
         };
         public_key_from_seed(&seed)?;
-        Ok(Self {
+        let store = Self {
             telemetry: Telemetry::disabled(),
             directory: Arc::new(directory),
             seed,
@@ -847,7 +851,9 @@ impl BlindStore {
             _process_lock: Arc::new(process_lock),
             inventories: Arc::new(Mutex::new(HashMap::new())),
             max_scope_bytes,
-        })
+        };
+        store.recover_checkpoint_scopes()?;
+        Ok(store)
     }
     pub fn public_key(&self) -> Result<String, String> {
         public_key_from_seed(&self.seed)
@@ -1693,6 +1699,10 @@ impl BlindStore {
             return Ok(cached.clone());
         }
         let mut objects = Vec::new();
+        let manifest = self.checkpoint_manifest(scope)?;
+        let floor = manifest.as_ref().map_or(0, |manifest| manifest.floor);
+        let mut checkpoint_found = manifest.is_none();
+        let mut scratch_sequence = None;
         for entry in fs::read_dir(self.scope_dir(scope)?.join("objects"))
             .map_err(|_| "Storage unavailable")?
         {
@@ -1702,26 +1712,55 @@ impl BlindStore {
                 .is_some_and(|extension| extension == "json")
             {
                 let value: StoredObject =
-                    serde_json::from_slice(&fs::read(path).map_err(|_| "Storage unavailable")?)
+                    serde_json::from_slice(&fs::read(&path).map_err(|_| "Storage unavailable")?)
                         .map_err(|_| "Invalid stored object")?;
                 value.object.validate(scope)?;
-                if value.object.id()? != value.object_id {
+                if value.object.id()? != value.object_id
+                    || path.file_name().and_then(|name| name.to_str())
+                        != Some(format!("{}.json", value.object_id).as_str())
+                {
                     return Err("Stored object integrity failure".into());
+                }
+                if value.sequence <= floor {
+                    continue;
+                }
+                if let Some(marker) = &value.checkpoint {
+                    if !marker.valid_for(value.sequence) {
+                        return Err("Checkpoint marker integrity failure".into());
+                    }
+                    scratch_sequence = Some(
+                        scratch_sequence
+                            .map_or(value.sequence, |previous: u64| previous.max(value.sequence)),
+                    );
+                }
+                if let Some(manifest) = &manifest {
+                    if value.sequence == manifest.sequence {
+                        if !manifest.matches(&value) {
+                            return Err("Checkpoint object integrity failure".into());
+                        }
+                        checkpoint_found = true;
+                    }
                 }
                 objects.push(ObjectMetadata {
                     sequence: value.sequence,
                     object_id: value.object_id,
                 });
-                if objects.len() > MAX_SCOPE_OBJECTS {
+                if objects.len() > MAX_SCOPE_OBJECTS + 1 {
                     return Err("Storage object capacity exceeded".into());
                 }
             }
         }
         objects.sort_by_key(|value| value.sequence);
-        if objects
-            .iter()
-            .enumerate()
-            .any(|(index, value)| value.sequence != (index as u64 + 1))
+        if objects.len() > MAX_SCOPE_OBJECTS
+            && scratch_sequence != objects.last().map(|object| object.sequence)
+        {
+            return Err("Storage object capacity exceeded".into());
+        }
+        if !checkpoint_found
+            || objects
+                .iter()
+                .enumerate()
+                .any(|(index, value)| floor.checked_add(index as u64 + 1) != Some(value.sequence))
         {
             return Err("Stored object sequence integrity failure".into());
         }
@@ -1752,7 +1791,11 @@ impl BlindStore {
             .scope_dir(scope)?
             .join("objects")
             .join(format!("{object_id}.json"));
-        let sequence = if path.exists() {
+        let sequence = if self
+            .objects(scope)?
+            .iter()
+            .any(|entry| entry.object_id == object_id)
+        {
             let stored: StoredObject =
                 serde_json::from_slice(&fs::read(&path).map_err(|_| "Storage unavailable")?)
                     .map_err(|_| "Invalid stored object")?;
@@ -1796,6 +1839,7 @@ impl BlindStore {
                 sequence,
                 object_id: object_id.clone(),
                 object: object.clone(),
+                checkpoint: None,
             };
             if let Err(error) = atomic_write(
                 &path,
@@ -1916,6 +1960,10 @@ pub fn router_with_telemetry(
             axum::routing::post(enrollment_challenge),
         )
         .route("/v2/scopes/{scope}", put(approve_scope))
+        .route(
+            "/v2/scopes/{scope}/checkpoint",
+            axum::routing::post(checkpoint::checkpoint),
+        )
         .route("/v2/scopes/{scope}/objects", get(inventory))
         .route(
             "/v2/scopes/{scope}/objects/{object_id}",
@@ -1947,6 +1995,8 @@ pub fn router_with_telemetry(
                     axum::http::header::AUTHORIZATION,
                     axum::http::header::CONTENT_TYPE,
                     axum::http::HeaderName::from_static("x-rusty-request-id"),
+                    axum::http::HeaderName::from_static("x-rusty-client"),
+                    axum::http::HeaderName::from_static("x-rusty-build"),
                 ]),
         )
         .layer(axum::middleware::from_fn_with_state(
@@ -1980,6 +2030,8 @@ async fn observe_request(
         } else {
             "inventory"
         }
+    } else if segments.get(4) == Some(&"checkpoint") {
+        "checkpoint"
     } else if segments.get(2) == Some(&"enrollment") {
         "enroll"
     } else {
@@ -1991,13 +2043,27 @@ async fn observe_request(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    let client = request
+        .headers()
+        .get("x-rusty-client")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| matches!(*value, "tincanban" | "automation"))
+        .map(str::to_owned);
+    let client_build = request
+        .headers()
+        .get("x-rusty-build")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(str::to_owned);
     let response = next.run(request).await;
     let status = response.status();
     let level = if status.is_server_error() {
         Level::Error
     } else if status.is_client_error() {
         Level::Warn
-    } else if operation == "upload" || operation == "enroll" {
+    } else if operation == "upload" || operation == "enroll" || operation == "checkpoint" {
         Level::Info
     } else if operation == "inventory" || operation == "download" {
         Level::Debug
@@ -2005,6 +2071,12 @@ async fn observe_request(
         Level::Trace
     };
     let mut attrs = json!({"bytes": bytes});
+    if let Some(client) = client {
+        attrs["client"] = json!(client);
+    }
+    if let Some(build) = client_build {
+        attrs["client_build"] = json!(build);
+    }
     if !status.is_success() {
         attrs["error_code"] = json!(format!("http_{}", status.as_u16()));
     }
@@ -2039,7 +2111,7 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
     Ok(Json(
         json!({"protocolVersions": [2], "publicOrigin": state.origin, "displayName": "Rusty",
         "service": {"serviceId": service_id, "publicKey": public_key},
-        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1}}}),
+        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1},"snapshotCheckpoints":{"version":1}}}),
     ))
 }
 
@@ -2534,7 +2606,10 @@ async fn inventory(
         let objects = state.store.objects(&scope)?;
         let page = objects.iter().filter(|o| o.sequence > query.after).take(128).map(|o| json!({"objectId": o.object_id, "sequence": o.sequence})).collect::<Vec<_>>();
         let cursor = page.last().and_then(|o| o["sequence"].as_u64()).unwrap_or(query.after);
-        Ok::<Value, String>(json!({"objects": page, "cursor": cursor, "hasMore": objects.last().is_some_and(|o| o.sequence > cursor)}))
+        let manifest = state.store.checkpoint_manifest(&scope)?;
+        Ok::<Value, String>(json!({"objects": page, "cursor": cursor, "hasMore": objects.last().is_some_and(|o| o.sequence > cursor),
+            "compactedThrough":manifest.as_ref().map_or(0,|value|value.floor),"checkpointSequence":manifest.as_ref().map(|value|value.sequence),
+            "maxSequence":objects.last().map_or(0,|value|value.sequence),"objectCount":objects.len()}))
     }).await.map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "Storage unavailable"))?.map_err(|message| failure(StatusCode::FORBIDDEN, &message))?;
     Ok(Json(result))
 }
@@ -2563,6 +2638,13 @@ async fn download(
             serde_json::from_slice(&fs::read(path).map_err(|_| "Object unavailable")?)
                 .map_err(|_| "Invalid stored object")?;
         stored.object.validate(&scope)?;
+        if state
+            .store
+            .checkpoint_manifest(&scope)?
+            .is_some_and(|manifest| stored.sequence <= manifest.floor)
+        {
+            return Err("Object unavailable after checkpoint".into());
+        }
         if stored.object_id != object_id || stored.object.id()? != object_id {
             return Err("Object integrity failure".into());
         }
@@ -2574,6 +2656,9 @@ async fn download(
     Ok(Json(object))
 }
 
+#[cfg(test)]
+#[path = "checkpoint_tests.rs"]
+mod checkpoint_tests;
 #[cfg(test)]
 #[path = "blind_tests.rs"]
 mod tests;
