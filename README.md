@@ -68,6 +68,29 @@ Use a **fresh durable directory/volume**. Startup rejects legacy configs, inboxe
 
 The container invokes the same blind binary. `RUSTY_STATE_DIR` defaults to `/data`; `RUSTY_HTTP_BIND` defaults to `0.0.0.0:8080`. An old readable `/data` volume fails closed; existing blind volumes retain their service key and encrypted scopes. Cloudflare Worker + Clef website intake, forwarded-mail correlation, and scoped automation remain a separate implementation tracked in tincanban's `blind-keeper-and-scoped-automation` OpenSpec. Old ingestion and plaintext authority modules have been removed.
 
+## Diagnostics
+
+`RUSTY_LOG` selects `off`, `error`, `warn`, `info` (default), `debug` or `trace`.
+Errors include quota exhaustion and failed requests; info records confirmed new
+objects and startup; debug adds immutable retries, inventory and downloads;
+trace adds routine service requests. Records always go to stderr at the selected
+level. Configure `RUSTY_TELEMETRY_URL`, `RUSTY_TELEMETRY_TOKEN` and optional
+`RUSTY_TELEMETRY_PROJECT` (default `rusty`) to send a copy to TinSink's v2 intake.
+The token is a server write key, stored only in private deployment configuration.
+
+Delivery uses a bounded 256-event queue and 25-event batches, a two-second
+request timeout and at most three attempts with stable event IDs. Sink failures
+never block storage; queue overflow and final delivery failure remain in stderr.
+Headers, tokens, ciphertext and decrypted board contents are excluded.
+`storage.object.stored` reports `stored_bytes_before`, `stored_bytes`,
+`object_count`, `scope_limit_bytes` and encoded object `bytes`.
+`storage.object.reused` identifies unchanged immutable retries;
+`storage.quota.exceeded` records the actual refused budget. Distinct ciphertext
+does not prove distinct application data: correlate client `mesh.rusty.upload.*`
+diagnostics by opaque scope to inspect initial/change/retry decisions.
+
+The domain root serves connection instructions and a link to the protected logs.
+
 ## Verification
 
 ```sh

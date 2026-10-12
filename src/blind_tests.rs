@@ -1,5 +1,125 @@
 use super::*;
 
+// Given durable writes and a duplicate retry, telemetry reports actual disk growth
+// and quota refusal, while ciphertext and bearer credentials remain absent.
+#[tokio::test]
+async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
+    let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let records = received.clone();
+    let sink = Router::new().route(
+        "/events",
+        axum::routing::post(move |Json(body): Json<Value>| {
+            let records = records.clone();
+            async move {
+                records
+                    .lock()
+                    .unwrap()
+                    .extend(body["events"].as_array().unwrap().iter().cloned());
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/events", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, sink).await.unwrap() });
+    let telemetry = Telemetry::start(
+        crate::telemetry::Config::new(
+            "debug",
+            Some(endpoint),
+            Some("test-private-key".into()),
+            "rusty".into(),
+        )
+        .unwrap(),
+    );
+    let directory = std::env::temp_dir().join(format!("rusty-growth-{}", rand::random::<u64>()));
+    let object = encrypted_fixture();
+    let limit = serde_json::to_vec(&object).unwrap().len() as u64 + 1024;
+    let store = BlindStore::open_with_scope_limit(directory.clone(), limit)
+        .unwrap()
+        .with_telemetry(telemetry);
+    approve_fixture(&store);
+    store
+        .save("opaque-scope", &"w".repeat(43), object.clone(), "write-one")
+        .unwrap();
+    store
+        .save("opaque-scope", &"w".repeat(43), object.clone(), "retry-one")
+        .unwrap();
+    let mut next = object.clone();
+    next.nonce = URL_SAFE_NO_PAD.encode([3; 12]);
+    assert!(
+        store
+            .save("opaque-scope", &"w".repeat(43), next, "write-two")
+            .is_err()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if received.lock().unwrap().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let records = received.lock().unwrap();
+    let stored = records
+        .iter()
+        .find(|value| value["event"] == "storage.object.stored")
+        .unwrap();
+    assert_eq!(stored["attrs"]["stored_bytes_before"], 0);
+    assert!(stored["attrs"]["stored_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(stored["attrs"]["object_count"], 1);
+    assert!(
+        records
+            .iter()
+            .any(|value| value["event"] == "storage.object.reused")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|value| value["event"] == "storage.quota.exceeded")
+    );
+    assert!(
+        !serde_json::to_string(&*records)
+            .unwrap()
+            .contains(&object.ciphertext)
+    );
+    assert!(
+        !serde_json::to_string(&*records)
+            .unwrap()
+            .contains(&"w".repeat(43))
+    );
+    drop(records);
+    drop(store);
+    server.abort();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn service_root_opens_connection_instructions_without_exposing_storage() {
+    let directory = std::env::temp_dir().join(format!("rusty-root-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let app = router(store, "https://rusty.example".into(), None, vec![]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let response = reqwest::get(format!("{origin}/")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("Board storage is available"));
+    assert!(html.contains("View Rusty logs"));
+    assert_eq!(
+        reqwest::get(format!("{origin}/unknown"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    server.abort();
+    let _ = server.await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
 // Given a full scope, when its deployment quota increases and storage restarts,
 // then immutable retries and existing objects survive and new writes resume.
 #[test]

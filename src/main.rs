@@ -1,5 +1,6 @@
 //! Rusty is a blind storage peer. Application execution lives outside this binary.
 use match_lighthouse::blind;
+use match_lighthouse::telemetry::{Config as TelemetryConfig, Level, Telemetry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -76,12 +77,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(std::env::VarError::NotPresent) => 1024 * 1024 * 1024,
         Err(error) => return Err(error.into()),
     };
-    let store = blind::BlindStore::open_with_scope_limit(directory.into(), max_scope_bytes)?;
+    let telemetry = Telemetry::start(TelemetryConfig::from_env()?);
+    let store = blind::BlindStore::open_with_scope_limit(directory.into(), max_scope_bytes)?
+        .with_telemetry(telemetry.clone());
     println!(
         "Rusty blind storage listening on {address}; public key {}",
         store.public_key()?
     );
-    let app = blind::router(store, origin, trusted_owner, origins)?;
+    telemetry.emit(
+        Level::Info,
+        "service.started",
+        "start",
+        "ok",
+        "",
+        0.0,
+        serde_json::json!({"scope_limit_bytes": max_scope_bytes}),
+    );
+    let app = blind::router_with_telemetry(store, origin, trusted_owner, origins, telemetry)?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

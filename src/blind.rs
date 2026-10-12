@@ -1,4 +1,5 @@
 //! Durable opaque object replication. This module never loads application documents.
+use crate::telemetry::{Level, Telemetry};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
@@ -763,6 +764,7 @@ struct ObjectMetadata {
 
 #[derive(Clone)]
 pub struct BlindStore {
+    telemetry: Telemetry,
     max_scope_bytes: u64,
     directory: Arc<PathBuf>,
     seed: [u8; 32],
@@ -838,6 +840,7 @@ impl BlindStore {
         };
         public_key_from_seed(&seed)?;
         Ok(Self {
+            telemetry: Telemetry::disabled(),
             directory: Arc::new(directory),
             seed,
             lock: Arc::new(Mutex::new(())),
@@ -848,6 +851,10 @@ impl BlindStore {
     }
     pub fn public_key(&self) -> Result<String, String> {
         public_key_from_seed(&self.seed)
+    }
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
     }
     fn publication_paths(&self, board_id: &str) -> Result<(PathBuf, PathBuf, PathBuf), String> {
         if !valid_id(board_id) {
@@ -1752,6 +1759,15 @@ impl BlindStore {
             if stored.object != object || stored.object_id != object_id {
                 return Err("Stored object mismatch".into());
             }
+            self.telemetry.emit(
+                Level::Debug,
+                "storage.object.reused",
+                "upload",
+                "ok",
+                scope,
+                0.0,
+                json!({"bytes": path.metadata().map_or(0, |value| value.len())}),
+            );
             stored.sequence
         } else {
             let objects = self.objects(scope)?;
@@ -1766,6 +1782,8 @@ impl BlindStore {
             if objects.len() >= MAX_SCOPE_OBJECTS
                 || used.saturating_add(bytes.len() as u64 + 1024) > self.max_scope_bytes
             {
+                self.telemetry.emit(Level::Error, "storage.quota.exceeded", "upload", "error", scope, 0.0,
+                    json!({"stored_bytes": used, "object_count": objects.len(), "scope_limit_bytes": self.max_scope_bytes, "bytes": bytes.len(), "error_code": "capacity_exceeded"}));
                 return Err("Storage capacity exceeded".into());
             }
             let sequence = objects.last().map_or(Ok(1), |value| {
@@ -1800,6 +1818,8 @@ impl BlindStore {
                     object_id: object_id.clone(),
                 });
             }
+            self.telemetry.emit(Level::Info, "storage.object.stored", "upload", "ok", scope, 0.0,
+                json!({"bytes": bytes.len(), "stored_bytes_before": used, "stored_bytes": used.saturating_add(path.metadata().map_or(0, |value| value.len())), "object_count": objects.len() + 1, "scope_limit_bytes": self.max_scope_bytes}));
             sequence
         };
         let public_key = self.public_key()?;
@@ -1861,6 +1881,15 @@ pub fn router(
     trusted_owner: Option<TrustedOwner>,
     origins: Vec<String>,
 ) -> Result<Router, String> {
+    router_with_telemetry(store, origin, trusted_owner, origins, Telemetry::disabled())
+}
+pub fn router_with_telemetry(
+    store: BlindStore,
+    origin: String,
+    trusted_owner: Option<TrustedOwner>,
+    origins: Vec<String>,
+    telemetry: Telemetry,
+) -> Result<Router, String> {
     let cors_origins = origins
         .iter()
         .map(|value| value.parse())
@@ -1872,6 +1901,10 @@ pub fn router(
         origin,
     };
     Ok(Router::new()
+        .route(
+            "/",
+            get(|| async { axum::response::Html(include_str!("service.html")) }),
+        )
         .route(
             "/health",
             get(|| async { Json(json!({"status": "ok", "mode": "blind"})) }),
@@ -1915,7 +1948,79 @@ pub fn router(
                     axum::http::HeaderName::from_static("x-rusty-request-id"),
                 ]),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            telemetry,
+            observe_request,
+        ))
         .with_state(state))
+}
+async fn observe_request(
+    State(telemetry): State<Telemetry>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let started = std::time::Instant::now();
+    let segments: Vec<_> = request.uri().path().split('/').collect();
+    let scope = if segments.get(1) == Some(&"v2") && segments.get(2) == Some(&"scopes") {
+        segments
+            .get(3)
+            .filter(|scope| valid_id(scope))
+            .copied()
+            .unwrap_or("")
+    } else {
+        ""
+    }
+    .to_owned();
+    let operation = if segments.get(2) == Some(&"scopes") && segments.get(4) == Some(&"objects") {
+        if request.method() == axum::http::Method::PUT {
+            "upload"
+        } else if segments.len() > 5 {
+            "download"
+        } else {
+            "inventory"
+        }
+    } else if segments.get(2) == Some(&"enrollment") {
+        "enroll"
+    } else {
+        "request"
+    };
+    let bytes = request
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let response = next.run(request).await;
+    let status = response.status();
+    let level = if status.is_server_error() {
+        Level::Error
+    } else if status.is_client_error() {
+        Level::Warn
+    } else if operation == "upload" || operation == "enroll" {
+        Level::Info
+    } else if operation == "inventory" || operation == "download" {
+        Level::Debug
+    } else {
+        Level::Trace
+    };
+    let mut attrs = json!({"bytes": bytes});
+    if !status.is_success() {
+        attrs["error_code"] = json!(format!("http_{}", status.as_u16()));
+    }
+    telemetry.emit(
+        level,
+        if status.is_client_error() || status.is_server_error() {
+            "http.request.failed"
+        } else {
+            "http.request.completed"
+        },
+        operation,
+        if status.is_success() { "ok" } else { "error" },
+        &scope,
+        started.elapsed().as_secs_f64() * 1000.0,
+        attrs,
+    );
+    response
 }
 async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiError> {
     let public_key = state.store.public_key().map_err(|_| {
