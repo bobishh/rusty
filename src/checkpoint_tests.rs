@@ -23,6 +23,7 @@ fn checkpoint_fixture() -> (PathBuf, BlindStore, TrustedOwner, Value) {
     }
     let mut object = encrypted_fixture();
     object.nonce = URL_SAFE_NO_PAD.encode([4u8; 12]);
+    let issued_at = now_ms().unwrap();
     let issued = now_ms().unwrap();
     let proof = sign_json_envelope(&[32;32], json!({"kind":"rusty-snapshot-checkpoint","version":1,
         "serviceId":public_key_id(&store.public_key().unwrap()).unwrap(),"origin":"https://rusty.example",
@@ -626,7 +627,7 @@ async fn owner_checkpoint_prunes_confirmed_frontier_retries_and_preserves_concur
     let payload = json!({"kind":"rusty-snapshot-checkpoint","version":1,
         "serviceId":public_key_id(&service_key).unwrap(), "origin":origin, "scopeId":"opaque-scope",
         "keyEpoch":1,"policyRevision":1,"expectedSequence":2,"objectId":object.id().unwrap(),
-        "requestId":"checkpoint-one","issuedAt":now_ms().unwrap(),"expiresAt":now_ms().unwrap()+120_000});
+        "requestId":"checkpoint-one","issuedAt":issued_at,"expiresAt":issued_at+120_000});
     let authorization = sign_json_envelope(&[32; 32], payload, &device_id, "MATCH/1").unwrap();
     let request = json!({"object":object,"identity":identity,"deviceId":device_id,
         "certificates":[certificate],"authorization":authorization});
