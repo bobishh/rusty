@@ -159,9 +159,12 @@ impl BlindStore {
         if !trusted_identity_matches(&request.identity, &trusted.identity)
             || policy.owner_person_id.as_deref() != Some(request.identity.person_id.as_str())
             || request.certificates.is_empty()
-            || !trusted
-                .allowed_controller_device_ids
-                .contains(&request.device_id)
+            || !trusted_controller_device(
+                trusted,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+            )
         {
             return Err("Untrusted checkpoint owner or device".into());
         }

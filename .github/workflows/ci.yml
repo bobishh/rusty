@@ -59,3 +59,22 @@ jobs:
         run: cargo build --locked --bin mesh-lighthouse
       - name: Verify real process discovery and restart
         run: python3 scripts/smoke_service.py target/debug/mesh-lighthouse
+
+  publish-container:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [verify, formal-models]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Authenticate container registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build verified service revision
+        run: docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/bobishh/rusty" --tag "ghcr.io/bobishh/mesh-lighthouse:$GITHUB_SHA" .
+      - name: Publish immutable service image
+        run: docker push "ghcr.io/bobishh/mesh-lighthouse:$GITHUB_SHA"

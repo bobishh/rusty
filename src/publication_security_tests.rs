@@ -4,6 +4,100 @@ use meta_mesh_core::{DeviceCertificatePayload, sign_device_certificate};
 const ORIGIN: &str = "https://rusty.example";
 const BOARD: &str = "selected-public-board";
 
+#[test]
+fn given_enrolled_device_when_publishing_then_trusted_controller_delegation_is_accepted() {
+    let fixture = Fixture::new();
+    let public_key = public_key_from_seed(&[63; 32]).unwrap();
+    let device_id = public_key_id(&public_key).unwrap();
+    let certificate = sign_device_certificate(
+        &[62; 32],
+        DeviceCertificatePayload {
+            kind: "device-certificate".into(),
+            version: 1,
+            person_id: fixture.owner.identity.person_id.clone(),
+            device_id: device_id.clone(),
+            device_public_key: public_key,
+            issuer_certificate_hash: Some(
+                meta_mesh_core::certificate_hash(&fixture.certificate).unwrap(),
+            ),
+            can_enroll_devices: true,
+        },
+        &fixture.device_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let challenge = fixture
+        .store
+        .create_public_challenge(
+            BOARD,
+            &fixture.owner.identity.person_id,
+            &device_id,
+            &device_id,
+            ORIGIN,
+        )
+        .unwrap();
+    let mut request = fixture.request("publish", Some(projection()), challenge);
+    request["deviceId"] = json!(device_id);
+    request["certificates"] = json!([certificate, fixture.certificate]);
+    request["authorization"] = serde_json::to_value(
+        sign_json_envelope(
+            &[63; 32],
+            request["authorization"]["payload"].clone(),
+            &device_id,
+            "MATCH/1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(fixture.mutate(request).is_ok());
+}
+
+#[test]
+fn given_unlisted_root_device_when_trusted_certificate_is_appended_then_publication_stays_denied() {
+    let fixture = Fixture::new();
+    let public_key = public_key_from_seed(&[63; 32]).unwrap();
+    let device_id = public_key_id(&public_key).unwrap();
+    let certificate = sign_device_certificate(
+        &[61; 32],
+        DeviceCertificatePayload {
+            kind: "device-certificate".into(),
+            version: 1,
+            person_id: fixture.owner.identity.person_id.clone(),
+            device_id: device_id.clone(),
+            device_public_key: public_key,
+            issuer_certificate_hash: None,
+            can_enroll_devices: true,
+        },
+        &fixture.owner.identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let challenge = fixture
+        .store
+        .create_public_challenge(
+            BOARD,
+            &fixture.owner.identity.person_id,
+            &device_id,
+            &device_id,
+            ORIGIN,
+        )
+        .unwrap();
+    let mut request = fixture.request("publish", Some(projection()), challenge);
+    request["deviceId"] = json!(device_id);
+    request["certificates"] = json!([certificate, fixture.certificate]);
+    request["authorization"] = serde_json::to_value(
+        sign_json_envelope(
+            &[63; 32],
+            request["authorization"]["payload"].clone(),
+            &device_id,
+            "MATCH/1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(fixture.mutate(request).is_err());
+}
+
 struct Fixture {
     directory: PathBuf,
     store: BlindStore,

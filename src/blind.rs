@@ -588,6 +588,42 @@ fn trusted_identity_matches(identity: &PublicIdentity, trusted: &PublicIdentity)
     identity.person_id == trusted.person_id && identity.public_key == trusted.public_key
 }
 
+// A confirmed device enrollment delegates from a pinned controller. An unrelated
+// root-signed device, or an appended certificate outside that chain, does not.
+fn trusted_controller_device(
+    owner: &TrustedOwner,
+    identity: &PublicIdentity,
+    device_id: &str,
+    certificates: &[DeviceCertificate],
+) -> bool {
+    if !trusted_identity_matches(identity, &owner.identity)
+        || verify_device_certificate_chain(identity, device_id, certificates, "MATCH/1").is_err()
+    {
+        return false;
+    }
+    let mut current = certificates
+        .iter()
+        .find(|certificate| certificate.payload.device_id == device_id);
+    for _ in 0..32 {
+        let Some(certificate) = current else {
+            return false;
+        };
+        if owner
+            .allowed_controller_device_ids
+            .contains(&certificate.payload.device_id)
+        {
+            return true;
+        }
+        let Some(issuer_hash) = certificate.payload.issuer_certificate_hash.as_ref() else {
+            return false;
+        };
+        current = certificates.iter().find(|candidate| {
+            meta_mesh_core::certificate_hash(candidate).as_ref() == Ok(issuer_hash)
+        });
+    }
+    false
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BlindObject {
@@ -1040,10 +1076,12 @@ impl BlindStore {
         if !valid_id(board_id)
             || !trusted_identity_matches(&request.identity, &trusted_owner.identity)
             || request.certificates.is_empty()
-            || !trusted_owner
-                .allowed_controller_device_ids
-                .iter()
-                .any(|id| id == &request.device_id)
+            || !trusted_controller_device(
+                trusted_owner,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+            )
         {
             return Err("Untrusted publication controller or device".into());
         }
@@ -1190,10 +1228,12 @@ impl BlindStore {
         if !valid_id(board_id)
             || !trusted_identity_matches(&request.identity, &trusted_owner.identity)
             || request.certificates.is_empty()
-            || !trusted_owner
-                .allowed_controller_device_ids
-                .iter()
-                .any(|id| id == &request.device_id)
+            || !trusted_controller_device(
+                trusted_owner,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+            )
         {
             return Err("Untrusted publication controller or device".into());
         }
@@ -1544,10 +1584,12 @@ impl BlindStore {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
         if !trusted_identity_matches(&request.identity, &trusted_owner.identity)
             || request.certificates.is_empty()
-            || !trusted_owner
-                .allowed_controller_device_ids
-                .iter()
-                .any(|id| id == &request.device_id)
+            || !trusted_controller_device(
+                trusted_owner,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+            )
         {
             return Err("Untrusted controller identity or device".into());
         }
@@ -2149,10 +2191,12 @@ async fn public_challenge(
         )
     })?;
     if !trusted_identity_matches(&request.identity, &owner.identity)
-        || !owner
-            .allowed_controller_device_ids
-            .iter()
-            .any(|id| id == &request.device_id)
+        || !trusted_controller_device(
+            owner,
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+        )
     {
         return Err(failure(
             StatusCode::FORBIDDEN,
@@ -2457,10 +2501,12 @@ async fn enrollment_challenge(
         )
     })?;
     if !trusted_identity_matches(&request.identity, &trusted_owner.identity)
-        || !trusted_owner
-            .allowed_controller_device_ids
-            .iter()
-            .any(|id| id == &request.device_id)
+        || !trusted_controller_device(
+            trusted_owner,
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+        )
     {
         return Err(failure(
             StatusCode::FORBIDDEN,
