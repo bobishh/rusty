@@ -75,6 +75,6 @@ jobs:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Build verified service revision
-        run: docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/bobishh/rusty" --tag "ghcr.io/bobishh/mesh-lighthouse:$GITHUB_SHA" .
+        run: docker build --build-arg "RUSTY_BUILD_SHA=$GITHUB_SHA" --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/bobishh/rusty" --tag "ghcr.io/bobishh/mesh-lighthouse:$GITHUB_SHA" .
       - name: Publish immutable service image
         run: docker push "ghcr.io/bobishh/mesh-lighthouse:$GITHUB_SHA"
