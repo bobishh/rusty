@@ -169,6 +169,30 @@ async fn service_root_opens_connection_instructions_without_exposing_storage() {
     let html = response.text().await.unwrap();
     assert!(html.contains("Board storage is available"));
     assert!(html.contains("View Rusty logs"));
+    let discovery: Value = reqwest::get(format!("{origin}/.well-known/mesh-lighthouse"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(discovery["protocolVersions"], json!([2]));
+    assert_eq!(discovery["capabilities"]["scopeManagement"]["version"], 1);
+    assert_eq!(
+        discovery["capabilities"]["snapshotCheckpoints"]["version"],
+        1
+    );
+    assert_eq!(
+        discovery["capabilities"]["publicBoardPublication"]["version"],
+        1
+    );
+    assert_eq!(
+        discovery["capabilities"]["writerPolicy"],
+        json!({"version":1,"maximumWriterVersion":2})
+    );
+    assert_eq!(
+        discovery["capabilities"]["blobCoverage"],
+        json!({"version":1,"maximumObjects":33})
+    );
     assert_eq!(
         reqwest::get(format!("{origin}/unknown"))
             .await
@@ -294,25 +318,45 @@ fn signed_scope_request(
     write_token: &str,
     revoked: bool,
 ) -> Value {
+    signed_scope_request_with_minimum_writer_version(
+        challenge,
+        identity.clone(),
+        device_id,
+        certificate.clone(),
+        read_token,
+        write_token,
+        revoked,
+        None,
+    )
+}
+
+fn signed_scope_request_with_minimum_writer_version(
+    challenge: Value,
+    identity: Value,
+    device_id: &str,
+    certificate: Value,
+    read_token: &str,
+    write_token: &str,
+    revoked: bool,
+    minimum_writer_version: Option<u8>,
+) -> Value {
     use meta_mesh_core::sign_json_envelope;
     let payload = &challenge["payload"];
-    let authorization = sign_json_envelope(
-        &[32; 32],
-        json!({
-            "kind": "rusty-scope-enrollment", "version": 1,
-            "challengeId": payload["challengeId"], "nonce": payload["nonce"],
-            "serviceId": payload["serviceId"], "publicOrigin": payload["publicOrigin"],
-            "scopeId": payload["scopeId"], "personId": payload["personId"],
-            "deviceId": device_id, "deviceKeyId": device_id,
-            "expectedRevision": payload["expectedRevision"],
-            "readTokenHash": digest(read_token.as_bytes()),
-            "writeTokenHash": digest(write_token.as_bytes()),
-            "revoked": revoked, "expiresAt": payload["expiresAt"]
-        }),
-        device_id,
-        "MATCH/1",
-    )
-    .unwrap();
+    let mut authorization = json!({
+        "kind": "rusty-scope-enrollment", "version": 1,
+        "challengeId": payload["challengeId"], "nonce": payload["nonce"],
+        "serviceId": payload["serviceId"], "publicOrigin": payload["publicOrigin"],
+        "scopeId": payload["scopeId"], "personId": payload["personId"],
+        "deviceId": device_id, "deviceKeyId": device_id,
+        "expectedRevision": payload["expectedRevision"],
+        "readTokenHash": digest(read_token.as_bytes()),
+        "writeTokenHash": digest(write_token.as_bytes()),
+        "revoked": revoked, "expiresAt": payload["expiresAt"]
+    });
+    if let Some(version) = minimum_writer_version {
+        authorization["minimumWriterVersion"] = json!(version);
+    }
+    let authorization = sign_json_envelope(&[32; 32], authorization, device_id, "MATCH/1").unwrap();
     json!({
         "challenge": challenge,
         "identity": identity,
@@ -323,6 +367,173 @@ fn signed_scope_request(
         "revoked": revoked,
         "authorization": authorization
     })
+}
+
+#[tokio::test]
+async fn writer_policy_floor_rejects_old_snapshot_writes_after_signed_scope_migration() {
+    let directory =
+        std::env::temp_dir().join(format!("rusty-writer-floor-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let (identity, device_id, certificate, _) = owner_controller_fixture();
+    let trusted = TrustedOwner {
+        identity: serde_json::from_value(identity.clone()).unwrap(),
+        allowed_controller_device_ids: vec![device_id.clone()],
+    };
+    let app = router(
+        store.clone(),
+        "https://rusty.example".into(),
+        Some(trusted),
+        vec![],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let challenge: Value = client.post(format!("{origin}/v2/enrollment/challenge"))
+        .json(&json!({"version":1,"scopeId":"opaque-scope","identity":identity,"deviceId":device_id,"certificates":[certificate]}))
+        .send().await.unwrap().json().await.unwrap();
+    let signed = signed_scope_request_with_minimum_writer_version(
+        challenge["challenge"].clone(),
+        identity.clone(),
+        &device_id,
+        certificate.clone(),
+        &"r".repeat(43),
+        &"w".repeat(43),
+        false,
+        Some(2),
+    );
+    let enrolled = client
+        .put(format!("{origin}/v2/scopes/opaque-scope"))
+        .json(&signed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enrolled.status(), StatusCode::OK);
+    let enrolled: Value = enrolled.json().await.unwrap();
+    assert_eq!(enrolled["receipt"]["payload"]["minimumWriterVersion"], 2);
+
+    let object = encrypted_fixture();
+    let object_path = format!(
+        "{origin}/v2/scopes/opaque-scope/objects/{}",
+        object.id().unwrap()
+    );
+    let response = client
+        .put(&object_path)
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "writer-floor-old-request")
+        .json(&object)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["code"],
+        "writer_upgrade_required"
+    );
+    assert!(store.objects("opaque-scope").unwrap().is_empty());
+
+    let capable = client
+        .put(format!("{object_path}?writerVersion=2"))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "writer-floor-capable-request")
+        .json(&object)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(capable.status(), StatusCode::OK);
+
+    let second_challenge: Value = client.post(format!("{origin}/v2/enrollment/challenge"))
+        .json(&json!({"version":1,"scopeId":"opaque-scope","identity":identity,"deviceId":device_id,"certificates":[certificate]}))
+        .send().await.unwrap().json().await.unwrap();
+    let downgrade = signed_scope_request_with_minimum_writer_version(
+        second_challenge["challenge"].clone(),
+        identity,
+        &device_id,
+        certificate,
+        &"r".repeat(43),
+        &"w".repeat(43),
+        false,
+        Some(1),
+    );
+    let updated = client
+        .put(format!("{origin}/v2/scopes/opaque-scope"))
+        .json(&downgrade)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value = updated.json().await.unwrap();
+    assert_eq!(updated["receipt"]["payload"]["minimumWriterVersion"], 2);
+    assert_eq!(
+        store.policy("opaque-scope").unwrap().minimum_writer_version,
+        2
+    );
+
+    let denied_blob = client
+        .put(format!(
+            "{origin}/v2/scopes/opaque-scope/blobs/{}",
+            object.id().unwrap()
+        ))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "writer-floor-blob-policy")
+        .json(&object)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_blob.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(
+        denied_blob.json::<Value>().await.unwrap()["code"],
+        "writer_upgrade_required"
+    );
+    let capable_blob = client
+        .put(format!(
+            "{origin}/v2/scopes/opaque-scope/blobs/{}?writerVersion=2",
+            object.id().unwrap()
+        ))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "writer-floor-blob-capable")
+        .json(&object)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(capable_blob.status(), StatusCode::OK);
+
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    let restarted = BlindStore::open(directory.clone()).unwrap();
+    assert_eq!(
+        restarted
+            .policy("opaque-scope")
+            .unwrap()
+            .minimum_writer_version,
+        2
+    );
+    assert!(
+        restarted
+            .save(
+                "opaque-scope",
+                &"w".repeat(43),
+                encrypted_fixture(),
+                "restart-old-writer"
+            )
+            .is_err()
+    );
+    let capable_object = encrypted_fixture();
+    assert!(
+        restarted
+            .save_for_writer(
+                "opaque-scope",
+                &"w".repeat(43),
+                capable_object,
+                "restart-new-writer",
+                2
+            )
+            .is_ok()
+    );
+    drop(restarted);
+    let _ = fs::remove_dir_all(directory);
 }
 
 // Given a certificate chain rooted in the configured owner identity, when a
@@ -618,6 +829,140 @@ pub(super) fn approve_fixture(store: &BlindStore) {
             },
         )
         .unwrap();
+}
+
+#[test]
+fn scope_policy_defaults_pre_writer_version_disks_to_one_and_rejects_unknown_floors() {
+    let directory = std::env::temp_dir().join(format!(
+        "rusty-writer-policy-disk-{}",
+        rand::random::<u64>()
+    ));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let path = store.scope_dir("opaque-scope").unwrap().join("policy.json");
+    let mut old: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("minimumWriterVersion");
+    atomic_write(&path, &serde_json::to_vec(&old).unwrap()).unwrap();
+    assert_eq!(
+        store.policy("opaque-scope").unwrap().minimum_writer_version,
+        1
+    );
+    old["minimumWriterVersion"] = json!(3);
+    atomic_write(&path, &serde_json::to_vec(&old).unwrap()).unwrap();
+    assert_eq!(
+        store.policy("opaque-scope").err().as_deref(),
+        Some("Invalid scope writer policy")
+    );
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// Given opaque attachment bytes, when clients retry and Rusty restarts, then
+// receipt-bound bytes survive outside the snapshot inventory and its cleanup.
+#[tokio::test]
+async fn attachment_http_namespace_is_durable_and_independent_of_snapshots() {
+    let directory = std::env::temp_dir().join(format!("rusty-blob-http-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let object = encrypted_fixture();
+    let id = object.id().unwrap();
+    let key = store.public_key().unwrap();
+    let client = reqwest::Client::new();
+    let app = router(store.clone(), "https://rusty.example".into(), None, vec![]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("{origin}/v2/scopes/opaque-scope/blobs/{id}");
+
+    let policy_required = client
+        .put(format!("{endpoint}?writerVersion=2"))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "policy-required-blob")
+        .json(&object)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(policy_required.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        policy_required.json::<Value>().await.unwrap()["code"],
+        "writer_policy_required"
+    );
+    set_scope_writer_floor_for_test(&store, "opaque-scope", 2);
+
+    for request_id in ["first-blob-request", "same-blob-retry"] {
+        let response = client
+            .put(format!("{endpoint}?writerVersion=2"))
+            .bearer_auth("w".repeat(43))
+            .header("x-rusty-request-id", request_id)
+            .json(&object)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt: SignedEnvelope<Value> = response.json().await.unwrap();
+        assert!(verify_signed_envelope(&receipt, &key, DOMAIN).unwrap());
+        assert_eq!(receipt.payload["kind"], "blind-blob-storage-receipt");
+        assert_eq!(receipt.payload["version"], 1);
+        assert_eq!(receipt.payload["objectId"], id);
+        assert_eq!(receipt.payload["scopeId"], "opaque-scope");
+        assert_eq!(receipt.payload["keyEpoch"], object.key_epoch);
+        assert_eq!(receipt.payload["policyRevision"], 1);
+        assert_eq!(receipt.payload["requestId"], request_id);
+        assert!(receipt.payload.get("sequence").is_none());
+    }
+    assert!(store.objects("opaque-scope").unwrap().is_empty());
+    let snapshot = client
+        .get(format!("{origin}/v2/scopes/opaque-scope/objects/{id}"))
+        .bearer_auth("r".repeat(43))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(snapshot.status(), StatusCode::OK);
+    let denied = client.get(&endpoint).send().await.unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    let read_only = client
+        .put(format!("{endpoint}?writerVersion=2"))
+        .bearer_auth("r".repeat(43))
+        .header("x-rusty-request-id", "reader-write")
+        .json(&object)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+    server.abort();
+    let _ = server.await;
+    drop(store);
+
+    let restarted = BlindStore::open(directory.clone()).unwrap();
+    assert_eq!(restarted.public_key().unwrap(), key);
+    assert!(restarted.objects("opaque-scope").unwrap().is_empty());
+    let app = router(
+        restarted.clone(),
+        "https://rusty.example".into(),
+        None,
+        vec![],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let restored = client
+        .get(format!("{origin}/v2/scopes/opaque-scope/blobs/{id}"))
+        .bearer_auth("r".repeat(43))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+    assert_eq!(restored.json::<BlindObject>().await.unwrap(), object);
+    let stored =
+        fs::read_to_string(directory.join(format!("scopes/opaque-scope/blobs/{id}.json"))).unwrap();
+    assert!(!stored.contains(&"r".repeat(43)));
+    assert!(!stored.contains(&"w".repeat(43)));
+    assert!(!stored.contains("contentKey"));
+    server.abort();
+    let _ = server.await;
+    drop(restarted);
+    fs::remove_dir_all(directory).unwrap();
 }
 #[test]
 fn opaque_replication_survives_restart_and_retry_without_plaintext_or_tokens() {

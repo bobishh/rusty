@@ -49,7 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .transpose()?;
     if let Some(owner) = &trusted_owner {
         if meta_mesh_core::public_key_id(&owner.identity.public_key)? != owner.identity.person_id
-            || owner.allowed_controller_device_ids.is_empty()
             || owner.allowed_controller_device_ids.len() > 32
             || owner.allowed_controller_device_ids.iter().any(|id| {
                 id.is_empty()

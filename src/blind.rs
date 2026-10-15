@@ -25,8 +25,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tower_http::cors::CorsLayer;
+#[cfg(test)]
+#[path = "archive_tests.rs"]
+mod archive_tests;
+#[path = "archives.rs"]
+mod archives;
+#[path = "blobs.rs"]
+mod blobs;
 #[path = "checkpoint.rs"]
 mod checkpoint;
+#[path = "management.rs"]
+mod management;
 
 pub const DOMAIN: &str = "RUSTY/2";
 const MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
@@ -48,10 +57,48 @@ fn valid_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+fn validate_writer_version(version: u8) -> Result<(), String> {
+    if matches!(version, 1 | 2) {
+        Ok(())
+    } else {
+        Err("Unsupported writer version".into())
+    }
+}
+fn require_writer_version(policy: &ScopePolicy, writer_version: u8) -> Result<(), String> {
+    validate_writer_version(writer_version)?;
+    if writer_version < policy.minimum_writer_version {
+        return Err("Writer upgrade required".into());
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WriterQuery {
+    #[serde(default = "legacy_writer_version")]
+    writer_version: u8,
+}
 fn exact_keys(value: &Value, expected: &[&str]) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
     })
+}
+fn exact_keys_with_optional(value: &Value, required: &[&str], optional: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        required.iter().all(|key| object.contains_key(*key))
+            && object
+                .keys()
+                .all(|key| required.contains(&key.as_str()) || optional.contains(&key.as_str()))
+    })
+}
+fn optional_management_revision(value: &Value) -> Result<Option<u64>, String> {
+    match value.get("managementRevision") {
+        None => Ok(None),
+        Some(revision) => revision
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| "Invalid management revision".into()),
+    }
 }
 fn public_string(value: &Value, max: usize) -> bool {
     value
@@ -588,8 +635,8 @@ fn trusted_identity_matches(identity: &PublicIdentity, trusted: &PublicIdentity)
     identity.person_id == trusted.person_id && identity.public_key == trusted.public_key
 }
 
-// A confirmed device enrollment delegates from a pinned controller. An unrelated
-// root-signed device, or an appended certificate outside that chain, does not.
+// Legacy provisioning/first migration only. Migrated resource rights use the
+// current explicit capability, independent of controller certificate ancestry.
 fn trusted_controller_device(
     owner: &TrustedOwner,
     identity: &PublicIdentity,
@@ -666,16 +713,22 @@ impl BlindObject {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScopePolicy {
     revision: u64,
+    #[serde(default = "legacy_writer_version")]
+    minimum_writer_version: u8,
     read_mac: String,
     write_mac: String,
     revoked: bool,
     #[serde(default)]
     owner_person_id: Option<String>,
 }
+fn legacy_writer_version() -> u8 {
+    1
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TrustedOwner {
     pub identity: PublicIdentity,
+    #[serde(default)]
     pub allowed_controller_device_ids: Vec<String>,
 }
 #[derive(Deserialize)]
@@ -686,6 +739,7 @@ struct EnrollmentChallengeRequest {
     identity: PublicIdentity,
     device_id: String,
     certificates: Vec<DeviceCertificate>,
+    management_capability: Option<SignedEnvelope<Value>>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -694,6 +748,7 @@ struct ScopeEnrollmentRequest {
     identity: PublicIdentity,
     device_id: String,
     certificates: Vec<DeviceCertificate>,
+    management_capability: Option<SignedEnvelope<Value>>,
     read_token: String,
     write_token: String,
     revoked: bool,
@@ -713,6 +768,10 @@ struct ScopeEnrollmentAuthorization {
     device_id: String,
     device_key_id: String,
     expected_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    management_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minimum_writer_version: Option<u8>,
     read_token_hash: String,
     write_token_hash: String,
     revoked: bool,
@@ -726,6 +785,16 @@ struct ScopeApproval {
     read_token: String,
     write_token: String,
     revoked: bool,
+}
+#[cfg(test)]
+fn set_scope_writer_floor_for_test(store: &BlindStore, scope: &str, minimum_writer_version: u8) {
+    let mut policy = store.policy(scope).unwrap();
+    policy.minimum_writer_version = minimum_writer_version;
+    atomic_write(
+        &store.scope_dir(scope).unwrap().join("policy.json"),
+        &serde_json::to_vec(&policy).unwrap(),
+    )
+    .unwrap();
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -744,6 +813,7 @@ struct PublicChallengeRequest {
     identity: PublicIdentity,
     device_id: String,
     certificates: Vec<DeviceCertificate>,
+    management_capability: Option<SignedEnvelope<Value>>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -761,6 +831,7 @@ struct PublicMutationRequest {
     identity: PublicIdentity,
     device_id: String,
     certificates: Vec<DeviceCertificate>,
+    management_capability: Option<SignedEnvelope<Value>>,
     action: String,
     projection: Option<Value>,
     authorization: SignedEnvelope<Value>,
@@ -772,6 +843,7 @@ struct PublicAssetRequest {
     identity: PublicIdentity,
     device_id: String,
     certificates: Vec<DeviceCertificate>,
+    management_capability: Option<SignedEnvelope<Value>>,
     sha256: String,
     byte_length: u64,
     bytes: String,
@@ -811,6 +883,9 @@ pub struct BlindStore {
     lock: Arc<Mutex<()>>,
     _process_lock: Arc<File>,
     inventories: Arc<Mutex<HashMap<String, Vec<ObjectMetadata>>>>,
+    archive_usage: Arc<Mutex<HashMap<String, (u64, usize)>>>,
+    #[cfg(test)]
+    management_commit_failure: Arc<std::sync::atomic::AtomicBool>,
 }
 impl BlindStore {
     pub fn open(directory: PathBuf) -> Result<Self, String> {
@@ -832,6 +907,7 @@ impl BlindStore {
                     "storage.lock",
                     "enrollment",
                     "publications",
+                    "management",
                 ]
                 .contains(&name)
                     && !name.starts_with(".pending-")
@@ -839,7 +915,9 @@ impl BlindStore {
                     return Err("Legacy or unknown state requires client re-encryption into a fresh directory".into());
                 }
             }
-            if (directory.join("scopes").exists() || directory.join("publications").exists())
+            if (directory.join("scopes").exists()
+                || directory.join("publications").exists()
+                || directory.join("management").exists())
                 && !directory.join("service-key").exists()
             {
                 return Err(
@@ -886,9 +964,13 @@ impl BlindStore {
             lock: Arc::new(Mutex::new(())),
             _process_lock: Arc::new(process_lock),
             inventories: Arc::new(Mutex::new(HashMap::new())),
+            archive_usage: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            management_commit_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_scope_bytes,
         };
         store.recover_checkpoint_scopes()?;
+        store.recover_management()?;
         Ok(store)
     }
     pub fn public_key(&self) -> Result<String, String> {
@@ -980,6 +1062,7 @@ impl BlindStore {
             .to_owned();
         Ok((bytes, media_type, filename))
     }
+    #[cfg(test)]
     fn create_public_challenge(
         &self,
         board_id: &str,
@@ -989,6 +1072,16 @@ impl BlindStore {
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        self.create_public_challenge_unlocked(board_id, person_id, device_id, device_key_id, origin)
+    }
+    fn create_public_challenge_unlocked(
+        &self,
+        board_id: &str,
+        person_id: &str,
+        device_id: &str,
+        device_key_id: &str,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
         let (record_path, challenge_dir, root) = self.publication_paths(board_id)?;
         fs::create_dir_all(&challenge_dir).map_err(|_| "Publication storage unavailable")?;
         File::open(&root)
@@ -1076,12 +1169,17 @@ impl BlindStore {
         if !valid_id(board_id)
             || !trusted_identity_matches(&request.identity, &trusted_owner.identity)
             || request.certificates.is_empty()
-            || !trusted_controller_device(
+            || !self.management_authorized(
                 trusted_owner,
                 &request.identity,
                 &request.device_id,
                 &request.certificates,
-            )
+                "board",
+                board_id,
+                "publication.stage-file",
+                request.management_capability.as_ref(),
+                origin,
+            )?
         {
             return Err("Untrusted publication controller or device".into());
         }
@@ -1133,7 +1231,7 @@ impl BlindStore {
         }
         let challenge = &request.challenge.payload;
         let command = &request.authorization.payload;
-        if !exact_keys(
+        if !exact_keys_with_optional(
             command,
             &[
                 "kind",
@@ -1149,6 +1247,7 @@ impl BlindStore {
                 "expiresAt",
                 "byteLength",
             ],
+            &["managementRevision"],
         ) || command["kind"] != "rusty-publication-command"
             || command["version"] != 1
             || command["challengeId"] != challenge["challengeId"]
@@ -1165,6 +1264,13 @@ impl BlindStore {
             || !verify_signed_envelope(&request.authorization, &device_public_key, "MATCH/1")?
         {
             return Err("Public asset command signature or binding invalid".into());
+        }
+        if !self.management_revision_matches(
+            "board",
+            board_id,
+            optional_management_revision(command)?,
+        )? {
+            return Err("Public asset management revision binding invalid".into());
         }
         let current_revision = if record_path.exists() {
             self.current_publication(board_id)?
@@ -1228,12 +1334,17 @@ impl BlindStore {
         if !valid_id(board_id)
             || !trusted_identity_matches(&request.identity, &trusted_owner.identity)
             || request.certificates.is_empty()
-            || !trusted_controller_device(
+            || !self.management_authorized(
                 trusted_owner,
                 &request.identity,
                 &request.device_id,
                 &request.certificates,
-            )
+                "board",
+                board_id,
+                &format!("publication.{}", request.action),
+                request.management_capability.as_ref(),
+                origin,
+            )?
         {
             return Err("Untrusted publication controller or device".into());
         }
@@ -1303,7 +1414,7 @@ impl BlindStore {
         }
         let command = &request.authorization.payload;
         let challenge_payload = &request.challenge.payload;
-        if !exact_keys(
+        if !exact_keys_with_optional(
             command,
             &[
                 "kind",
@@ -1318,6 +1429,7 @@ impl BlindStore {
                 "expectedRevision",
                 "expiresAt",
             ],
+            &["managementRevision"],
         ) || command.get("kind").and_then(Value::as_str) != Some("rusty-publication-command")
             || command.get("version").and_then(Value::as_u64) != Some(1)
             || command.get("challengeId").and_then(Value::as_str) != Some(challenge_id)
@@ -1334,6 +1446,13 @@ impl BlindStore {
             || !verify_signed_envelope(&request.authorization, &device_public_key, "MATCH/1")?
         {
             return Err("Publication command signature or binding invalid".into());
+        }
+        if !self.management_revision_matches(
+            "board",
+            board_id,
+            optional_management_revision(command)?,
+        )? {
+            return Err("Publication management revision binding invalid".into());
         }
         let expected_revision = challenge_payload
             .get("expectedRevision")
@@ -1425,11 +1544,15 @@ impl BlindStore {
         Ok(self.directory.join("scopes").join(scope))
     }
     fn policy(&self, scope: &str) -> Result<ScopePolicy, String> {
-        serde_json::from_slice(
+        let policy: ScopePolicy = serde_json::from_slice(
             &fs::read(self.scope_dir(scope)?.join("policy.json"))
                 .map_err(|_| "Scope unavailable")?,
         )
-        .map_err(|_| "Invalid scope policy".into())
+        .map_err(|_| "Invalid scope policy")?;
+        if !matches!(policy.minimum_writer_version, 1 | 2) {
+            return Err("Invalid scope writer policy".into());
+        }
+        Ok(policy)
     }
     fn authorize(&self, scope: &str, token: &str, write: bool) -> Result<ScopePolicy, String> {
         let policy = self.policy(scope)?;
@@ -1454,11 +1577,12 @@ impl BlindStore {
     fn approve(&self, scope: &str, approval: ScopeApproval) -> Result<u64, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
         let directory = self.scope_dir(scope)?;
-        let revision = if directory.join("policy.json").exists() {
-            self.policy(scope)?.revision
+        let existing_policy = if directory.join("policy.json").exists() {
+            Some(self.policy(scope)?)
         } else {
-            0
+            None
         };
+        let revision = existing_policy.as_ref().map_or(0, |policy| policy.revision);
         if approval.expected_revision != revision {
             return Err("Storage policy revision conflict".into());
         }
@@ -1467,6 +1591,9 @@ impl BlindStore {
             .ok_or("Storage policy revision exhausted")?;
         let policy = ScopePolicy {
             revision: next,
+            minimum_writer_version: existing_policy.map_or_else(legacy_writer_version, |policy| {
+                policy.minimum_writer_version
+            }),
             read_mac: self.token_mac(scope, &approval.read_token)?,
             write_mac: self.token_mac(scope, &approval.write_token)?,
             revoked: approval.revoked,
@@ -1495,7 +1622,7 @@ impl BlindStore {
         }
         Ok(self.policy(scope)?.revision)
     }
-    fn create_challenge(
+    fn create_challenge_unlocked(
         &self,
         scope: &str,
         person_id: &str,
@@ -1503,7 +1630,6 @@ impl BlindStore {
         device_key_id: &str,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
-        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
         let now = now_ms()?;
         let enrollment_dir = self.directory.join("enrollment");
         fs::create_dir_all(&enrollment_dir).map_err(|_| "Enrollment storage unavailable")?;
@@ -1584,12 +1710,17 @@ impl BlindStore {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
         if !trusted_identity_matches(&request.identity, &trusted_owner.identity)
             || request.certificates.is_empty()
-            || !trusted_controller_device(
+            || !self.management_authorized(
                 trusted_owner,
                 &request.identity,
                 &request.device_id,
                 &request.certificates,
-            )
+                "scope",
+                scope,
+                "scope.policy",
+                request.management_capability.as_ref(),
+                origin,
+            )?
         {
             return Err("Untrusted controller identity or device".into());
         }
@@ -1635,6 +1766,9 @@ impl BlindStore {
         let challenge_payload = &request.challenge.payload;
         let read_hash = digest(request.read_token.as_bytes());
         let write_hash = digest(request.write_token.as_bytes());
+        if !self.management_revision_matches("scope", scope, proof.management_revision)? {
+            return Err("Controller management revision binding invalid".into());
+        }
         if proof.kind != "rusty-scope-enrollment"
             || proof.version != 1
             || payload_challenge_id != challenge_id
@@ -1666,6 +1800,7 @@ impl BlindStore {
         } else {
             ScopePolicy {
                 revision: 0,
+                minimum_writer_version: legacy_writer_version(),
                 read_mac: String::new(),
                 write_mac: String::new(),
                 revoked: false,
@@ -1674,6 +1809,12 @@ impl BlindStore {
         };
         if current.revision != expected_revision {
             return Err("Storage policy revision conflict".into());
+        }
+        if proof
+            .minimum_writer_version
+            .is_some_and(|version| !matches!(version, 1 | 2))
+        {
+            return Err("Unsupported minimum writer version".into());
         }
         if current
             .owner_person_id
@@ -1688,6 +1829,11 @@ impl BlindStore {
             .ok_or("Storage policy revision exhausted")?;
         let policy = ScopePolicy {
             revision,
+            minimum_writer_version: current.minimum_writer_version.max(
+                proof
+                    .minimum_writer_version
+                    .unwrap_or(current.minimum_writer_version),
+            ),
             read_mac: self.token_mac(scope, &request.read_token)?,
             write_mac: self.token_mac(scope, &request.write_token)?,
             revoked: request.revoked,
@@ -1718,18 +1864,17 @@ impl BlindStore {
         let authorization_envelope = serde_json::to_value(&request.authorization)
             .map_err(|_| "Controller authorization invalid")?;
         let authorization_hash = digest(canonicalize_json(&authorization_envelope)?.as_bytes());
-        sign_json_envelope(
-            &self.seed,
-            json!({
-                "kind": "rusty-scope-policy-receipt", "version": 1,
-                "serviceId": service_id, "scopeId": scope,
-                "personId": request.identity.person_id, "revision": revision,
-                "revoked": request.revoked, "challengeId": challenge_id,
-                "authorizationHash": authorization_hash
-            }),
-            service_id,
-            DOMAIN,
-        )
+        let mut receipt = json!({
+            "kind": "rusty-scope-policy-receipt", "version": 1,
+            "serviceId": service_id, "scopeId": scope,
+            "personId": request.identity.person_id, "revision": revision,
+            "revoked": request.revoked, "challengeId": challenge_id,
+            "authorizationHash": authorization_hash
+        });
+        if proof.minimum_writer_version.is_some() || policy.minimum_writer_version > 1 {
+            receipt["minimumWriterVersion"] = json!(policy.minimum_writer_version);
+        }
+        sign_json_envelope(&self.seed, receipt, service_id, DOMAIN)
     }
     fn objects(&self, scope: &str) -> Result<Vec<ObjectMetadata>, String> {
         if let Some(cached) = self
@@ -1822,12 +1967,23 @@ impl BlindStore {
         object: BlindObject,
         request_id: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
+        self.save_for_writer(scope, token, object, request_id, legacy_writer_version())
+    }
+    fn save_for_writer(
+        &self,
+        scope: &str,
+        token: &str,
+        object: BlindObject,
+        request_id: &str,
+        writer_version: u8,
+    ) -> Result<SignedEnvelope<Value>, String> {
         object.validate(scope)?;
         if !valid_id(request_id) {
             return Err("Invalid receipt challenge".into());
         }
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
         let policy = self.authorize(scope, token, true)?;
+        require_writer_version(&policy, writer_version)?;
         let object_id = object.id()?;
         let path = self
             .scope_dir(scope)?
@@ -1860,13 +2016,7 @@ impl BlindStore {
             stored.sequence
         } else {
             let objects = self.objects(scope)?;
-            let used = fs::read_dir(path.parent().ok_or("Invalid object path")?)
-                .map_err(|e| e.to_string())?
-                .try_fold(0u64, |total, entry| {
-                    let size = entry?.metadata()?.len();
-                    Ok::<u64, std::io::Error>(total.saturating_add(size))
-                })
-                .map_err(|e| e.to_string())?;
+            let used = self.scope_storage_bytes(scope)?;
             let bytes = serde_json::to_vec(&object).map_err(|e| e.to_string())?;
             if objects.len() >= MAX_SCOPE_OBJECTS
                 || used.saturating_add(bytes.len() as u64 + 1024) > self.max_scope_bytes
@@ -2018,6 +2168,11 @@ pub fn router_with_telemetry(
             "/v2/enrollment/challenge",
             axum::routing::post(enrollment_challenge),
         )
+        .route("/v2/management/{kind}/{id}", put(management::update))
+        .route(
+            "/v2/management/{kind}/{id}/status",
+            axum::routing::post(management::status),
+        )
         .route("/v2/scopes/{scope}", put(approve_scope))
         .route(
             "/v2/scopes/{scope}/checkpoint",
@@ -2027,6 +2182,28 @@ pub fn router_with_telemetry(
         .route(
             "/v2/scopes/{scope}/objects/{object_id}",
             get(download).put(upload),
+        )
+        .route(
+            "/v2/scopes/{scope}/blobs/{object_id}",
+            get(blobs::download).put(blobs::upload),
+        )
+        .route(
+            "/v2/scopes/{scope}/blob-coverage",
+            axum::routing::post(blobs::coverage).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/v2/scopes/{scope}/archives/{object_id}",
+            get(archives::download)
+                .put(archives::upload)
+                .layer(DefaultBodyLimit::max(360 * 1024)),
+        )
+        .route(
+            "/v2/scopes/{scope}/archive-coverage",
+            axum::routing::post(archives::coverage).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/v2/scopes/{scope}/archive-coverage/aggregate",
+            axum::routing::post(archives::aggregate).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
             "/v1/public/challenges",
@@ -2170,7 +2347,7 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
     Ok(Json(
         json!({"protocolVersions": [2], "publicOrigin": state.origin, "displayName": "Rusty",
         "service": {"serviceId": service_id, "publicKey": public_key},
-        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1},"snapshotCheckpoints":{"version":1}}}),
+        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1},"snapshotCheckpoints":{"version":1},"scopeManagement":{"version":1},"personManagement":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
     ))
 }
 
@@ -2191,12 +2368,20 @@ async fn public_challenge(
         )
     })?;
     if !trusted_identity_matches(&request.identity, &owner.identity)
-        || !trusted_controller_device(
-            owner,
-            &request.identity,
-            &request.device_id,
-            &request.certificates,
-        )
+        || !state
+            .store
+            .management_authorized(
+                owner,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+                "board",
+                &request.board_id,
+                "publication.status",
+                request.management_capability.as_ref(),
+                &state.origin,
+            )
+            .map_err(|message| failure(StatusCode::SERVICE_UNAVAILABLE, &message))?
     {
         return Err(failure(
             StatusCode::FORBIDDEN,
@@ -2225,19 +2410,9 @@ async fn public_challenge(
     }
     let challenge = tokio::task::spawn_blocking({
         let store = state.store.clone();
-        let board_id = request.board_id;
-        let person_id = request.identity.person_id;
-        let device_id = request.device_id;
+        let owner = owner.clone();
         let origin = state.origin;
-        move || {
-            store.create_public_challenge(
-                &board_id,
-                &person_id,
-                &device_id,
-                &device_key_id,
-                &origin,
-            )
-        }
+        move || store.create_managed_public_challenge(request, &owner, &origin, &device_key_id)
     })
     .await
     .map_err(|_| {
@@ -2248,7 +2423,9 @@ async fn public_challenge(
     })?
     .map_err(|message| {
         failure(
-            if message.contains("capacity") {
+            if message.contains("Unauthorized") {
+                StatusCode::FORBIDDEN
+            } else if message.contains("capacity") {
                 StatusCode::TOO_MANY_REQUESTS
             } else {
                 StatusCode::CONFLICT
@@ -2501,12 +2678,20 @@ async fn enrollment_challenge(
         )
     })?;
     if !trusted_identity_matches(&request.identity, &trusted_owner.identity)
-        || !trusted_controller_device(
-            trusted_owner,
-            &request.identity,
-            &request.device_id,
-            &request.certificates,
-        )
+        || !state
+            .store
+            .management_authorized(
+                trusted_owner,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+                "scope",
+                &request.scope_id,
+                "scope.policy",
+                request.management_capability.as_ref(),
+                &state.origin,
+            )
+            .map_err(|message| failure(StatusCode::SERVICE_UNAVAILABLE, &message))?
     {
         return Err(failure(
             StatusCode::FORBIDDEN,
@@ -2528,23 +2713,10 @@ async fn enrollment_challenge(
     let device_key_id = public_key_id(&device_public_key)
         .map_err(|_| failure(StatusCode::FORBIDDEN, "Invalid controller device key"))?;
     let store = state.store.clone();
-    let scope = request.scope_id;
-    let person_id = request.identity.person_id;
-    let device_id = request.device_id;
+    let owner = trusted_owner.clone();
     let origin = state.origin.clone();
     let challenge = tokio::task::spawn_blocking(move || {
-        let revision = store.policy_revision(&scope)?;
-        if revision > 0 {
-            let policy = store.policy(&scope)?;
-            if policy
-                .owner_person_id
-                .as_ref()
-                .is_some_and(|owner| owner != &person_id)
-            {
-                return Err("Scope owner binding conflict".into());
-            }
-        }
-        store.create_challenge(&scope, &person_id, &device_id, &device_key_id, &origin)
+        store.create_managed_enrollment_challenge(request, &owner, &origin, &device_key_id)
     })
     .await
     .map_err(|_| {
@@ -2555,7 +2727,9 @@ async fn enrollment_challenge(
     })?
     .map_err(|message| {
         failure(
-            if message.contains("capacity") {
+            if message.contains("Unauthorized") {
+                StatusCode::FORBIDDEN
+            } else if message.contains("capacity") {
                 StatusCode::TOO_MANY_REQUESTS
             } else {
                 StatusCode::CONFLICT
@@ -2613,6 +2787,7 @@ async fn upload(
     State(state): State<HttpState>,
     RoutePath((scope, object_id)): RoutePath<(String, String)>,
     headers: HeaderMap,
+    Query(query): Query<WriterQuery>,
     Json(object): Json<BlindObject>,
 ) -> Result<Json<SignedEnvelope<Value>>, ApiError> {
     let token = bearer(&headers)?;
@@ -2635,20 +2810,30 @@ async fn upload(
             "Ciphertext object hash mismatch",
         ));
     }
-    let receipt =
-        tokio::task::spawn_blocking(move || state.store.save(&scope, &token, object, &request_id))
-            .await
-            .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "Storage unavailable"))?
-            .map_err(|message| {
-                failure(
-                    if message.contains("access") || message.contains("Scope unavailable") {
-                        StatusCode::FORBIDDEN
-                    } else {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    },
-                    &message,
-                )
-            })?;
+    let writer_version = query.writer_version;
+    let receipt = tokio::task::spawn_blocking(move || {
+        state
+            .store
+            .save_for_writer(&scope, &token, object, &request_id, writer_version)
+    })
+    .await
+    .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "Storage unavailable"))?
+    .map_err(|message| {
+        if message.contains("Writer") || message.contains("writer") {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                Json(json!({"code":"writer_upgrade_required","message":message})),
+            );
+        }
+        failure(
+            if message.contains("access") || message.contains("Scope unavailable") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            &message,
+        )
+    })?;
     Ok(Json(receipt))
 }
 #[derive(Deserialize)]
@@ -2729,3 +2914,7 @@ mod tests;
 #[cfg(test)]
 #[path = "publication_security_tests.rs"]
 mod publication_security_tests;
+
+#[cfg(test)]
+#[path = "management_tests.rs"]
+mod management_tests;
