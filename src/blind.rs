@@ -45,6 +45,9 @@ const MAX_SCOPE_OBJECTS: usize = 10_000;
 const ENROLLMENT_CHALLENGE_TTL_MS: u64 = 120_000;
 const MAX_PENDING_CHALLENGES: usize = 128;
 const MAX_PENDING_CHALLENGES_PER_SCOPE: usize = 8;
+const MAX_SAFE_JS_INTEGER: u64 = 9_007_199_254_740_991;
+const CHECKPOINT_GENERATION_REQUIRED: &str =
+    "checkpoint generation required; refresh storage inventory before uploading new objects";
 
 type ApiError = (StatusCode, Json<Value>);
 fn failure(status: StatusCode, message: &str) -> ApiError {
@@ -77,6 +80,8 @@ fn require_writer_version(policy: &ScopePolicy, writer_version: u8) -> Result<()
 struct WriterQuery {
     #[serde(default = "legacy_writer_version")]
     writer_version: u8,
+    #[serde(default)]
+    observed_sequence: u64,
 }
 fn exact_keys(value: &Value, expected: &[&str]) -> bool {
     value.as_object().is_some_and(|object| {
@@ -135,6 +140,82 @@ fn public_rank(value: &Value) -> bool {
         left == 1
     }
 }
+fn validate_public_presentation(
+    value: &Value,
+    columns: &HashSet<String>,
+    visible_ids: &HashSet<String>,
+) -> Result<(), String> {
+    if !exact_keys_with_optional(
+        value,
+        &[],
+        &[
+            "entityName",
+            "preset",
+            "cardStageButtons",
+            "cardAgingPolicy",
+        ],
+    ) || value
+        .get("entityName")
+        .is_some_and(|name| !public_string(name, 100) || name.as_str().unwrap_or("").is_empty())
+    {
+        return Err("Invalid public presentation".into());
+    }
+    if let Some(preset) = value.get("preset").filter(|preset| !preset.is_null()) {
+        if !exact_keys(preset, &["key", "version", "bindings"])
+            || !matches!(preset["key"].as_str(), Some("job-search" | "blank"))
+            || preset["version"] != 1
+        {
+            return Err("Invalid public preset".into());
+        }
+        let bindings = preset["bindings"]
+            .as_object()
+            .ok_or("Invalid public bindings")?;
+        if bindings.iter().any(|(key, id)| {
+            key.encode_utf16().count() > 128
+                || !id.as_str().is_some_and(|id| visible_ids.contains(id))
+        }) {
+            return Err("Public binding is outside publication".into());
+        }
+    }
+    if let Some(buttons) = value.get("cardStageButtons") {
+        let buttons = buttons
+            .as_array()
+            .filter(|buttons| buttons.len() <= 100)
+            .ok_or("Invalid public stage buttons")?;
+        if buttons.iter().any(|button| {
+            !exact_keys_with_optional(button, &["columnId"], &["label"])
+                || !button["columnId"]
+                    .as_str()
+                    .is_some_and(|id| columns.contains(id))
+                || button.get("label").is_some_and(|label| {
+                    !public_string(label, 4096) || label.as_str().unwrap_or("").is_empty()
+                })
+        }) {
+            return Err("Invalid public stage button".into());
+        }
+    }
+    if let Some(policy) = value.get("cardAgingPolicy") {
+        if !exact_keys(policy, &["version", "thresholds"])
+            || policy["version"] != 1
+            || !exact_keys(&policy["thresholds"], &["watch", "aged", "overdue"])
+        {
+            return Err("Invalid public card aging".into());
+        }
+        let t = &policy["thresholds"];
+        let (Some(watch), Some(aged), Some(overdue)) = (
+            t["watch"].as_u64(),
+            t["aged"].as_u64(),
+            t["overdue"].as_u64(),
+        ) else {
+            return Err("Invalid public card aging thresholds".into());
+        };
+        if watch == 0 || watch >= aged || aged >= overdue {
+            return Err("Invalid public card aging thresholds".into());
+        }
+    }
+    Ok(())
+}
+
 fn validate_public_projection(value: &Value) -> Result<(), String> {
     if !exact_keys(
         value,
@@ -150,7 +231,7 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
         ],
     ) || value["kind"] != "tincanban-public-board"
         || value["version"] != 1
-        || !exact_keys(&value["board"], &["id", "title"])
+        || !exact_keys_with_optional(&value["board"], &["id", "title"], &["presentation"])
         || !valid_id(value["board"]["id"].as_str().unwrap_or(""))
         || !public_string(&value["board"]["title"], 4096)
     {
@@ -168,7 +249,17 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
     ids.insert(value["board"]["id"].as_str().unwrap().to_owned());
     let mut column_ids = HashSet::new();
     for column in columns {
-        if !exact_keys(column, &["id", "title", "rank"])
+        if !exact_keys_with_optional(column, &["id", "title", "rank"], &["color", "collapsible"])
+            || column.get("color").is_some_and(|color| {
+                !color.as_str().is_some_and(|color| {
+                    color.len() == 7
+                        && color.starts_with('#')
+                        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+            || column
+                .get("collapsible")
+                .is_some_and(|value| !value.is_boolean())
             || !valid_id(column["id"].as_str().unwrap_or(""))
             || !public_string(&column["title"], 4096)
             || !public_rank(&column["rank"])
@@ -181,10 +272,15 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
     let mut field_ids = HashSet::new();
     let mut field_definitions: HashMap<String, (String, HashSet<String>)> = HashMap::new();
     for field in fields {
-        if !exact_keys(
+        if !exact_keys_with_optional(
             field,
             &["id", "title", "valueType", "required", "rank", "options"],
-        ) || !valid_id(field["id"].as_str().unwrap_or(""))
+            &["min", "max"],
+        ) || ["min", "max"].iter().any(|key| {
+            field.get(*key).is_some_and(|value| {
+                !value.is_null() && !value.as_f64().is_some_and(f64::is_finite)
+            })
+        }) || !valid_id(field["id"].as_str().unwrap_or(""))
             || !public_string(&field["title"], 4096)
             || !public_rank(&field["rank"])
             || !field["required"].is_boolean()
@@ -224,14 +320,26 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
         );
         field_ids.insert(field["id"].as_str().unwrap().to_owned());
     }
+    if let Some(presentation) = value["board"].get("presentation") {
+        let mut presentation_ids = ids.clone();
+        presentation_ids.remove(value["board"]["id"].as_str().unwrap());
+        validate_public_presentation(presentation, &column_ids, &presentation_ids)?;
+    }
     let mut cards_seen: HashMap<String, (Option<String>, String)> = HashMap::new();
     for card in cards {
-        if !exact_keys(
+        if !exact_keys_with_optional(
             card,
             &[
                 "id", "parentId", "columnId", "title", "body", "values", "rank",
             ],
-        ) || !valid_id(card["id"].as_str().unwrap_or(""))
+            &["createdAt", "updatedAt", "lastActivityAt"],
+        ) || ["createdAt", "updatedAt", "lastActivityAt"]
+            .iter()
+            .any(|key| {
+                card.get(*key)
+                    .is_some_and(|value| !public_string(value, 128))
+            })
+            || !valid_id(card["id"].as_str().unwrap_or(""))
             || !valid_id(card["columnId"].as_str().unwrap_or(""))
             || !column_ids.contains(card["columnId"].as_str().unwrap_or(""))
             || !public_string(&card["title"], 4096)
@@ -720,6 +828,15 @@ struct ScopePolicy {
     revoked: bool,
     #[serde(default)]
     owner_person_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_enrollment: Option<CompletedScopeEnrollment>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompletedScopeEnrollment {
+    request_hash: String,
+    receipt: SignedEnvelope<Value>,
 }
 fn legacy_writer_version() -> u8 {
     1
@@ -741,7 +858,7 @@ struct EnrollmentChallengeRequest {
     certificates: Vec<DeviceCertificate>,
     management_capability: Option<SignedEnvelope<Value>>,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScopeEnrollmentRequest {
     challenge: SignedEnvelope<Value>,
@@ -805,6 +922,36 @@ struct PendingChallenge {
     expires_at: u64,
     envelope: SignedEnvelope<Value>,
 }
+
+fn scope_enrollment_receipt_payload(
+    scope: &str,
+    request: &ScopeEnrollmentRequest,
+    policy: &ScopePolicy,
+    service_id: &str,
+) -> Result<Value, String> {
+    let authorization = serde_json::to_value(&request.authorization)
+        .map_err(|_| "Controller authorization invalid")?;
+    let authorization_hash = digest(canonicalize_json(&authorization)?.as_bytes());
+    let mut receipt = json!({
+        "kind": "rusty-scope-policy-receipt", "version": 1,
+        "serviceId": service_id, "scopeId": scope,
+        "personId": request.identity.person_id, "revision": policy.revision,
+        "revoked": request.revoked,
+        "challengeId": request.authorization.payload.challenge_id,
+        "authorizationHash": authorization_hash
+    });
+    if request
+        .authorization
+        .payload
+        .minimum_writer_version
+        .is_some()
+        || policy.minimum_writer_version > 1
+    {
+        receipt["minimumWriterVersion"] = json!(policy.minimum_writer_version);
+    }
+    Ok(receipt)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PublicChallengeRequest {
@@ -1598,6 +1745,7 @@ impl BlindStore {
             write_mac: self.token_mac(scope, &approval.write_token)?,
             revoked: approval.revoked,
             owner_person_id: None,
+            completed_enrollment: None,
         };
         fs::create_dir_all(directory.join("objects")).map_err(|e| e.to_string())?;
         for ancestor in [
@@ -1745,21 +1893,12 @@ impl BlindStore {
             .directory
             .join("enrollment")
             .join(format!("{challenge_id}.json"));
-        let pending: PendingChallenge = serde_json::from_slice(
-            &fs::read(&challenge_path).map_err(|_| "Enrollment challenge expired or consumed")?,
-        )
-        .map_err(|_| "Enrollment challenge invalid")?;
         let service_public_key = self.public_key()?;
         let service_id = public_key_id(&service_public_key)?;
-        if pending.envelope != request.challenge
-            || request.challenge.signer_key_id != service_id
+        if request.challenge.signer_key_id != service_id
             || !verify_signed_envelope(&request.challenge, &service_public_key, DOMAIN)?
-            || pending.scope_id != scope
-            || pending.person_id != request.identity.person_id
-            || pending.device_id != request.device_id
-            || pending.expires_at <= now_ms()?
         {
-            return Err("Enrollment challenge binding, signature, or expiry invalid".into());
+            return Err("Enrollment challenge signature invalid".into());
         }
         let proof = &request.authorization.payload;
         let payload_challenge_id = proof.challenge_id.as_str();
@@ -1805,9 +1944,62 @@ impl BlindStore {
                 write_mac: String::new(),
                 revoked: false,
                 owner_person_id: None,
+                completed_enrollment: None,
             }
         };
+        let normalized_request =
+            serde_json::to_value(&request).map_err(|_| "Enrollment request invalid")?;
+        let request_hash = digest(canonicalize_json(&normalized_request)?.as_bytes());
+        if let Some(completed) = &current.completed_enrollment {
+            if completed.request_hash == request_hash {
+                let expected_receipt =
+                    scope_enrollment_receipt_payload(scope, &request, &current, &service_id)?;
+                if expected_revision.checked_add(1) != Some(current.revision)
+                    || current.owner_person_id.as_ref() != Some(&request.identity.person_id)
+                    || current.revoked != request.revoked
+                    || current.read_mac != self.token_mac(scope, &request.read_token)?
+                    || current.write_mac != self.token_mac(scope, &request.write_token)?
+                    || completed.receipt.payload != expected_receipt
+                    || completed.receipt.signer_key_id != service_id
+                    || !verify_signed_envelope(&completed.receipt, &service_public_key, DOMAIN)?
+                {
+                    return Err("Completed enrollment receipt binding invalid".into());
+                }
+                // A previous rename can succeed while directory fsync reports failure.
+                sync_directory(&directory).map_err(|_| "Enrollment durability failed")?;
+                return Ok(completed.receipt.clone());
+            }
+        }
+        let pending: PendingChallenge = serde_json::from_slice(
+            &fs::read(&challenge_path).map_err(|_| "Enrollment challenge expired or consumed")?,
+        )
+        .map_err(|_| "Enrollment challenge invalid")?;
+        if pending.envelope != request.challenge
+            || pending.scope_id != scope
+            || pending.person_id != request.identity.person_id
+            || pending.device_id != request.device_id
+            || pending.expires_at <= now_ms()?
+        {
+            return Err("Enrollment challenge binding or expiry invalid".into());
+        }
         if current.revision != expected_revision {
+            // Concurrent owner devices can request the exact same floor upgrade.
+            // Confirm that already durable target without changing its policy CAS.
+            if expected_revision.checked_add(1) == Some(current.revision)
+                && current.owner_person_id.as_ref() == Some(&request.identity.person_id)
+                && current.revoked == request.revoked
+                && proof.minimum_writer_version == Some(current.minimum_writer_version)
+                && current.read_mac == self.token_mac(scope, &request.read_token)?
+                && current.write_mac == self.token_mac(scope, &request.write_token)?
+            {
+                sync_directory(&directory).map_err(|_| "Enrollment durability failed")?;
+                return sign_json_envelope(
+                    &self.seed,
+                    scope_enrollment_receipt_payload(scope, &request, &current, &service_id)?,
+                    &service_id,
+                    DOMAIN,
+                );
+            }
             return Err("Storage policy revision conflict".into());
         }
         if proof
@@ -1827,7 +2019,7 @@ impl BlindStore {
             .revision
             .checked_add(1)
             .ok_or("Storage policy revision exhausted")?;
-        let policy = ScopePolicy {
+        let mut policy = ScopePolicy {
             revision,
             minimum_writer_version: current.minimum_writer_version.max(
                 proof
@@ -1838,7 +2030,18 @@ impl BlindStore {
             write_mac: self.token_mac(scope, &request.write_token)?,
             revoked: request.revoked,
             owner_person_id: Some(request.identity.person_id.clone()),
+            completed_enrollment: None,
         };
+        let receipt = sign_json_envelope(
+            &self.seed,
+            scope_enrollment_receipt_payload(scope, &request, &policy, &service_id)?,
+            &service_id,
+            DOMAIN,
+        )?;
+        policy.completed_enrollment = Some(CompletedScopeEnrollment {
+            request_hash,
+            receipt: receipt.clone(),
+        });
         fs::create_dir_all(directory.join("objects")).map_err(|e| e.to_string())?;
         for ancestor in [
             self.directory.as_path(),
@@ -1861,20 +2064,7 @@ impl BlindStore {
         )
         .and_then(|file| file.sync_all())
         .map_err(|_| "Enrollment durability failed")?;
-        let authorization_envelope = serde_json::to_value(&request.authorization)
-            .map_err(|_| "Controller authorization invalid")?;
-        let authorization_hash = digest(canonicalize_json(&authorization_envelope)?.as_bytes());
-        let mut receipt = json!({
-            "kind": "rusty-scope-policy-receipt", "version": 1,
-            "serviceId": service_id, "scopeId": scope,
-            "personId": request.identity.person_id, "revision": revision,
-            "revoked": request.revoked, "challengeId": challenge_id,
-            "authorizationHash": authorization_hash
-        });
-        if proof.minimum_writer_version.is_some() || policy.minimum_writer_version > 1 {
-            receipt["minimumWriterVersion"] = json!(policy.minimum_writer_version);
-        }
-        sign_json_envelope(&self.seed, receipt, service_id, DOMAIN)
+        Ok(receipt)
     }
     fn objects(&self, scope: &str) -> Result<Vec<ObjectMetadata>, String> {
         if let Some(cached) = self
@@ -1977,9 +2167,23 @@ impl BlindStore {
         request_id: &str,
         writer_version: u8,
     ) -> Result<SignedEnvelope<Value>, String> {
+        self.save_for_writer_at_sequence(scope, token, object, request_id, writer_version, 0)
+    }
+    fn save_for_writer_at_sequence(
+        &self,
+        scope: &str,
+        token: &str,
+        object: BlindObject,
+        request_id: &str,
+        writer_version: u8,
+        observed_sequence: u64,
+    ) -> Result<SignedEnvelope<Value>, String> {
         object.validate(scope)?;
         if !valid_id(request_id) {
             return Err("Invalid receipt challenge".into());
+        }
+        if observed_sequence > MAX_SAFE_JS_INTEGER {
+            return Err("Invalid observed storage sequence".into());
         }
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
         let policy = self.authorize(scope, token, true)?;
@@ -2015,6 +2219,12 @@ impl BlindStore {
             );
             stored.sequence
         } else {
+            if self
+                .checkpoint_manifest(scope)?
+                .is_some_and(|manifest| observed_sequence < manifest.sequence)
+            {
+                return Err(CHECKPOINT_GENERATION_REQUIRED.into());
+            }
             let objects = self.objects(scope)?;
             let used = self.scope_storage_bytes(scope)?;
             let bytes = serde_json::to_vec(&object).map_err(|e| e.to_string())?;
@@ -2161,7 +2371,9 @@ pub fn router_with_telemetry(
         .route("/assets/{name}", get(crate::service_ui::asset))
         .route(
             "/health",
-            get(|| async { Json(json!({"status": "ok", "mode": "blind"})) }),
+            get(|| async { Json(json!({"status": "ok", "mode": "blind", "buildSha": crate::build_identity::build_sha(),
+                "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
+                "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1}})) }),
         )
         .route("/.well-known/mesh-lighthouse", get(discovery))
         .route(
@@ -2345,9 +2557,11 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
         )
     })?;
     Ok(Json(
-        json!({"protocolVersions": [2], "publicOrigin": state.origin, "displayName": "Rusty",
+        json!({"protocolVersions": [2], "publicOrigin": state.origin, "displayName": "Rusty", "buildSha": crate::build_identity::build_sha(),
+            "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
+            "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1},
         "service": {"serviceId": service_id, "publicKey": public_key},
-        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1},"snapshotCheckpoints":{"version":1},"scopeManagement":{"version":1},"personManagement":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
+        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
     ))
 }
 
@@ -2811,14 +3025,32 @@ async fn upload(
         ));
     }
     let writer_version = query.writer_version;
+    if query.observed_sequence > MAX_SAFE_JS_INTEGER {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Invalid observed storage sequence",
+        ));
+    }
+    let observed_sequence = query.observed_sequence;
     let receipt = tokio::task::spawn_blocking(move || {
-        state
-            .store
-            .save_for_writer(&scope, &token, object, &request_id, writer_version)
+        state.store.save_for_writer_at_sequence(
+            &scope,
+            &token,
+            object,
+            &request_id,
+            writer_version,
+            observed_sequence,
+        )
     })
     .await
     .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "Storage unavailable"))?
     .map_err(|message| {
+        if message == CHECKPOINT_GENERATION_REQUIRED {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"code":"checkpoint_generation_required","message":message})),
+            );
+        }
         if message.contains("Writer") || message.contains("writer") {
             return (
                 StatusCode::UPGRADE_REQUIRED,

@@ -7,7 +7,10 @@ send a strictly validated, selected-board projection and separate public file co
 after confirming source-board owner rights locally. Rusty verifies its configured
 owner root/device proof, resource-management authority, challenge-bound signatures, expected revision and snapshot
 hash; it does not claim to inspect private workspace history. Public copies include
-selected-board/card discussions and attachments, and remain unchanged until explicit
+selected-board/card discussions and attachments, plus allowlisted visitor display
+settings (preset bindings, column accents, stage labels and aging). The
+`publicBoardPublication.presentationVersion: 1` capability advertises support; older
+projections remain valid. Public copies remain unchanged until explicit
 update or withdrawal. Configure the public frontend origin in `RUSTY_CORS_ORIGINS`
 and `VITE_PUBLIC_BOARD_ORIGIN`. Never put private storage tokens, workspace reading
 keys or user board content in service configuration.
@@ -24,11 +27,52 @@ RUSTY_CORS_ORIGINS='https://tincanban.example' \
 
 In tincanban, connect by entering the Rusty address. The owner device proves its identity with a short-lived Rusty challenge and a device-signed authorization. The browser creates a random opaque scope, separate read/write storage tokens, and a 32-byte AES-GCM reading key. It sends only scope and storage tokens to Rusty; Rusty stores keyed token hashes. The service never returns bearer tokens. The browser pins the service public key and verifies signed policy and upload receipts before saving access locally or marking a snapshot replicated. Access transfer to additional already-enrolled devices requires a separate encrypted device-settings channel and is not part of this protocol.
 
-Board history, authorization proofs, and workspace chat are encrypted together. A receiving client verifies AES-GCM authentication, scope/epoch, and the existing signed causal authorization before merging changes. Normal replica push now discovers workspace file descriptors and schedules encrypted Rusty upload or cold-coverage confirmation. Completion follows blob receipts, locator-index merge and an acknowledged current snapshot; a local locator alone is insufficient. Status stays in the active local session with separate upload, missing-source, availability, access, unsupported and capacity phases. The reader uses current workspace/device authorization and verifies complete file bytes. Production scheduling and cold-read confirmation pass native HTTP acceptance from a source-closed snapshot; browser acceptance remains unrun. The current client prepares encrypted chunks through a durable bounded journal and receives them through a verified local streaming sink; preview/download callers may materialize the final verified file. Per-stream cancellation and bounded peer reads now have native/core and SDK evidence. Service-credential migration, browser acceptance and app-level session-replacement behavior remain unverified. Storage access does not grant board edit permissions. Rusty stores snapshots containing Automerge history, rather than implementing the readable Automerge sync protocol.
+Board history, authorization proofs, and workspace chat are encrypted together.
+A receiving client verifies AES-GCM authentication, scope/epoch and signed causal
+authorization before merging changes. Normal replica push schedules encrypted
+attachment upload and cold coverage confirmation. Completion requires verified
+blob receipts, locator-index merge and an acknowledged current snapshot; a local
+locator alone is insufficient. The client uses durable bounded encryption journals
+and a verified local streaming sink. Preview/download may materialize the final
+verified file within the application limit. Current Chromium and WebKit acceptance
+covers a cold recipient reading and downloading exact attachment bytes after the
+source closes, plus interrupted peer transfers without partial-cache publication.
+Storage access does not grant board editing permission. Rusty stores encrypted
+snapshots and archive objects; it never runs the readable Automerge sync protocol.
 
-**Export private access** saves a JSON file containing the reading key and storage tokens. Transfer it privately to an authorized device that already has the board through the normal signed invitation/import flow, then choose **Import private Rusty access**. These credentials remain in private local IndexedDB, outside shared board state. The current tincanban working tree transfers portable access during authenticated same-person enrollment and device-state exchange; each device retains its own cursor. Its normal device-sync loop can provision a separate identity scope for a previously board-only Rusty origin. Focused native HTTP tests cover person-policy setup, a same-person root-issued device after controller pins are removed, and cold photo delivery with source capture unavailable. Browser and deployed-device acceptance remain unverified. Older enrollments need a current key holder or recovery package once. **Disconnect locally** stops this device; it does not revoke storage tokens on Rusty. Removing a member's board grant does not remove previously obtained plaintext or reading keys.
+**Export private access** saves a JSON file containing the reading key and storage
+tokens. Transfer it privately to an authorized device that already has the board,
+then choose **Import private Rusty access**. These credentials stay in private local
+IndexedDB, outside shared board state. Same-person enrollment and authenticated
+device-state exchange transfer portable access while retaining each device's own
+cursor. The normal client loop can add a separate identity scope for a previously
+board-only Rusty origin. Native HTTP acceptance covers person-policy setup,
+same-person devices after legacy controller pins are removed and cold photo
+delivery. Desktop-to-mobile WebKit acceptance covers cold reopening after a photo
+change without another upload. A device that never received access still needs a
+current key holder or recovery package. **Disconnect locally** stops that device;
+it does not revoke server tokens. Removing a board grant cannot erase plaintext
+or keys already obtained. Local acceptance does not establish a production rollout.
 
 ## Storage protocol
+
+Scope enrollment advertises `capabilities.scopeEnrollmentRetry.version: 1`.
+The latest completed signed receipt and a hash of the exact normalized request
+commit atomically with the scope's token MACs. An identical request can recover
+that receipt after a lost response, consumed challenge or restart without
+advancing policy again. Current person/resource/device authorization and original
+signatures still apply; changed requests and superseded policies cannot reuse it.
+Two still-valid owner requests can also confirm the same immediate policy result:
+the stored revision must be exactly the requested revision plus one, and owner,
+read/write token commitments, revocation flag and explicit writer floor must all
+match. Rusty signs a receipt for each exact authorization without rewriting the
+policy or advancing its revision. Different targets and older revisions still
+conflict; this confirmation does not bypass challenge expiry or authorization.
+Bearer tokens remain absent from durable storage. Older scope-policy readers
+reject the new optional receipt field, so rollback must use a compatible reader.
+The client retains the exact enrollment request and signed receipt in a durable
+transition journal; a lost confirmation is retried without generating another key
+or silently adopting an unrelated policy revision.
 
 ### Resource management policy
 
@@ -58,14 +102,27 @@ challenges and staged files, checkpoints, and scope enrollment even when the
 presented resource capability remains otherwise valid. Pending person-policy
 updates block resource operations; an authenticated, currently authorized device
 can read person status and retry the exact saved update. These rules revoke
-management authorization only: they do not revoke storage bearer tokens already
-disclosed or erase downloaded plaintext. Future content-key and token rotation is
-separate. Root-reported current checks: 58 Rust tests plus formatting/build, three
-native HTTP integration cases, six focused app client files / 63 tests, 14
-management-capability verifier tests and 6 discovery tests passed. These focused
-results do not establish product migration/recovery UI, global revocation UI,
-future key/token rotation, full browser acceptance or coordinated old-reader
-rollback; those remain unverified.
+management authorization only: they do not themselves rotate storage bearer
+tokens or erase downloaded plaintext.
+
+Tincanban implements a separate explicit Owner action to remove another registered
+device from all connected scopes at one pinned Rusty origin. It freezes ordinary
+writers, discovers and freezes approved Workers, drains exact saved ciphertext,
+confirms cumulative person revocation, rotates scope tokens and future content
+keys through signed policy compare-and-set, updates Workers without widening their
+grants, then atomically activates portable settings and confirms a fresh snapshot.
+Durable intent and old keys survive interrupted confirmations. Conflicting stored
+credentials require explicit recovery: every historical key variant is retained
+and a fresh active epoch is proposed above all observed epochs. No timestamp or
+arbitrary variant chooses an authority winner.
+
+Focused client tests cover freeze/CAS failures, exact original outbox retries,
+signed receipt bindings, retained same-epoch key variants and activation only after
+required confirmations. Server HTTP tests cover current authorization, revocation,
+retries, policy conflicts and writer-floor enforcement. UI scenarios cover the
+explicit removal/recovery controls and their pending/failure states; they are not
+a claim that every distributed rotation fault has been exercised in a browser.
+Previously downloaded plaintext remains readable by its holder.
 
 Discovery advertises `capabilities.scopeManagement.version: 1`.
 `POST /v2/management/{kind}/{id}/status` returns `capability` (or null),
@@ -177,9 +234,9 @@ capacity and scratch accounting. The blob namespace
 allows at most 16,384 objects per scope and each ciphertext at most 1 MiB plus a
 16-byte GCM tag. No automatic blob deletion is implemented. Old servers do not
 advertise this capability; clients must retain pending uploads and report upgrade
-required rather than claiming complete attachment coverage. This server increment
-does not establish client delivery, encrypted manifest/chunk formats, product UI,
-browser acceptance or a deployed release.
+required rather than claiming complete attachment coverage. A server receipt
+attests opaque object durability; the client must additionally verify the encrypted
+manifest/chunk bindings and current workspace access before reporting completion.
 
 ### Read-only blob coverage
 
@@ -200,18 +257,15 @@ receipt binding. A private locator by itself does not establish durable presence
 of its manifest and chunks. Servers without the advertised capability cannot
 prove cold coverage; clients must report coverage as unsupported or incomplete.
 
-Rusty's full suite passes 72 tests, including malformed-batch, missing/corrupt
-object, wrong-epoch, read-denial, live-policy/revocation and injected namespace
-fsync-failure coverage cases. The durability fault reproduced premature receipt
-issuance and now requires both scope-link and blob-directory durability. Five
-focused client suites pass 42 tests. The production client coverage adapter has
-five focused cases and a native HTTP confirmation test before cold-recipient
-download: it authenticates the manifest, derives the exact chunk set, requests
-signed coverage without downloading chunk payloads, and rechecks live guards.
-Normal application replication now schedules attachment upload and coverage
-confirmation. Product/browser acceptance and compatible-client rollout of the
-bounded peer-read limit remain unfinished; older cached adapters may ignore the
-optional read bound.
+Protocol tests cover malformed batches, missing/corrupt objects, wrong epochs,
+read denial, policy/revocation and injected namespace-fsync failure. The client
+coverage adapter authenticates the manifest, derives the exact chunk set, verifies
+signed coverage without downloading chunk payloads and rechecks live guards.
+Application replication schedules upload and coverage confirmation. Real
+source-closed attachment preview/download passes in Chromium and WebKit. Bounded
+peer-read and cancellation checks include interrupted transfer/reconnect without
+publishing partial bytes. Reload tabs onto the coordinated current frontend/WASM
+cohort: an older cached adapter may ignore the optional stream read bound.
 
 ### Private history archive objects and coverage
 
@@ -261,33 +315,39 @@ limits each scope to 1,048,576 objects. First use after process start scans the
 archive directory for byte/count accounting. A warm in-memory accounting cache
 is invalidated before uncertain writes and refreshed after a durable write. This
 is not a durable bounded accounting index: restart accounting still requires a
-directory scan. The durable captured/archived/covered preparation repository now
-has SDK, private IndexedDB and Worker Durable Object storage adapters. It is caller-
-fed: it does not consume the native `VerifiedHistoryPreparation` token or capture
-the authenticated archive catalogue. No ordinary host scheduler, signed Owner
-transition, atomic baseline activation, restore/export or capability rollout is
-implemented.
+directory scan.
 
-Tincanban's targeted native-client test now uses the durable private IndexedDB
-preparation repository. After a lost upload reply and Rusty restart, a fresh handle
-reopens captured/archived state, retries exact ciphertext without resealing, then
-confirms signed complete coverage. It retains and cold-recovers a real signed
-Automerge change with an absent dependency and repeated-content parts, checking the
-original hash, dependencies and author signature. This caller-fed repository is
-not connected to the native verified preparation token, ordinary host scheduling
-or baseline activation. The combined native client suite now passes eight cases,
-including a Native-derived catalogue generated by `VerifiedHistoryArchiveCapture`.
-That case stages the exact Native objects through the app journal, confirms real
-signed coverage, then cold-downloads original control, proof and compressed pending
-change bytes. SDK replay of the same vector preserves admitted/pending/quarantined
-classifications through actual WASM. This is fixture/transport integration; a live
-WASM capture handle and ordinary producer integration remain absent. The retained
-Workerd result is 125 runtime cases. Browser acceptance, automatic host
-scheduling, native baseline authority and deployment verification remain open.
+The shared captured/archived/covered preparation journal has SDK, private
+IndexedDB and Worker Durable Object adapters. Tincanban's live WASM producer
+consumes Native-verified preparation, emits the original encrypted catalogue,
+confirms exact data/directory coverage and signs an Owner-attested compact basis.
+The compact basis byte tree has its own exact-set coverage receipt. Current
+Workers have explicit prepare/activate history phases: original pending writes
+are drained before freezing, and Native verifies the published basis and covered
+local heads before activation. Rusty only stores opaque objects and signs storage
+receipts; it cannot create the Owner attestation or expand a Worker's grant.
+
+Native HTTP acceptance exercises real capture/rebase/storage/coverage through the
+WASM sink and application journal, exact ciphertext retry after a lost reply and
+Rusty restart, and cold original control/proof/pending-change reads. Frozen legacy
+fixtures retain their original admission policy and bytes. Current Chromium and
+WebKit acceptance covers archive publication, a credential-free Editor's bounded
+historical read, complete private export, incomplete export after both sources
+close, fresh identity/workspace recovery and an offline version restore as a new
+currently authorized command. Encrypted Rusty readers verify storage correspondence;
+authorized direct-peer readers verify Owner authority and content-addressed
+plaintext proof paths without claiming equivalent ciphertext evidence.
+
+Application activation uses a staged journal and exact source/revision guards;
+original history and prior baselines remain available. Export includes unavailable
+objects as incomplete coverage rather than deleting or inventing originals. These
+results prove the tested local paths, not an activated production revision. The
+coordinated CI cohort and deployment receipts identify actual deployed artifacts.
 
 ### Confirmed snapshot retention
 
-Discovery advertises `capabilities.snapshotCheckpoints.version: 1`. An owner
+Discovery advertises `capabilities.snapshotCheckpoints` as
+`{version: 1, observedSequence: true}`. An owner
 device may replace already merged snapshots with one complete encrypted
 checkpoint. Ordinary writers, including scoped automation, retain append-only
 storage access; a write token alone cannot prune a scope.
@@ -301,10 +361,12 @@ Times are epoch milliseconds; expiry may be at most 120 seconds after issuance,
 and issuance may be at most 30 seconds ahead of server time. Rusty verifies the
 configured root/controller certificate chain and the scope policy's owner.
 
-The device must first durably merge the full inventory and confirm that its raw
-Automerge history has no pending or quarantined changes, retaining all required
-authorization evidence. It encrypts the resulting full history and current chat
-state, including signed records. Chat follows tincanban's existing local retention
+The device must first durably merge the full inventory and confirm that its
+current raw Automerge document has no pending or quarantined changes, retaining
+all required authorization evidence. It encrypts the admitted compact basis and
+active tail (or the original document before archiving), archive references and
+current chat state, including signed records. Earlier archived originals stay in
+the separate archive namespace. Chat follows tincanban's existing local retention
 policy (2000 messages / 4 MiB); this is not an archive of all historical chat.
 Ephemeral typing is excluded. Rusty remains blind and trusts the certified
 owner's checkpoint attestation rather than inspecting plaintext.
@@ -317,6 +379,15 @@ the new object at `N+1`, atomically fsyncs `compaction.json` with retained floor
 object can use temporary scratch space while an old scope is full, but the
 retained object must fit the configured quota. Old objects are never deleted
 before the new checkpoint is durable.
+
+Snapshot uploads include `observedSequence`, the admitted inventory cursor saved
+with their original outbox ciphertext and request. After a checkpoint, a new
+object prepared before its sequence receives HTTP 409
+`checkpoint_generation_required` before storage changes. An omitted field means
+zero. A byte-identical object already retained remains idempotent after current
+authorization checks. Clients must preserve the original sequence on retries;
+a later cursor cannot reauthorize an older prepared snapshot. This storage
+ordering fence keeps the existing writer policy unchanged.
 
 The `RUSTY/2` signed receipt has `kind: rusty-snapshot-checkpoint-receipt`,
 `version: 1`, `serviceId`, `scopeId`, `keyEpoch`, `objectId`, `sequence`,
@@ -419,19 +490,22 @@ python3 scripts/smoke_service.py target/debug/mesh-lighthouse
 node scripts/service-ui.mjs target/debug/mesh-lighthouse
 ```
 
-The tests cover two HTTP clients, opaque replication, signed durable receipts, retry, restart, concurrent-writer exclusion, read/write separation, revoked storage, and refusal of plaintext state. Tincanban's `e2e/blind-keeper.spec.ts` starts the standalone debug binary with its own temporary directory/port and checks actual browser encryption, native signature verification, restart settings, and unavailable-server behavior.
+The tests cover two HTTP clients, opaque replication, signed durable receipts, retry, restart, concurrent-writer exclusion, read/write separation, revoked storage, and refusal of plaintext state. Tincanban's `e2e/rusty-connection.spec.ts` and `e2e/repeated-rusty-poll.spec.ts` use an actual service binary with isolated temporary state and unused ports. Attachment and history acceptance live in `e2e/attachments-rusty.spec.ts` and `e2e/attachment-session-recovery.spec.ts`.
 
 The service UI browser check uses the adjacent tincanban checkout's installed
 Playwright. It starts an isolated Rusty process on an unused port, verifies loaded
 local fonts and the original robot/header on desktop and mobile, and exercises an
 unavailable Sink link. Screenshots are written under ignored `target/`.
 
-`main` is the canonical blind-storage and public-publication release. GitHub Actions
-checks formatting, the storage/publication protocol suite, and discovery and durable
-identity across real service-process restarts. Tincanban CI pins a commit from this
-branch and exercises its publication lifecycle with browsers. The former readable
-Keeper runtime, pairing console and application grants are superseded; merging their
-history does not reactivate them or change existing encrypted storage.
+GitHub Actions checks formatting, storage/publication protocols, formal models,
+and discovery/durable identity across real service-process restarts. Publishing
+seals the exact executable hash, immutable image digest and pinned SDK revision.
+The running service reports its executable digest; a source SHA alone does not
+identify deployed bytes. Coordinated tincanban CI binds this artifact to the exact
+frontend and captured Worker artifacts before activation and rollback selection.
+Only that cohort's deployment evidence establishes which release is running.
+The retired readable Keeper runtime, pairing console and application grants are
+not reactivated by retaining their Git history.
 
 [Blind-storage TLA+ models](formal/tla/README.md) run in CI alongside native tests.
 Duplicate upload and recovered checkpoint retries confirm directory durability

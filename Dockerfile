@@ -14,6 +14,8 @@ RUN mkdir src \
 COPY src ./src
 ARG RUSTY_BUILD_SHA=unknown
 ENV RUSTY_BUILD_SHA=$RUSTY_BUILD_SHA
+ARG RUSTY_SDK_SHA=unknown
+ENV RUSTY_SDK_SHA=$RUSTY_SDK_SHA
 # Rebuild only the root package after replacing the placeholder sources.
 RUN touch src/lib.rs src/main.rs \
     && cargo build --release --locked

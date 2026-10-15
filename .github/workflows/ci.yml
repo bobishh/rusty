@@ -59,6 +59,8 @@ jobs:
         run: cargo build --locked --bin mesh-lighthouse
       - name: Verify real process discovery and restart
         run: python3 scripts/smoke_service.py target/debug/mesh-lighthouse
+      - name: Verify immutable release sealing
+        run: python3 -m unittest discover -s scripts -p test_seal_release.py
 
   publish-container:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -75,6 +77,22 @@ jobs:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Build verified service revision
-        run: docker build --build-arg "RUSTY_BUILD_SHA=$GITHUB_SHA" --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/bobishh/rusty" --tag "ghcr.io/bobishh/rusty:$GITHUB_SHA" .
+        run: |
+          sdk_sha=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["dependencies"]["meta-mesh-core"]["rev"])')
+          docker build --build-arg "RUSTY_BUILD_SHA=$GITHUB_SHA" --build-arg "RUSTY_SDK_SHA=$sdk_sha" --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/bobishh/rusty" --tag "ghcr.io/bobishh/rusty:$GITHUB_SHA" .
       - name: Publish immutable service image
         run: docker push "ghcr.io/bobishh/rusty:$GITHUB_SHA"
+      - name: Capture the exact published executable and immutable image identity
+        run: |
+          mkdir -p .release/rusty
+          container=$(docker create "ghcr.io/bobishh/rusty:$GITHUB_SHA")
+          docker cp "$container:/usr/local/bin/mesh-lighthouse" .release/rusty/mesh-lighthouse
+          docker rm "$container"
+          image=$(docker inspect --format '{{index .RepoDigests 0}}' "ghcr.io/bobishh/rusty:$GITHUB_SHA")
+          python3 scripts/seal_release.py .release/rusty "$image"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rusty-release-${{ github.sha }}-${{ github.run_attempt }}
+          path: .release/rusty/
+          if-no-files-found: error
+          retention-days: 14

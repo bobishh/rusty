@@ -933,13 +933,87 @@ async fn owner_checkpoint_prunes_confirmed_frontier_retries_and_preserves_concur
     assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
     let mut racing = encrypted_fixture();
     racing.nonce = URL_SAFE_NO_PAD.encode([5u8; 12]);
-    assert_eq!(
-        store
-            .save("opaque-scope", &"w".repeat(43), racing, "racing")
-            .unwrap()
-            .payload["sequence"],
-        4
+    let racing_id = racing.id().unwrap();
+    let upload_endpoint = format!("{origin}/v2/scopes/opaque-scope/objects/{racing_id}");
+    let stale = client
+        .put(format!(
+            "{upload_endpoint}?writerVersion=2&observedSequence=2"
+        ))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "racing-stale")
+        .json(&racing)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale_body = stale.json::<Value>().await.unwrap();
+    assert_eq!(stale_body["code"], "checkpoint_generation_required");
+    assert!(
+        stale_body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refresh storage inventory")
     );
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
+
+    let current = client
+        .put(format!(
+            "{upload_endpoint}?writerVersion=2&observedSequence=3"
+        ))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "racing-current")
+        .json(&racing)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        current.status(),
+        StatusCode::OK,
+        "{}",
+        current.text().await.unwrap()
+    );
+    let current_receipt: SignedEnvelope<Value> = client
+        .put(format!("{upload_endpoint}?writerVersion=2"))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "racing-retry")
+        .json(&racing)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(current_receipt.payload["sequence"], 4);
+
+    let mut legacy = encrypted_fixture();
+    legacy.nonce = URL_SAFE_NO_PAD.encode([7u8; 12]);
+    let legacy_id = legacy.id().unwrap();
+    let unsafe_sequence = client
+        .put(format!("{origin}/v2/scopes/opaque-scope/objects/{legacy_id}?writerVersion=2&observedSequence=9007199254740992"))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "unsafe-sequence")
+        .json(&legacy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsafe_sequence.status(), StatusCode::BAD_REQUEST);
+    let legacy_response = client
+        .put(format!(
+            "{origin}/v2/scopes/opaque-scope/objects/{legacy_id}?writerVersion=2"
+        ))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "legacy-no-sequence")
+        .json(&legacy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        legacy_response.json::<Value>().await.unwrap()["code"],
+        "checkpoint_generation_required"
+    );
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 2);
+
     let replay: SignedEnvelope<Value> = client
         .post(&endpoint)
         .bearer_auth("w".repeat(43))
@@ -973,6 +1047,22 @@ async fn owner_checkpoint_prunes_confirmed_frontier_retries_and_preserves_concur
         conflict.json::<Value>().await.unwrap()["code"],
         "checkpoint_conflict"
     );
+    let mut revoked_policy = store.policy("opaque-scope").unwrap();
+    revoked_policy.revoked = true;
+    atomic_write(
+        &store.scope_dir("opaque-scope").unwrap().join("policy.json"),
+        &serde_json::to_vec(&revoked_policy).unwrap(),
+    )
+    .unwrap();
+    let revoked_retry = client
+        .put(format!("{upload_endpoint}?writerVersion=2"))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "revoked-existing-object")
+        .json(&racing)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked_retry.status(), StatusCode::FORBIDDEN);
     server.abort();
     let _ = server.await;
     drop(store);
