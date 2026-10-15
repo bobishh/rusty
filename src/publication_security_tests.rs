@@ -551,3 +551,33 @@ fn orphan_cleanup_is_bounded_and_preserves_active_and_recent_files() {
         bytes
     );
 }
+
+#[test]
+fn given_visitor_presentation_when_validating_publication_then_keep_only_public_references() {
+    let mut projection = json!({"kind":"tincanban-public-board","version":1,
+        "board":{"id":BOARD,"title":"Jobs","presentation":{"entityName":"lead",
+            "preset":{"key":"job-search","version":1,"bindings":{"status.applied":"column","field.company":"company"}}}},
+        "columns":[{"id":"column","title":"Applied","rank":"0/1","color":"#66b3ff","collapsible":true}],
+        "fields":[{"id":"company","title":"Company","valueType":"text","required":true,"rank":"0/1","options":[]}],
+        "cards":[{"id":"card","parentId":null,"columnId":"column","title":"Acme","body":"","values":{"company":"Acme"},"rank":"0/1","createdAt":"2026-10-15","updatedAt":"2026-10-15"}],
+        "discussions":[],"files":[]});
+    assert!(validate_public_projection(&projection).is_ok());
+    let fixture = Fixture::new();
+    let request = fixture.request("publish", Some(projection.clone()), fixture.challenge());
+    assert!(fixture.mutate(request).is_ok());
+    assert_eq!(
+        fixture
+            .store
+            .current_publication(BOARD)
+            .unwrap()
+            .unwrap()
+            .projection,
+        Some(projection.clone())
+    );
+    projection["board"]["presentation"]["preset"]["bindings"]["field.company"] =
+        json!("private-field");
+    assert!(validate_public_projection(&projection).is_err());
+    projection["board"]["presentation"]["preset"]["bindings"]["field.company"] = json!("company");
+    projection["board"]["presentation"]["ownerKey"] = json!("private");
+    assert!(validate_public_projection(&projection).is_err());
+}

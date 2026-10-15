@@ -40,6 +40,265 @@ fn checkpoint_fixture() -> (PathBuf, BlindStore, TrustedOwner, Value) {
     )
 }
 
+// Given independently acknowledged attachment objects, a real authorized snapshot
+// checkpoint preserves those bytes and accounts for them in the shared quota.
+#[test]
+fn checkpoint_keeps_attachment_bytes_and_respects_combined_retained_capacity() {
+    let (directory, mut store, trusted, mut request) = checkpoint_fixture();
+    set_scope_writer_floor_for_test(&store, "opaque-scope", 2);
+    let mut authorization = request["authorization"]["payload"].clone();
+    authorization["writerVersion"] = json!(2);
+    let device_id = request["deviceId"].as_str().unwrap();
+    request["authorization"] = serde_json::to_value(
+        sign_json_envelope(&[32; 32], authorization, device_id, "MATCH/1").unwrap(),
+    )
+    .unwrap();
+    let mut blob = encrypted_fixture();
+    blob.nonce = URL_SAFE_NO_PAD.encode([8; 12]);
+    let blob_id = blob.id().unwrap();
+    store
+        .save_blob_for_writer(
+            "opaque-scope",
+            &"w".repeat(43),
+            blob.clone(),
+            "blob-before-checkpoint",
+            2,
+        )
+        .unwrap();
+    let replacement = json!({"sequence":3,"objectId":request["authorization"]["payload"]["objectId"],
+        "object":request["object"],"checkpoint":{"expectedSequence":2,
+        "authorizationHash":digest(canonicalize_json(&request["authorization"]).unwrap().as_bytes())}});
+    store.max_scope_bytes = serde_json::to_vec(&replacement).unwrap().len() as u64;
+    assert_eq!(
+        store
+            .checkpoint(
+                "opaque-scope",
+                &"w".repeat(43),
+                serde_json::from_value(request.clone()).unwrap(),
+                &trusted,
+                "https://rusty.example"
+            )
+            .unwrap_err(),
+        "Checkpoint exceeds storage capacity"
+    );
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 2);
+    assert!(store.checkpoint_manifest("opaque-scope").unwrap().is_none());
+    store.max_scope_bytes = MAX_SCOPE_BYTES;
+    store
+        .checkpoint(
+            "opaque-scope",
+            &"w".repeat(43),
+            serde_json::from_value(request).unwrap(),
+            &trusted,
+            "https://rusty.example",
+        )
+        .unwrap();
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
+    let path = directory.join(format!("scopes/opaque-scope/blobs/{blob_id}.json"));
+    assert_eq!(
+        serde_json::from_slice::<BlindObject>(&fs::read(&path).unwrap()).unwrap(),
+        blob
+    );
+    drop(store);
+    let restarted = BlindStore::open(directory.clone()).unwrap();
+    assert_eq!(restarted.objects("opaque-scope").unwrap().len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<BlindObject>(&fs::read(path).unwrap()).unwrap(),
+        blob
+    );
+    drop(restarted);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn set_checkpoint_writer_v2(request: &mut Value) {
+    let mut authorization = request["authorization"]["payload"].clone();
+    authorization["writerVersion"] = json!(2);
+    request["authorization"] = serde_json::to_value(
+        sign_json_envelope(
+            &[32; 32],
+            authorization,
+            request["deviceId"].as_str().unwrap(),
+            "MATCH/1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn archive_objects_survive_signed_checkpoint_pruning_and_restart() {
+    let (directory, store, trusted, mut request) = checkpoint_fixture();
+    set_scope_writer_floor_for_test(&store, "opaque-scope", 2);
+    set_checkpoint_writer_v2(&mut request);
+
+    let mut archive = encrypted_fixture();
+    archive.nonce = URL_SAFE_NO_PAD.encode([21u8; 12]);
+    let archive_id = archive.id().unwrap();
+    let receipt = store
+        .save_archive_for_writer(
+            "opaque-scope",
+            &"w".repeat(43),
+            archive.clone(),
+            "archive-before-checkpoint-0001",
+            2,
+        )
+        .unwrap();
+    assert_eq!(receipt.payload["objectId"], archive_id);
+    assert_eq!(
+        store.read_archive("opaque-scope", &archive_id).unwrap(),
+        archive
+    );
+
+    store
+        .checkpoint(
+            "opaque-scope",
+            &"w".repeat(43),
+            serde_json::from_value(request).unwrap(),
+            &trusted,
+            "https://rusty.example",
+        )
+        .unwrap();
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
+    assert_eq!(
+        store.read_archive("opaque-scope", &archive_id).unwrap(),
+        archive
+    );
+    drop(store);
+
+    let restarted = BlindStore::open(directory.clone()).unwrap();
+    assert_eq!(restarted.objects("opaque-scope").unwrap().len(), 1);
+    assert_eq!(
+        restarted.read_archive("opaque-scope", &archive_id).unwrap(),
+        archive
+    );
+    drop(restarted);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn archives_consume_shared_capacity_and_reduce_checkpoint_retention_budget() {
+    let (directory, mut store, trusted, mut request) = checkpoint_fixture();
+    set_scope_writer_floor_for_test(&store, "opaque-scope", 2);
+    set_checkpoint_writer_v2(&mut request);
+
+    let mut archive = encrypted_fixture();
+    archive.nonce = URL_SAFE_NO_PAD.encode([22u8; 12]);
+    let archive_id = archive.id().unwrap();
+    store
+        .save_archive_for_writer(
+            "opaque-scope",
+            &"w".repeat(43),
+            archive,
+            "archive-for-capacity-0001",
+            2,
+        )
+        .unwrap();
+    let archive_path = directory.join(format!("scopes/opaque-scope/archives/{archive_id}.json"));
+    let archive_bytes = fs::metadata(&archive_path).unwrap().len();
+
+    let used = store.scope_storage_bytes("opaque-scope").unwrap();
+    store.max_scope_bytes = used;
+    let mut second_archive = encrypted_fixture();
+    second_archive.nonce = URL_SAFE_NO_PAD.encode([23u8; 12]);
+    assert!(
+        store
+            .save_archive_for_writer(
+                "opaque-scope",
+                &"w".repeat(43),
+                second_archive,
+                "archive-over-capacity-001",
+                2,
+            )
+            .is_err(),
+        "archive namespace must share scope quota with snapshots and attachments"
+    );
+
+    let replacement = json!({"sequence":3,"objectId":request["authorization"]["payload"]["objectId"],
+        "object":request["object"],"checkpoint":{"expectedSequence":2,
+        "authorizationHash":digest(canonicalize_json(&request["authorization"]).unwrap().as_bytes())}});
+    let checkpoint_bytes = serde_json::to_vec(&replacement).unwrap().len() as u64;
+    store.max_scope_bytes = checkpoint_bytes + archive_bytes - 1;
+    assert_eq!(
+        store
+            .checkpoint(
+                "opaque-scope",
+                &"w".repeat(43),
+                serde_json::from_value(request).unwrap(),
+                &trusted,
+                "https://rusty.example",
+            )
+            .unwrap_err(),
+        "Checkpoint exceeds storage capacity",
+        "retained archive bytes must reduce checkpoint capacity"
+    );
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 2);
+    assert_eq!(
+        store
+            .read_archive("opaque-scope", &archive_id)
+            .unwrap()
+            .id()
+            .unwrap(),
+        archive_id
+    );
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_requires_signed_current_writer_version_before_cleanup() {
+    let (directory, store, trusted, mut request) = checkpoint_fixture();
+    set_scope_writer_floor_for_test(&store, "opaque-scope", 2);
+    let app = router(
+        store.clone(),
+        "https://rusty.example".into(),
+        Some(trusted),
+        vec![],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let endpoint = format!("{origin}/v2/scopes/opaque-scope/checkpoint");
+    let old = client
+        .post(&endpoint)
+        .bearer_auth("w".repeat(43))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(
+        old.json::<Value>().await.unwrap()["code"],
+        "writer_upgrade_required"
+    );
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 2);
+    assert!(store.checkpoint_manifest("opaque-scope").unwrap().is_none());
+
+    let mut authorization = request["authorization"]["payload"].clone();
+    authorization["writerVersion"] = json!(2);
+    let device_id = request["deviceId"].as_str().unwrap();
+    request["authorization"] = serde_json::to_value(
+        sign_json_envelope(&[32; 32], authorization, device_id, "MATCH/1").unwrap(),
+    )
+    .unwrap();
+    let current = client
+        .post(&endpoint)
+        .bearer_auth("w".repeat(43))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    let receipt: SignedEnvelope<Value> = current.json().await.unwrap();
+    assert_eq!(receipt.payload["sequence"], 3);
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn checkpoint_owner_signature_binding_expiry_and_current_policy_fail_closed() {
     let (directory, store, trusted, request) = checkpoint_fixture();
@@ -674,13 +933,87 @@ async fn owner_checkpoint_prunes_confirmed_frontier_retries_and_preserves_concur
     assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
     let mut racing = encrypted_fixture();
     racing.nonce = URL_SAFE_NO_PAD.encode([5u8; 12]);
-    assert_eq!(
-        store
-            .save("opaque-scope", &"w".repeat(43), racing, "racing")
-            .unwrap()
-            .payload["sequence"],
-        4
+    let racing_id = racing.id().unwrap();
+    let upload_endpoint = format!("{origin}/v2/scopes/opaque-scope/objects/{racing_id}");
+    let stale = client
+        .put(format!(
+            "{upload_endpoint}?writerVersion=2&observedSequence=2"
+        ))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "racing-stale")
+        .json(&racing)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale_body = stale.json::<Value>().await.unwrap();
+    assert_eq!(stale_body["code"], "checkpoint_generation_required");
+    assert!(
+        stale_body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refresh storage inventory")
     );
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
+
+    let current = client
+        .put(format!(
+            "{upload_endpoint}?writerVersion=2&observedSequence=3"
+        ))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "racing-current")
+        .json(&racing)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        current.status(),
+        StatusCode::OK,
+        "{}",
+        current.text().await.unwrap()
+    );
+    let current_receipt: SignedEnvelope<Value> = client
+        .put(format!("{upload_endpoint}?writerVersion=2"))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "racing-retry")
+        .json(&racing)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(current_receipt.payload["sequence"], 4);
+
+    let mut legacy = encrypted_fixture();
+    legacy.nonce = URL_SAFE_NO_PAD.encode([7u8; 12]);
+    let legacy_id = legacy.id().unwrap();
+    let unsafe_sequence = client
+        .put(format!("{origin}/v2/scopes/opaque-scope/objects/{legacy_id}?writerVersion=2&observedSequence=9007199254740992"))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "unsafe-sequence")
+        .json(&legacy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsafe_sequence.status(), StatusCode::BAD_REQUEST);
+    let legacy_response = client
+        .put(format!(
+            "{origin}/v2/scopes/opaque-scope/objects/{legacy_id}?writerVersion=2"
+        ))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "legacy-no-sequence")
+        .json(&legacy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        legacy_response.json::<Value>().await.unwrap()["code"],
+        "checkpoint_generation_required"
+    );
+    assert_eq!(store.objects("opaque-scope").unwrap().len(), 2);
+
     let replay: SignedEnvelope<Value> = client
         .post(&endpoint)
         .bearer_auth("w".repeat(43))
@@ -714,6 +1047,22 @@ async fn owner_checkpoint_prunes_confirmed_frontier_retries_and_preserves_concur
         conflict.json::<Value>().await.unwrap()["code"],
         "checkpoint_conflict"
     );
+    let mut revoked_policy = store.policy("opaque-scope").unwrap();
+    revoked_policy.revoked = true;
+    atomic_write(
+        &store.scope_dir("opaque-scope").unwrap().join("policy.json"),
+        &serde_json::to_vec(&revoked_policy).unwrap(),
+    )
+    .unwrap();
+    let revoked_retry = client
+        .put(format!("{upload_endpoint}?writerVersion=2"))
+        .bearer_auth("w".repeat(43))
+        .header("x-rusty-request-id", "revoked-existing-object")
+        .json(&racing)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked_retry.status(), StatusCode::FORBIDDEN);
     server.abort();
     let _ = server.await;
     drop(store);

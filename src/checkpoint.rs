@@ -45,6 +45,7 @@ pub(super) struct Request {
     identity: PublicIdentity,
     device_id: String,
     certificates: Vec<DeviceCertificate>,
+    management_capability: Option<SignedEnvelope<Value>>,
     authorization: SignedEnvelope<Authorization>,
 }
 
@@ -58,6 +59,10 @@ struct Authorization {
     scope_id: String,
     key_epoch: u64,
     policy_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    management_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer_version: Option<u8>,
     expected_sequence: u64,
     object_id: String,
     request_id: String,
@@ -112,7 +117,11 @@ impl BlindStore {
         Ok(Some(value))
     }
 
-    fn prune_checkpoint_objects(&self, scope: &str, floor: u64) -> Result<(u64, usize), String> {
+    pub(super) fn prune_checkpoint_objects(
+        &self,
+        scope: &str,
+        floor: u64,
+    ) -> Result<(u64, usize), String> {
         let directory = self.scope_dir(scope)?.join("objects");
         let mut bytes = 0u64;
         let mut count = 0usize;
@@ -159,12 +168,17 @@ impl BlindStore {
         if !trusted_identity_matches(&request.identity, &trusted.identity)
             || policy.owner_person_id.as_deref() != Some(request.identity.person_id.as_str())
             || request.certificates.is_empty()
-            || !trusted_controller_device(
+            || !self.management_authorized(
                 trusted,
                 &request.identity,
                 &request.device_id,
                 &request.certificates,
-            )
+                "scope",
+                scope,
+                "snapshot.checkpoint",
+                request.management_capability.as_ref(),
+                origin,
+            )?
         {
             return Err("Untrusted checkpoint owner or device".into());
         }
@@ -189,6 +203,9 @@ impl BlindStore {
         let object_id = request.object.id()?;
         let service_id = public_key_id(&self.public_key()?)?;
         let proof = &request.authorization.payload;
+        if !self.management_revision_matches("scope", scope, proof.management_revision)? {
+            return Err("Checkpoint management revision binding invalid".into());
+        }
         if proof.kind != "rusty-snapshot-checkpoint"
             || proof.version != 1
             || proof.service_id != service_id
@@ -202,6 +219,10 @@ impl BlindStore {
         {
             return Err("Checkpoint authorization binding invalid".into());
         }
+        require_writer_version(
+            &policy,
+            proof.writer_version.unwrap_or_else(legacy_writer_version),
+        )?;
         let authorization_hash = digest(
             canonicalize_json(
                 &serde_json::to_value(&request.authorization)
@@ -280,27 +301,25 @@ impl BlindStore {
                 .filter(|object| {
                     object.sequence > proof.expected_sequence && object.object_id != object_id
                 })
-                .try_fold(encoded.len() as u64, |total, object| {
-                    directory
-                        .join("objects")
-                        .join(format!("{}.json", object.object_id))
-                        .metadata()
-                        .map(|metadata| total.saturating_add(metadata.len()))
-                        .map_err(|_| "Checkpoint storage unavailable")
-                })?;
+                .try_fold(
+                    (encoded.len() as u64)
+                        .saturating_add(self.blob_storage_bytes(scope)?)
+                        .saturating_add(self.archive_storage_usage(scope)?.0),
+                    |total, object| {
+                        directory
+                            .join("objects")
+                            .join(format!("{}.json", object.object_id))
+                            .metadata()
+                            .map(|metadata| total.saturating_add(metadata.len()))
+                            .map_err(|_| "Checkpoint storage unavailable")
+                    },
+                )?;
             if remaining_bytes > self.max_scope_bytes {
                 return Err("Checkpoint exceeds storage capacity".into());
             }
             if !recovery {
                 // Bound disk scratch by one maximum-sized encoded replacement slot.
-                let used = fs::read_dir(directory.join("objects"))
-                    .map_err(|_| "Checkpoint storage unavailable")?
-                    .try_fold(0u64, |total, entry| {
-                        entry
-                            .and_then(|entry| entry.metadata())
-                            .map(|metadata| total.saturating_add(metadata.len()))
-                    })
-                    .map_err(|_| "Checkpoint storage unavailable")?;
+                let used = self.scope_storage_bytes(scope)?;
                 let scratch_limit = (MAX_OBJECT_BYTES as u64 + 2) / 3 * 4 + 4096;
                 if objects.len() > MAX_SCOPE_OBJECTS
                     || used.saturating_add(encoded.len() as u64)
@@ -402,7 +421,9 @@ pub(super) async fn checkpoint(
         )
     })?;
     result.map(Json).map_err(|message| {
-        let (status, code) = if message.starts_with("Checkpoint inventory changed:") { (StatusCode::CONFLICT, "checkpoint_conflict") }
+        let (status, code) = if message == "Writer upgrade required" || message == "Unsupported writer version" {
+            (StatusCode::UPGRADE_REQUIRED, "writer_upgrade_required")
+        } else if message.starts_with("Checkpoint inventory changed:") { (StatusCode::CONFLICT, "checkpoint_conflict") }
             else if message.contains("owner") || message.contains("device") || message.contains("signature") || message.contains("access") || message.contains("Scope unavailable") { (StatusCode::FORBIDDEN, "checkpoint_forbidden") }
             else if message.contains("binding") || message.contains("expired") || message.contains("Invalid object") || message.contains("Invalid encrypted") { (StatusCode::BAD_REQUEST, "checkpoint_invalid") }
             else { (StatusCode::SERVICE_UNAVAILABLE, "checkpoint_unavailable") };
