@@ -1982,24 +1982,28 @@ impl BlindStore {
         {
             return Err("Enrollment challenge binding or expiry invalid".into());
         }
+        let concurrent_confirmation = expected_revision.checked_add(1) == Some(current.revision);
+        let current_floor_confirmation = current.revision == expected_revision
+            && proof.minimum_writer_version == Some(2)
+            && current.minimum_writer_version == 2;
+        // Equivalent explicit floor-2 confirmations from another owner device
+        // preserve the canonical policy revision instead of creating divergent client state.
+        if (concurrent_confirmation || current_floor_confirmation)
+            && current.owner_person_id.as_ref() == Some(&request.identity.person_id)
+            && current.revoked == request.revoked
+            && proof.minimum_writer_version == Some(current.minimum_writer_version)
+            && current.read_mac == self.token_mac(scope, &request.read_token)?
+            && current.write_mac == self.token_mac(scope, &request.write_token)?
+        {
+            sync_directory(&directory).map_err(|_| "Enrollment durability failed")?;
+            return sign_json_envelope(
+                &self.seed,
+                scope_enrollment_receipt_payload(scope, &request, &current, &service_id)?,
+                &service_id,
+                DOMAIN,
+            );
+        }
         if current.revision != expected_revision {
-            // Concurrent owner devices can request the exact same floor upgrade.
-            // Confirm that already durable target without changing its policy CAS.
-            if expected_revision.checked_add(1) == Some(current.revision)
-                && current.owner_person_id.as_ref() == Some(&request.identity.person_id)
-                && current.revoked == request.revoked
-                && proof.minimum_writer_version == Some(current.minimum_writer_version)
-                && current.read_mac == self.token_mac(scope, &request.read_token)?
-                && current.write_mac == self.token_mac(scope, &request.write_token)?
-            {
-                sync_directory(&directory).map_err(|_| "Enrollment durability failed")?;
-                return sign_json_envelope(
-                    &self.seed,
-                    scope_enrollment_receipt_payload(scope, &request, &current, &service_id)?,
-                    &service_id,
-                    DOMAIN,
-                );
-            }
             return Err("Storage policy revision conflict".into());
         }
         if proof

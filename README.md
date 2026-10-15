@@ -68,6 +68,14 @@ read/write token commitments, revocation flag and explicit writer floor must all
 match. Rusty signs a receipt for each exact authorization without rewriting the
 policy or advancing its revision. Different targets and older revisions still
 conflict; this confirmation does not bypass challenge expiry or authorization.
+An explicit floor-2 request may also reaffirm the exact current floor-2 policy:
+when owner, token commitments and revocation state already match, a fresh signed
+receipt keeps the current revision. It does not rewrite policy or replace the
+last completed mutation receipt. Current device/resource authorization and the
+fresh challenge still apply. A real token, revocation or floor change retains
+normal revision compare-and-set semantics; legacy requests keep their previous
+revision behavior. New board scopes can start at floor 2 without an intermediate
+upgrade visible to another device.
 Bearer tokens remain absent from durable storage. Older scope-policy readers
 reject the new optional receipt field, so rollback must use a compatible reader.
 The client retains the exact enrollment request and signed receipt in a durable
@@ -176,7 +184,7 @@ preserve the service key, pending markers, current pointers and immutable record
 Discovery: `GET /.well-known/mesh-lighthouse`, protocol 2, mode `blind`, `applicationWrites: false`, `classification: false`. No person/device certificate or application grant is advertised. The signed enrollment flow is distinct from workspace pairing; it never sends workspace grants or content keys.
 
 - `POST /v2/enrollment/challenge`: `{version, scopeId, identity, deviceId, certificates}`. Returns a Rusty-signed, 120-second challenge bound to service identity, configured origin, owner, controller device, scope, and current policy revision. Up to 8 pending challenges per owner/scope and 128 globally; expired challenges are removed.
-- `PUT /v2/scopes/{opaqueScope}`: `{challenge, identity, deviceId, certificates, readToken, writeToken, revoked, authorization}`. Authorization is a `MATCH/1` device-signed envelope binding the challenge, origin/service/scope, revision, revocation state, and SHA-256 commitments to both storage tokens. Rusty checks the configured root and allowed device list, consumes each challenge once, and returns a `RUSTY/2` signed policy receipt. Policy revision compare-and-set prevents stale updates. Revocation uses the same signed flow with `revoked: true`; clients must verify the receipt before reporting success.
+- `PUT /v2/scopes/{opaqueScope}`: `{challenge, identity, deviceId, certificates, readToken, writeToken, revoked, authorization}`. Authorization is a `MATCH/1` device-signed envelope binding the challenge, origin/service/scope, revision, revocation state, and SHA-256 commitments to both storage tokens. Rusty checks current controller authority and consumes the challenge when changing policy, returning a `RUSTY/2` signed receipt. Exact completed retries and unchanged floor-2 confirmations follow the rules above. Policy revision compare-and-set prevents stale updates. Revocation uses the same signed flow with `revoked: true`; clients must verify the receipt before reporting success.
 - `PUT /v2/scopes/{scope}/objects/{id}`: write bearer token; `X-Rusty-Request-Id` fresh challenge; encrypted object JSON. ID is base64url SHA-256 of canonical JSON. Returns Ed25519 envelope under `RUSTY/2`, binding service, scope, epoch, object hash, durable sequence, policy revision, and challenge.
 - `GET /v2/scopes/{scope}/objects?after=0`: read bearer token; ordered inventory, maximum 128 entries per page.
 - `GET /v2/scopes/{scope}/objects/{id}`: read bearer token; encrypted object JSON.

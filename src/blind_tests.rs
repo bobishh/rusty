@@ -812,12 +812,14 @@ async fn parallel_equivalent_scope_enrollments_confirm_without_rewriting_policy(
         .await
         .unwrap();
     let fresh: Value = response.json().await.unwrap();
+    // Legacy unspecified-floor requests retain +1 semantics. Keep the target
+    // identical so the following rejection isolates an older revision, not a token mismatch.
     let advanced = request(
         fresh["challenge"].clone(),
         &read_token,
         &write_token,
         false,
-        Some(2),
+        None,
     );
     let response = client
         .put(format!("{origin}/v2/scopes/opaque-scope"))
@@ -837,6 +839,246 @@ async fn parallel_equivalent_scope_enrollments_confirm_without_rewriting_policy(
         StatusCode::CONFLICT,
         "older generations cannot bypass policy CAS"
     );
+    server.abort();
+    let _ = server.await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// Given two authorized owner devices observe the same floor at different times,
+// confirming floor 2 must not create concurrent client revisions for identical credentials.
+#[tokio::test]
+async fn fresh_equivalent_floor_two_enrollments_keep_current_policy_revision() {
+    use meta_mesh_core::{DeviceCertificatePayload, sign_device_certificate};
+    let directory =
+        std::env::temp_dir().join(format!("rusty-current-floor-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let service_key = store.public_key().unwrap();
+    let (identity, desktop_id, desktop_certificate, person_id) = owner_controller_fixture();
+    let phone_key = public_key_from_seed(&[33; 32]).unwrap();
+    let phone_id = public_key_id(&phone_key).unwrap();
+    let phone_certificate = serde_json::to_value(
+        sign_device_certificate(
+            &[31; 32],
+            DeviceCertificatePayload {
+                kind: "device-certificate".into(),
+                version: 1,
+                person_id: person_id.clone(),
+                device_id: phone_id.clone(),
+                device_public_key: phone_key,
+                issuer_certificate_hash: None,
+                can_enroll_devices: true,
+            },
+            &person_id,
+            "MATCH/1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let trusted = TrustedOwner {
+        identity: serde_json::from_value(identity.clone()).unwrap(),
+        allowed_controller_device_ids: vec![desktop_id.clone(), phone_id.clone()],
+    };
+    let read_token = "r".repeat(43);
+    let write_token = "w".repeat(43);
+    store
+        .approve(
+            "opaque-scope",
+            ScopeApproval {
+                expected_revision: 0,
+                read_token: read_token.clone(),
+                write_token: write_token.clone(),
+                revoked: false,
+            },
+        )
+        .unwrap();
+    let app = router(
+        store.clone(),
+        "https://rusty.example".into(),
+        Some(trusted),
+        vec![],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let policy_path = directory.join("scopes/opaque-scope/policy.json");
+    let mut first_request = None;
+    let mut first_receipt = None;
+    let mut confirmed_policy = None;
+    let mut no_op_request = None;
+    for (seed, device_id, certificate, expected_revision) in [
+        (32, desktop_id, desktop_certificate, 1),
+        (33, phone_id, phone_certificate, 2),
+    ] {
+        let response = client
+            .post(format!("{origin}/v2/enrollment/challenge"))
+            .json(
+                &json!({ "version": 1, "scopeId": "opaque-scope", "identity": identity,
+                "deviceId": device_id, "certificates": [certificate] }),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let challenge: Value = response.json().await.unwrap();
+        assert_eq!(
+            challenge["challenge"]["payload"]["expectedRevision"],
+            expected_revision
+        );
+        let mut request = signed_scope_request_with_minimum_writer_version(
+            challenge["challenge"].clone(),
+            identity.clone(),
+            &device_id,
+            certificate,
+            &read_token,
+            &write_token,
+            false,
+            Some(2),
+        );
+        request["authorization"] = serde_json::to_value(
+            sign_json_envelope(
+                &[seed; 32],
+                request["authorization"]["payload"].clone(),
+                &device_id,
+                "MATCH/1",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let response = client
+                .put(format!("{origin}/v2/scopes/opaque-scope"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = response.json().await.unwrap();
+            let receipt: SignedEnvelope<Value> =
+                serde_json::from_value(body["receipt"].clone()).unwrap();
+            assert!(verify_signed_envelope(&receipt, &service_key, DOMAIN).unwrap());
+            assert_eq!(
+                receipt.payload["revision"], 2,
+                "fresh equivalent floor confirmation must not advance policy"
+            );
+            assert_eq!(receipt.payload["minimumWriterVersion"], 2);
+            assert_eq!(receipt.payload["personId"], person_id);
+            assert_eq!(
+                receipt.payload["challengeId"],
+                request["challenge"]["payload"]["challengeId"]
+            );
+            assert_eq!(
+                receipt.payload["authorizationHash"],
+                digest(
+                    canonicalize_json(&request["authorization"])
+                        .unwrap()
+                        .as_bytes()
+                )
+            );
+            if let Some(original) = &confirmed_policy {
+                assert_eq!(&fs::read(&policy_path).unwrap(), original);
+            } else {
+                confirmed_policy = Some(fs::read(&policy_path).unwrap());
+            }
+            if first_receipt.is_none() {
+                first_receipt = Some(body["receipt"].clone());
+            }
+        }
+        if first_request.is_none() {
+            first_request = Some(request);
+        } else {
+            no_op_request = Some(request);
+        }
+    }
+    let replay = client
+        .put(format!("{origin}/v2/scopes/opaque-scope"))
+        .json(first_request.as_ref().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay.json::<Value>().await.unwrap()["receipt"],
+        first_receipt.unwrap(),
+        "no-op preserves original completed receipt"
+    );
+    assert_eq!(fs::read(&policy_path).unwrap(), confirmed_policy.unwrap());
+    let no_op_request = no_op_request.unwrap();
+    let challenge_path = directory.join("enrollment").join(format!(
+        "{}.json",
+        no_op_request["challenge"]["payload"]["challengeId"]
+            .as_str()
+            .unwrap()
+    ));
+    let mut pending: Value = serde_json::from_slice(&fs::read(&challenge_path).unwrap()).unwrap();
+    pending["expiresAt"] = json!(0);
+    fs::write(&challenge_path, serde_json::to_vec(&pending).unwrap()).unwrap();
+    let expired = client
+        .put(format!("{origin}/v2/scopes/opaque-scope"))
+        .json(&no_op_request)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        expired.status(),
+        StatusCode::OK,
+        "fresh no-op never bypasses challenge expiry"
+    );
+    let original = first_request.unwrap();
+    for (floor, read, write, revoked, next_revision) in [
+        (Some(1), read_token.clone(), write_token.clone(), false, 3),
+        (None, read_token.clone(), write_token.clone(), false, 4),
+        (Some(2), "x".repeat(43), write_token.clone(), false, 5),
+        (Some(2), "x".repeat(43), "y".repeat(43), false, 6),
+        (Some(2), "x".repeat(43), "y".repeat(43), true, 7),
+    ] {
+        let device_id = original["deviceId"].as_str().unwrap();
+        let certificate = original["certificates"][0].clone();
+        let response = client
+            .post(format!("{origin}/v2/enrollment/challenge"))
+            .json(
+                &json!({ "version": 1, "scopeId": "opaque-scope", "identity": identity,
+                "deviceId": device_id, "certificates": [certificate] }),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let challenge: Value = response.json().await.unwrap();
+        let request = signed_scope_request_with_minimum_writer_version(
+            challenge["challenge"].clone(),
+            identity.clone(),
+            device_id,
+            certificate,
+            &read,
+            &write,
+            revoked,
+            floor,
+        );
+        let response = client
+            .put(format!("{origin}/v2/scopes/opaque-scope"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["receipt"]["payload"]["revision"], next_revision,
+            "legacy requests and real target changes retain increment semantics"
+        );
+        assert_eq!(body["receipt"]["payload"]["minimumWriterVersion"], 2);
+        assert_eq!(body["receipt"]["payload"]["revoked"], revoked);
+        assert_eq!(
+            store.policy("opaque-scope").unwrap().read_mac,
+            store.token_mac("opaque-scope", &read).unwrap()
+        );
+        assert_eq!(
+            store.policy("opaque-scope").unwrap().write_mac,
+            store.token_mac("opaque-scope", &write).unwrap()
+        );
+    }
     server.abort();
     let _ = server.await;
     fs::remove_dir_all(directory).unwrap();
