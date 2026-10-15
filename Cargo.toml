@@ -16,7 +16,7 @@ path = "src/main.rs"
 axum = "0.8"
 base64 = "0.22"
 hmac = "0.12"
-meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "5dafd1e3dd10312cf3dee515b7153c63a7249c91" }
+meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "7d768e7b03e1de70a959707c85f7a7970f84c60f" }
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
