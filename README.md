@@ -484,7 +484,7 @@ Styles, fonts and artwork are embedded in the service binary and served from
 serves an explicit embedded allowlist, never files from the storage directory.
 
 `src/ui/design-system.css` contains the unmodified, flattened tincanban design
-system from `7f546526bfcc7610f25f771a2288df3784e2abc6` (`src/styles/design-system/index.css`
+system from `7a60c9b3d82a9a766aadc5ba77e9a49cf27e3a2d` (`src/styles/design-system/index.css`
 and its imports). Rusty typography, robot, favicon, font/paint files and font
 licenses come from Rusty's original UI at
 `4c0d15dc06ec5d2c0b93fc02ed91a67eb52f262e` (`frontend/src/typography.css`,
