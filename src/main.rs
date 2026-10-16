@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(std::env::VarError::NotPresent) => 1024 * 1024 * 1024,
         Err(error) => return Err(error.into()),
     };
-    let telemetry = Telemetry::start(TelemetryConfig::from_env()?);
+    let telemetry = Telemetry::start_optional(TelemetryConfig::from_env());
     let store = blind::BlindStore::open_with_scope_limit(directory.into(), max_scope_bytes)?
         .with_telemetry(telemetry.clone());
     println!(
@@ -92,11 +92,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         0.0,
         serde_json::json!({"scope_limit_bytes": max_scope_bytes}),
     );
-    let app = blind::router_with_telemetry(store, origin, trusted_owner, origins, telemetry)?;
-    axum::serve(listener, app)
+    let app =
+        blind::router_with_telemetry(store, origin, trusted_owner, origins, telemetry.clone())?;
+    let server = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await?;
+        .await;
+    telemetry.shutdown();
+    server?;
     Ok(())
 }

@@ -18,7 +18,8 @@ def seal_release(directory, image, source_sha, sdk_sha, candidate_id):
     body = {
         "kind": "tincanban-component-artifact", "version": 1, "component": "rusty",
         "sourceSha": source_sha, "sdkSha": sdk_sha, "candidateId": candidate_id,
-        "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1},
+        "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1,
+                    "publicBoardPublication": 1},
         "writerVersion": 2, "files": {"mesh-lighthouse": binary_sha},
         "image": image, "binarySha256": binary_sha,
     }

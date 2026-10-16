@@ -10,8 +10,10 @@ hash; it does not claim to inspect private workspace history. Public copies incl
 selected-board/card discussions and attachments, plus allowlisted visitor display
 settings (preset bindings, column accents, stage labels and aging). The
 `publicBoardPublication.presentationVersion: 1` capability advertises support; older
-projections remain valid. Public copies remain unchanged until explicit
-update or withdrawal. Configure the public frontend origin in `RUSTY_CORS_ORIGINS`
+projections remain valid. Owner-controlled access determines whether a board is
+available for anonymous reads; accepted deliveries from currently authorized
+writers advance its public revision. Disabling access stops future reads but
+cannot recall bytes already received. Configure the public frontend origin in `RUSTY_CORS_ORIGINS`
 and `VITE_PUBLIC_BOARD_ORIGIN`. Never put private storage tokens, workspace reading
 keys or user board content in service configuration.
 
@@ -349,8 +351,8 @@ plaintext proof paths without claiming equivalent ciphertext evidence.
 Application activation uses a staged journal and exact source/revision guards;
 original history and prior baselines remain available. Export includes unavailable
 objects as incomplete coverage rather than deleting or inventing originals. These
-results prove the tested local paths, not an activated production revision. The
-coordinated CI cohort and deployment receipts identify actual deployed artifacts.
+results prove the tested local paths, not an activated production revision.
+Rusty's own CI and deployment receipts identify its actual deployed artifacts.
 
 ### Confirmed snapshot retention
 
@@ -506,12 +508,35 @@ local fonts and the original robot/header on desktop and mobile, and exercises a
 unavailable Sink link. Screenshots are written under ignored `target/`.
 
 GitHub Actions checks formatting, storage/publication protocols, formal models,
-and discovery/durable identity across real service-process restarts. Publishing
-seals the exact executable hash, immutable image digest and pinned SDK revision.
-The running service reports its executable digest; a source SHA alone does not
-identify deployed bytes. Coordinated tincanban CI binds this artifact to the exact
-frontend and captured Worker artifacts before activation and rollback selection.
-Only that cohort's deployment evidence establishes which release is running.
+and discovery/durable identity across real service-process restarts. Rusty CI
+seals the exact executable hash, immutable image digest and SDK revision as build
+provenance. Rusty's own protected deployment workflow consumes that artifact,
+performs the existing single-writer storage handoff, and confirms the live image
+digest and reader floors. Its rollback selects an earlier sealed Rusty artifact;
+it does not activate tincanban or change the retained volume.
+
+### Deployment and rollback
+
+`Deploy Rusty` runs after a successful push build on `main`. It downloads the
+artifact from that exact CI run and attempt, verifies the signed-by-hash manifest
+and executable bytes, then deploys the immutable image through the existing
+Kamal service. The production environment should require its normal reviewer
+approval. Deployment variables/secrets belong only to this repository:
+`RUSTY_DEPLOY_SPEC` (same pinned service/host JSON contract used before the
+release split), `RUSTY_DEPLOY_SSH_KEY`, `RUSTY_DEPLOY_KNOWN_HOSTS`,
+`RUSTY_TRUSTED_OWNER`, `RUSTY_TELEMETRY_TOKEN`, and `CLICKHOUSE_PASSWORD`.
+`release/deployment-config.json` pins the public infrastructure repository and
+commit. Optional telemetry endpoint/project values are configuration, not
+deployment gates.
+
+To roll back, run `Deploy Rusty` from `main` with the exact successful source run
+and attempt for the previously sealed artifact. The same digest verification,
+single-writer storage handoff and live receipt checks apply. Never rebuild an old
+source revision or select a mutable image tag for rollback. This operation
+changes Rusty only; it does not activate product Workers or alter the volume.
+Artifacts predating the current public-board publication reader floor are refused
+before the storage handoff, because their strict reader cannot open current
+publication records.
 The retired readable Keeper runtime, pairing console and application grants are
 not reactivated by retaining their Git history.
 

@@ -10,8 +10,9 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use meta_mesh_core::{
-    DeviceCertificate, PublicIdentity, SignedEnvelope, canonicalize_json, public_key_from_seed,
-    public_key_id, sign_json_envelope, verify_device_certificate_chain, verify_signed_envelope,
+    DeviceCertificate, PublicIdentity, SignedEnvelope, WorkspaceGrant, WorkspaceRole,
+    canonicalize_json, public_key_from_seed, public_key_id, sign_json_envelope,
+    verify_device_certificate_chain, verify_signed_envelope, verify_workspace_grant,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -150,6 +151,7 @@ fn validate_public_presentation(
         &[],
         &[
             "entityName",
+            "archiveColumnId",
             "preset",
             "cardStageButtons",
             "cardAgingPolicy",
@@ -159,6 +161,12 @@ fn validate_public_presentation(
         .is_some_and(|name| !public_string(name, 100) || name.as_str().unwrap_or("").is_empty())
     {
         return Err("Invalid public presentation".into());
+    }
+    if value
+        .get("archiveColumnId")
+        .is_some_and(|id| !id.is_null() && !id.as_str().is_some_and(|id| columns.contains(id)))
+    {
+        return Err("Invalid public archive column binding".into());
     }
     if let Some(preset) = value.get("preset").filter(|preset| !preset.is_null()) {
         if !exact_keys(preset, &["key", "version", "bindings"])
@@ -216,6 +224,275 @@ fn validate_public_presentation(
     Ok(())
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicBoardDeliveryPolicy {
+    kind: String,
+    version: u8,
+    workspace_id: String,
+    board_id: String,
+    generation: u64,
+    access_epoch: u64,
+    enabled: bool,
+    accepted_grants: Vec<WorkspaceGrant>,
+    revoked_grant_ids: Vec<String>,
+    revoked_device_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicBoardDeliveryPolicyEvidence {
+    policy: SignedEnvelope<PublicBoardDeliveryPolicy>,
+    owner_certificates: Vec<DeviceCertificate>,
+}
+
+fn validate_public_board_delivery_policy(
+    evidence: &PublicBoardDeliveryPolicyEvidence,
+    owner: &TrustedOwner,
+    board_id: &str,
+    expected_generation: Option<u64>,
+    now: u64,
+) -> Result<(), String> {
+    let policy = &evidence.policy;
+    let payload = &policy.payload;
+    let owner_identity = &owner.identity;
+    if payload.kind != "rusty-public-board-delivery-policy"
+        || payload.version != 1
+        || payload.workspace_id.is_empty()
+        || payload.workspace_id.len() > 128
+        || payload.board_id != board_id
+        || payload.generation == 0
+        || payload.access_epoch == 0
+        || !payload.enabled
+        || payload.accepted_grants.len() > 1024
+        || payload.revoked_grant_ids.len() > 4096
+        || payload.revoked_device_ids.len() > 4096
+        || expected_generation
+            .is_some_and(|current| current.checked_add(1) != Some(payload.generation))
+    {
+        return Err("Invalid public delivery policy".into());
+    }
+
+    let signer_key = if verify_signed_envelope(policy, &owner_identity.public_key, "MATCH/1")? {
+        owner_identity.public_key.clone()
+    } else {
+        let key = verify_device_certificate_chain(
+            owner_identity,
+            &policy.signer_key_id,
+            &evidence.owner_certificates,
+            "MATCH/1",
+        )?;
+        if !verify_signed_envelope(policy, &key, "MATCH/1")? {
+            return Err("Invalid public delivery policy signature".into());
+        }
+        key
+    };
+    if public_key_id(&signer_key)? != policy.signer_key_id {
+        return Err("Public delivery policy signer mismatch".into());
+    }
+
+    let revoked_grants = payload.revoked_grant_ids.iter().collect::<HashSet<_>>();
+    let revoked_devices = payload.revoked_device_ids.iter().collect::<HashSet<_>>();
+    if revoked_grants.len() != payload.revoked_grant_ids.len()
+        || revoked_devices.len() != payload.revoked_device_ids.len()
+        || payload.revoked_grant_ids.iter().any(String::is_empty)
+        || payload.revoked_device_ids.iter().any(String::is_empty)
+    {
+        return Err("Invalid public delivery policy revocations".into());
+    }
+    let mut grant_ids = HashSet::new();
+    for grant in &payload.accepted_grants {
+        let grant_payload = &grant.payload;
+        let role = verify_workspace_grant(
+            grant,
+            &payload.workspace_id,
+            &grant_payload.person_id,
+            owner_identity,
+            &evidence.owner_certificates,
+        )?;
+        if !matches!(role, WorkspaceRole::Editor | WorkspaceRole::Automation)
+            || grant_payload.effective_access_epoch() != payload.access_epoch
+            || !grant_ids.insert(grant_payload.grant_id.as_str())
+            || revoked_grants.contains(&grant_payload.grant_id)
+            || grant_payload
+                .automation
+                .as_ref()
+                .is_some_and(|scope| scope.board_id != board_id || scope.expires_at <= now)
+        {
+            return Err("Invalid public delivery grant".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_heads(source_heads: &[String]) -> Result<String, String> {
+    if source_heads.is_empty()
+        || source_heads.len() > 256
+        || source_heads.iter().any(|head| {
+            head.len() != 64
+                || !head
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        || source_heads.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err("Invalid public source heads".into());
+    }
+    let bytes = serde_json::to_vec(source_heads).map_err(|_| "Invalid public source heads")?;
+    Ok(digest(&bytes))
+}
+
+fn authorize_public_delivery_writer(
+    publication: &PublicPublication,
+    owner: &TrustedOwner,
+    board_id: &str,
+    identity: &PublicIdentity,
+    device_id: &str,
+    certificates: &[DeviceCertificate],
+    grant: &WorkspaceGrant,
+    source_heads: &[String],
+    now: u64,
+) -> Result<PublicDeliveryBinding, String> {
+    let evidence = publication
+        .delivery_policy
+        .as_ref()
+        .ok_or("Public delivery policy unavailable")?;
+    validate_public_board_delivery_policy(evidence, owner, board_id, None, now)?;
+    let policy = &evidence.policy.payload;
+    if !policy.enabled
+        || publication.withdrawn
+        || !valid_id(device_id)
+        || policy.revoked_device_ids.iter().any(|id| id == device_id)
+    {
+        return Err("Public delivery writer is not authorized".into());
+    }
+    let device_key = verify_device_certificate_chain(identity, device_id, certificates, "MATCH/1")?;
+    if public_key_id(&device_key)? != device_id {
+        return Err("Public delivery device mismatch".into());
+    }
+    let grant_payload = &grant.payload;
+    let accepted = policy
+        .accepted_grants
+        .iter()
+        .any(|accepted| accepted == grant);
+    let role = verify_workspace_grant(
+        grant,
+        &policy.workspace_id,
+        &identity.person_id,
+        &owner.identity,
+        &evidence.owner_certificates,
+    )?;
+    if !accepted
+        || grant_payload.person_id != identity.person_id
+        || !matches!(role, WorkspaceRole::Editor | WorkspaceRole::Automation)
+        || grant_payload.effective_access_epoch() != policy.access_epoch
+        || policy
+            .revoked_grant_ids
+            .iter()
+            .any(|id| id == &grant_payload.grant_id)
+        || grant_payload
+            .automation
+            .as_ref()
+            .is_some_and(|scope| scope.board_id != board_id || scope.expires_at <= now)
+    {
+        return Err("Public delivery writer is not authorized".into());
+    }
+    let source_heads_hash = validate_source_heads(source_heads)?;
+    Ok(PublicDeliveryBinding {
+        generation: policy.generation,
+        grant_id: grant_payload.grant_id.clone(),
+        role,
+        source_heads: source_heads.to_vec(),
+        source_heads_hash,
+    })
+}
+
+fn automation_board_entities(projection: &Value) -> Result<Value, String> {
+    let board = projection
+        .get("board")
+        .and_then(Value::as_object)
+        .ok_or("Invalid public board for automation")?;
+    let board_id = board
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("Invalid public board for automation")?;
+    let archive_column = board
+        .get("presentation")
+        .and_then(|presentation| presentation.get("archiveColumnId"))
+        .filter(|value| !value.is_null());
+    let mut entities = serde_json::Map::new();
+    entities.insert(
+        board_id.to_owned(),
+        json!({"id":board_id,"kind":"board","archivedAt":null,
+            "archiveColumnId":archive_column.cloned().unwrap_or(Value::Null)}),
+    );
+    for column in projection["columns"]
+        .as_array()
+        .ok_or("Invalid public board columns for automation")?
+    {
+        let id = column["id"]
+            .as_str()
+            .ok_or("Invalid public column for automation")?;
+        entities.insert(
+            id.to_owned(),
+            json!({"id":id,"kind":"column","archivedAt":null,
+                "placement":{"parentId":board_id,"rank":column["rank"]}}),
+        );
+    }
+    for field in projection["fields"]
+        .as_array()
+        .ok_or("Invalid public board fields for automation")?
+    {
+        let id = field["id"]
+            .as_str()
+            .ok_or("Invalid public field for automation")?;
+        entities.insert(
+            id.to_owned(),
+            json!({"id":id,"kind":"field",
+                "placement":{"parentId":board_id,"rank":field["rank"]}}),
+        );
+    }
+    for card in projection["cards"]
+        .as_array()
+        .ok_or("Invalid public board cards for automation")?
+    {
+        let id = card["id"]
+            .as_str()
+            .ok_or("Invalid public card for automation")?;
+        let column_id = card["columnId"]
+            .as_str()
+            .ok_or("Invalid public card column for automation")?;
+        let parent = card["parentId"].as_str().unwrap_or(column_id);
+        let is_archived = archive_column.is_some_and(|archive| archive.as_str() == Some(column_id));
+        entities.insert(
+            id.to_owned(),
+            json!({"id":id,"title":card["title"],"body":card["body"],
+                "values":card["values"],"archivedAt":if is_archived {json!("public-archive")} else {Value::Null},
+                "placement":{"parentId":parent,"rank":card["rank"]}}),
+        );
+    }
+    Ok(json!({"entities":entities}))
+}
+
+fn validate_automation_publication_delta(
+    before: &Value,
+    after: &Value,
+    board_id: &str,
+    scope: &meta_mesh_core::AutomationGrantScope,
+) -> Result<(), String> {
+    for key in ["board", "columns", "fields", "discussions", "files"] {
+        if before.get(key) != after.get(key) {
+            return Err(format!("Automation cannot change public {key}"));
+        }
+    }
+    if before["board"]["id"] != board_id || after["board"]["id"] != board_id {
+        return Err("Automation board does not match delivery policy".into());
+    }
+    let before_entities = automation_board_entities(before)?;
+    let after_entities = automation_board_entities(after)?;
+    meta_mesh_core::validate_automation_board_transitions(&before_entities, &after_entities, scope)
+}
+
 fn validate_public_projection(value: &Value) -> Result<(), String> {
     if !exact_keys(
         value,
@@ -248,18 +525,22 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
     let mut ids = HashSet::new();
     ids.insert(value["board"]["id"].as_str().unwrap().to_owned());
     let mut column_ids = HashSet::new();
+    let mut archive_column_ids = HashSet::new();
     for column in columns {
-        if !exact_keys_with_optional(column, &["id", "title", "rank"], &["color", "collapsible"])
-            || column.get("color").is_some_and(|color| {
-                !color.as_str().is_some_and(|color| {
-                    color.len() == 7
-                        && color.starts_with('#')
-                        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
+        if !exact_keys_with_optional(
+            column,
+            &["id", "title", "rank"],
+            &["color", "collapsible", "archive"],
+        ) || column.get("color").is_some_and(|color| {
+            !color.as_str().is_some_and(|color| {
+                color.len() == 7
+                    && color.starts_with('#')
+                    && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
             })
-            || column
-                .get("collapsible")
-                .is_some_and(|value| !value.is_boolean())
+        }) || column
+            .get("collapsible")
+            .is_some_and(|value| !value.is_boolean())
+            || column.get("archive").is_some_and(|value| value != true)
             || !valid_id(column["id"].as_str().unwrap_or(""))
             || !public_string(&column["title"], 4096)
             || !public_rank(&column["rank"])
@@ -267,7 +548,14 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
         {
             return Err("Invalid or duplicate public column".into());
         }
-        column_ids.insert(column["id"].as_str().unwrap().to_owned());
+        let id = column["id"].as_str().unwrap().to_owned();
+        if column.get("archive") == Some(&Value::Bool(true)) {
+            archive_column_ids.insert(id.clone());
+        }
+        column_ids.insert(id);
+    }
+    if archive_column_ids.len() > 1 {
+        return Err("Public projection has multiple archive columns".into());
     }
     let mut field_ids = HashSet::new();
     let mut field_definitions: HashMap<String, (String, HashSet<String>)> = HashMap::new();
@@ -325,6 +613,12 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
         presentation_ids.remove(value["board"]["id"].as_str().unwrap());
         validate_public_presentation(presentation, &column_ids, &presentation_ids)?;
     }
+    let archive_column_binding = value["board"]["presentation"].get("archiveColumnId");
+    match (archive_column_binding, archive_column_ids.iter().next()) {
+        (Some(Value::String(id)), Some(marker)) if id == marker => {}
+        (None, None) | (Some(Value::Null), None) => {}
+        _ => return Err("Public archive column binding is inconsistent".into()),
+    }
     let mut cards_seen: HashMap<String, (Option<String>, String)> = HashMap::new();
     for card in cards {
         if !exact_keys_with_optional(
@@ -354,6 +648,9 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
             Value::String(value) if valid_id(value) => Some(value.clone()),
             _ => return Err("Invalid public card parent".into()),
         };
+        if archive_column_ids.contains(card["columnId"].as_str().unwrap()) && parent.is_some() {
+            return Err("Archived public cards must be roots".into());
+        }
         let values = card["values"]
             .as_object()
             .ok_or("Invalid public card values")?;
@@ -961,6 +1258,10 @@ struct PublicChallengeRequest {
     device_id: String,
     certificates: Vec<DeviceCertificate>,
     management_capability: Option<SignedEnvelope<Value>>,
+    #[serde(default)]
+    delivery_grant: Option<WorkspaceGrant>,
+    #[serde(default)]
+    source_heads: Option<Vec<String>>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -969,7 +1270,21 @@ struct PendingPublicChallenge {
     person_id: String,
     device_id: String,
     expires_at: u64,
+    #[serde(default)]
+    delivery_generation: Option<u64>,
+    #[serde(default)]
+    delivery_grant_id: Option<String>,
+    #[serde(default)]
+    source_heads_hash: Option<String>,
     envelope: SignedEnvelope<Value>,
+}
+#[derive(Clone)]
+struct PublicDeliveryBinding {
+    generation: u64,
+    grant_id: String,
+    role: WorkspaceRole,
+    source_heads: Vec<String>,
+    source_heads_hash: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -979,6 +1294,12 @@ struct PublicMutationRequest {
     device_id: String,
     certificates: Vec<DeviceCertificate>,
     management_capability: Option<SignedEnvelope<Value>>,
+    #[serde(default)]
+    delivery_grant: Option<WorkspaceGrant>,
+    #[serde(default)]
+    source_heads: Option<Vec<String>>,
+    #[serde(default)]
+    delivery_policy: Option<PublicBoardDeliveryPolicyEvidence>,
     action: String,
     projection: Option<Value>,
     authorization: SignedEnvelope<Value>,
@@ -991,6 +1312,10 @@ struct PublicAssetRequest {
     device_id: String,
     certificates: Vec<DeviceCertificate>,
     management_capability: Option<SignedEnvelope<Value>>,
+    #[serde(default)]
+    delivery_grant: Option<WorkspaceGrant>,
+    #[serde(default)]
+    source_heads: Option<Vec<String>>,
     sha256: String,
     byte_length: u64,
     bytes: String,
@@ -1005,6 +1330,10 @@ struct PublicPublication {
     withdrawn: bool,
     projection: Option<Value>,
     projection_hash: String,
+    #[serde(default)]
+    delivery_policy: Option<PublicBoardDeliveryPolicyEvidence>,
+    #[serde(default)]
+    source_heads: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1174,8 +1503,8 @@ impl BlindStore {
             .current_publication(board_id)?
             .filter(|record| !record.withdrawn)
             .ok_or("Public board unavailable")?;
-        if record.revision != revision {
-            return Err("Public file revision is no longer active".into());
+        if revision == 0 || revision > record.revision {
+            return Err("Public file revision is invalid or from the future".into());
         }
         let manifest = record
             .projection
@@ -1219,7 +1548,15 @@ impl BlindStore {
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
-        self.create_public_challenge_unlocked(board_id, person_id, device_id, device_key_id, origin)
+        self.create_public_challenge_unlocked(
+            board_id,
+            person_id,
+            device_id,
+            device_key_id,
+            origin,
+            None,
+            None,
+        )
     }
     fn create_public_challenge_unlocked(
         &self,
@@ -1228,6 +1565,8 @@ impl BlindStore {
         device_id: &str,
         device_key_id: &str,
         origin: &str,
+        delivery: Option<&PublicDeliveryBinding>,
+        owner_source_heads: Option<&[String]>,
     ) -> Result<SignedEnvelope<Value>, String> {
         let (record_path, challenge_dir, root) = self.publication_paths(board_id)?;
         fs::create_dir_all(&challenge_dir).map_err(|_| "Publication storage unavailable")?;
@@ -1268,6 +1607,8 @@ impl BlindStore {
                 withdrawn: false,
                 projection: None,
                 projection_hash: digest(b"null"),
+                delivery_policy: None,
+                source_heads: Vec::new(),
             }
         };
         let revision = current.revision;
@@ -1278,6 +1619,25 @@ impl BlindStore {
         let challenge_id = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
         let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
         let service_id = public_key_id(&self.public_key()?)?;
+        let source_heads_hash = delivery
+            .map(|binding| binding.source_heads_hash.clone())
+            .or_else(|| owner_source_heads.and_then(|heads| validate_source_heads(heads).ok()));
+        let current_delivery_policy_hash = current
+            .delivery_policy
+            .as_ref()
+            .map(|policy| {
+                serde_json::to_value(policy)
+                    .map_err(|_| "Public delivery policy invalid".to_owned())
+                    .and_then(|value| canonicalize_json(&value))
+            })
+            .transpose()?
+            .map(|canonical| digest(canonical.as_bytes()));
+        let delivery_generation = delivery.map(|binding| binding.generation).or_else(|| {
+            current
+                .delivery_policy
+                .as_ref()
+                .map(|policy| policy.policy.payload.generation)
+        });
         let envelope = sign_json_envelope(
             &self.seed,
             json!({
@@ -1285,6 +1645,11 @@ impl BlindStore {
                 "serviceId":service_id, "publicOrigin":origin, "boardId":board_id, "personId":person_id,
                 "deviceId":device_id, "deviceKeyId":device_key_id, "expectedRevision":revision,
                 "issuedAt":issued_at, "expiresAt":expires_at, "withdrawn":current.withdrawn, "projectionHash":current.projection_hash
+                ,"deliveryGeneration":delivery_generation,
+                "deliveryGrantId":delivery.map(|binding| binding.grant_id.as_str()),
+                "sourceHeadsHash":source_heads_hash,
+                "currentSourceHeads":current.source_heads,
+                "deliveryPolicyHash":current_delivery_policy_hash
             }),
             service_id,
             DOMAIN,
@@ -1294,6 +1659,9 @@ impl BlindStore {
             person_id: person_id.into(),
             device_id: device_id.into(),
             expires_at,
+            delivery_generation: delivery.map(|binding| binding.generation),
+            delivery_grant_id: delivery.map(|binding| binding.grant_id.clone()),
+            source_heads_hash,
             envelope: envelope.clone(),
         };
         atomic_write(
@@ -1313,23 +1681,66 @@ impl BlindStore {
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
-        if !valid_id(board_id)
-            || !trusted_identity_matches(&request.identity, &trusted_owner.identity)
-            || request.certificates.is_empty()
-            || !self.management_authorized(
-                trusted_owner,
-                &request.identity,
-                &request.device_id,
-                &request.certificates,
-                "board",
-                board_id,
-                "publication.stage-file",
-                request.management_capability.as_ref(),
-                origin,
-            )?
-        {
+        if !valid_id(board_id) || request.certificates.is_empty() {
             return Err("Untrusted publication controller or device".into());
         }
+        let current = self.current_publication(board_id)?;
+        let delivery_binding =
+            if trusted_identity_matches(&request.identity, &trusted_owner.identity) {
+                if request.delivery_grant.is_some() {
+                    return Err("Owner publication cannot use a delivery grant".into());
+                }
+                request
+                    .source_heads
+                    .as_deref()
+                    .map(validate_source_heads)
+                    .transpose()?;
+                if current
+                    .as_ref()
+                    .is_some_and(|record| !record.source_heads.is_empty())
+                    && request.source_heads.is_none()
+                {
+                    return Err("Publication file staging requires a source frontier".into());
+                }
+                if !self.management_authorized(
+                    trusted_owner,
+                    &request.identity,
+                    &request.device_id,
+                    &request.certificates,
+                    "board",
+                    board_id,
+                    "publication.stage-file",
+                    request.management_capability.as_ref(),
+                    origin,
+                )? {
+                    return Err("Untrusted publication controller or device".into());
+                }
+                None
+            } else {
+                if request.management_capability.is_some() {
+                    return Err("Public delivery writers cannot manage publication".into());
+                }
+                let publication = current.as_ref().ok_or("Public publication unavailable")?;
+                let grant = request
+                    .delivery_grant
+                    .as_ref()
+                    .ok_or("Missing public delivery grant")?;
+                let source_heads = request
+                    .source_heads
+                    .as_deref()
+                    .ok_or("Missing public source heads")?;
+                Some(authorize_public_delivery_writer(
+                    publication,
+                    trusted_owner,
+                    board_id,
+                    &request.identity,
+                    &request.device_id,
+                    &request.certificates,
+                    grant,
+                    source_heads,
+                    now_ms()?,
+                )?)
+            };
         if request.sha256.len() != 43
             || !request
                 .sha256
@@ -1352,7 +1763,7 @@ impl BlindStore {
             "MATCH/1",
         )?;
         let device_key_id = public_key_id(&device_public_key)?;
-        let (record_path, challenge_dir, root) = self.publication_paths(board_id)?;
+        let (_, challenge_dir, root) = self.publication_paths(board_id)?;
         let challenge_id = request
             .challenge
             .payload
@@ -1394,7 +1805,12 @@ impl BlindStore {
                 "expiresAt",
                 "byteLength",
             ],
-            &["managementRevision"],
+            &[
+                "managementRevision",
+                "deliveryGeneration",
+                "deliveryGrantId",
+                "sourceHeadsHash",
+            ],
         ) || command["kind"] != "rusty-publication-command"
             || command["version"] != 1
             || command["challengeId"] != challenge["challengeId"]
@@ -1412,6 +1828,45 @@ impl BlindStore {
         {
             return Err("Public asset command signature or binding invalid".into());
         }
+        match &delivery_binding {
+            Some(binding)
+                if pending.delivery_generation == Some(binding.generation)
+                    && pending.delivery_grant_id.as_deref() == Some(&binding.grant_id)
+                    && pending.source_heads_hash.as_deref()
+                        == Some(binding.source_heads_hash.as_str())
+                    && command.get("deliveryGeneration").and_then(Value::as_u64)
+                        == Some(binding.generation)
+                    && command.get("deliveryGrantId").and_then(Value::as_str)
+                        == Some(binding.grant_id.as_str())
+                    && command.get("sourceHeadsHash").and_then(Value::as_str)
+                        == Some(binding.source_heads_hash.as_str()) => {}
+            Some(_) => return Err("Public delivery binding mismatch".into()),
+            None if pending.delivery_generation.is_none()
+                && pending.delivery_grant_id.is_none()
+                && command.get("deliveryGeneration").is_none()
+                && command.get("deliveryGrantId").is_none() => {}
+            None => return Err("Unexpected public delivery binding".into()),
+        }
+        let owner_source_heads_hash = if delivery_binding.is_none()
+            && trusted_identity_matches(&request.identity, &trusted_owner.identity)
+        {
+            request
+                .source_heads
+                .as_deref()
+                .map(validate_source_heads)
+                .transpose()?
+        } else {
+            None
+        };
+        let expected_source_heads_hash = delivery_binding
+            .as_ref()
+            .map(|binding| binding.source_heads_hash.as_str())
+            .or(owner_source_heads_hash.as_deref());
+        if pending.source_heads_hash.as_deref() != expected_source_heads_hash
+            || command.get("sourceHeadsHash").and_then(Value::as_str) != expected_source_heads_hash
+        {
+            return Err("Public source frontier binding mismatch".into());
+        }
         if !self.management_revision_matches(
             "board",
             board_id,
@@ -1419,13 +1874,7 @@ impl BlindStore {
         )? {
             return Err("Public asset management revision binding invalid".into());
         }
-        let current_revision = if record_path.exists() {
-            self.current_publication(board_id)?
-                .ok_or("Publication unavailable")?
-                .revision
-        } else {
-            0
-        };
+        let current_revision = current.as_ref().map(|record| record.revision).unwrap_or(0);
         if challenge["expectedRevision"].as_u64() != Some(current_revision) {
             return Err("Publication revision conflict".into());
         }
@@ -1478,10 +1927,16 @@ impl BlindStore {
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
-        if !valid_id(board_id)
-            || !trusted_identity_matches(&request.identity, &trusted_owner.identity)
-            || request.certificates.is_empty()
-            || !self.management_authorized(
+        if !valid_id(board_id) || request.certificates.is_empty() {
+            return Err("Untrusted publication controller or device".into());
+        }
+        let current = self.current_publication(board_id)?;
+        let is_owner = trusted_identity_matches(&request.identity, &trusted_owner.identity);
+        let delivery_binding = if is_owner {
+            if request.delivery_grant.is_some() {
+                return Err("Owner publication cannot use a delivery grant".into());
+            }
+            if !self.management_authorized(
                 trusted_owner,
                 &request.identity,
                 &request.device_id,
@@ -1491,9 +1946,55 @@ impl BlindStore {
                 &format!("publication.{}", request.action),
                 request.management_capability.as_ref(),
                 origin,
-            )?
+            )? {
+                return Err("Untrusted publication controller or device".into());
+            }
+            None
+        } else {
+            if request.action != "update"
+                || request.management_capability.is_some()
+                || request.delivery_policy.is_some()
+            {
+                return Err("Public delivery writers may only update content".into());
+            }
+            let publication = current.as_ref().ok_or("Public publication unavailable")?;
+            let grant = request
+                .delivery_grant
+                .as_ref()
+                .ok_or("Missing public delivery grant")?;
+            let source_heads = request
+                .source_heads
+                .as_deref()
+                .ok_or("Missing public source heads")?;
+            Some(authorize_public_delivery_writer(
+                publication,
+                trusted_owner,
+                board_id,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+                grant,
+                source_heads,
+                now_ms()?,
+            )?)
+        };
+        let owner_source_heads_hash = if is_owner {
+            request
+                .source_heads
+                .as_deref()
+                .map(validate_source_heads)
+                .transpose()?
+        } else {
+            None
+        };
+        if is_owner
+            && request.action != "unpublish"
+            && current
+                .as_ref()
+                .is_some_and(|record| !record.source_heads.is_empty())
+            && request.source_heads.is_none()
         {
-            return Err("Untrusted publication controller or device".into());
+            return Err("Publication update requires a source frontier".into());
         }
         let device_public_key = verify_device_certificate_chain(
             &request.identity,
@@ -1527,6 +2028,24 @@ impl BlindStore {
         } else {
             digest(b"null")
         };
+        if delivery_binding
+            .as_ref()
+            .is_some_and(|binding| binding.role == WorkspaceRole::Automation)
+        {
+            let before = current
+                .as_ref()
+                .and_then(|record| record.projection.as_ref())
+                .ok_or("Automation delivery requires an existing public projection")?;
+            let after = projection
+                .as_ref()
+                .ok_or("Automation delivery cannot withdraw publication")?;
+            let scope = request
+                .delivery_grant
+                .as_ref()
+                .and_then(|grant| grant.payload.automation.as_ref())
+                .ok_or("Automation delivery grant scope missing")?;
+            validate_automation_publication_delta(before, after, board_id, scope)?;
+        }
         let (record_path, challenge_dir, root) = self.publication_paths(board_id)?;
         fs::create_dir_all(root.join("records")).map_err(|_| "Publication storage unavailable")?;
         File::open(&root)
@@ -1576,7 +2095,13 @@ impl BlindStore {
                 "expectedRevision",
                 "expiresAt",
             ],
-            &["managementRevision"],
+            &[
+                "managementRevision",
+                "deliveryGeneration",
+                "deliveryGrantId",
+                "sourceHeadsHash",
+                "deliveryPolicyHash",
+            ],
         ) || command.get("kind").and_then(Value::as_str) != Some("rusty-publication-command")
             || command.get("version").and_then(Value::as_u64) != Some(1)
             || command.get("challengeId").and_then(Value::as_str) != Some(challenge_id)
@@ -1594,6 +2119,47 @@ impl BlindStore {
         {
             return Err("Publication command signature or binding invalid".into());
         }
+        match &delivery_binding {
+            Some(binding)
+                if pending.delivery_generation == Some(binding.generation)
+                    && pending.delivery_grant_id.as_deref() == Some(&binding.grant_id)
+                    && pending.source_heads_hash.as_deref()
+                        == Some(binding.source_heads_hash.as_str())
+                    && command.get("deliveryGeneration").and_then(Value::as_u64)
+                        == Some(binding.generation)
+                    && command.get("deliveryGrantId").and_then(Value::as_str)
+                        == Some(binding.grant_id.as_str())
+                    && command.get("sourceHeadsHash").and_then(Value::as_str)
+                        == Some(binding.source_heads_hash.as_str()) => {}
+            Some(_) => return Err("Public delivery binding mismatch".into()),
+            None if pending.delivery_generation.is_none()
+                && pending.delivery_grant_id.is_none()
+                && command.get("deliveryGeneration").is_none()
+                && command.get("deliveryGrantId").is_none() => {}
+            None => return Err("Unexpected public delivery binding".into()),
+        }
+        let expected_source_heads_hash = delivery_binding
+            .as_ref()
+            .map(|binding| binding.source_heads_hash.as_str())
+            .or(owner_source_heads_hash.as_deref());
+        if pending.source_heads_hash.as_deref() != expected_source_heads_hash
+            || command.get("sourceHeadsHash").and_then(Value::as_str) != expected_source_heads_hash
+        {
+            return Err("Public source frontier binding mismatch".into());
+        }
+        let delivery_policy_hash = request
+            .delivery_policy
+            .as_ref()
+            .map(|evidence| {
+                canonicalize_json(&serde_json::to_value(evidence).unwrap_or(Value::Null))
+            })
+            .transpose()?
+            .map(|canonical| digest(canonical.as_bytes()));
+        if command.get("deliveryPolicyHash").and_then(Value::as_str)
+            != delivery_policy_hash.as_deref()
+        {
+            return Err("Public delivery policy binding mismatch".into());
+        }
         if !self.management_revision_matches(
             "board",
             board_id,
@@ -1605,14 +2171,13 @@ impl BlindStore {
             .get("expectedRevision")
             .and_then(Value::as_u64)
             .ok_or("Invalid publication revision")?;
-        let current = self.current_publication(board_id)?;
         let current_revision = current.as_ref().map(|record| record.revision).unwrap_or(0);
         if current_revision != expected_revision {
             return Err("Publication revision conflict".into());
         }
         if current
             .as_ref()
-            .is_some_and(|record| record.controller_person_id != request.identity.person_id)
+            .is_some_and(|record| record.controller_person_id != trusted_owner.identity.person_id)
         {
             return Err("Publication controller conflict".into());
         }
@@ -1624,6 +2189,46 @@ impl BlindStore {
         {
             return Err("Publication action does not match current state".into());
         }
+        if current
+            .as_ref()
+            .is_some_and(|record| record.withdrawn && record.delivery_policy.is_some())
+            && request.action == "publish"
+            && request.delivery_policy.is_none()
+        {
+            return Err("Re-enabling publication requires a fresh delivery policy".into());
+        }
+        let next_delivery_policy = if let Some(evidence) = &request.delivery_policy {
+            let current_generation = current
+                .as_ref()
+                .and_then(|record| record.delivery_policy.as_ref())
+                .map(|policy| policy.policy.payload.generation);
+            validate_public_board_delivery_policy(
+                evidence,
+                trusted_owner,
+                board_id,
+                current_generation,
+                now_ms()?,
+            )?;
+            if current_generation.is_none() && evidence.policy.payload.generation != 1 {
+                return Err("Public delivery policy generation conflict".into());
+            }
+            if current
+                .as_ref()
+                .and_then(|record| record.delivery_policy.as_ref())
+                .is_some_and(|existing| {
+                    existing.policy.payload.workspace_id != evidence.policy.payload.workspace_id
+                        || evidence.policy.payload.access_epoch
+                            < existing.policy.payload.access_epoch
+                })
+            {
+                return Err("Public delivery policy authority regression".into());
+            }
+            Some(evidence.clone())
+        } else {
+            current
+                .as_ref()
+                .and_then(|record| record.delivery_policy.clone())
+        };
         if let Some(value) = &projection {
             for file in value["files"].as_array().ok_or("Invalid public files")? {
                 let sha256 = file["sha256"]
@@ -1650,11 +2255,21 @@ impl BlindStore {
         let withdrawn = request.action == "unpublish";
         let record = PublicPublication {
             board_id: board_id.into(),
-            controller_person_id: request.identity.person_id.clone(),
+            controller_person_id: current
+                .as_ref()
+                .map(|record| record.controller_person_id.clone())
+                .unwrap_or_else(|| request.identity.person_id.clone()),
             revision,
             withdrawn,
             projection,
             projection_hash: projection_hash.clone(),
+            delivery_policy: next_delivery_policy,
+            source_heads: delivery_binding
+                .as_ref()
+                .map(|binding| binding.source_heads.clone())
+                .or_else(|| request.source_heads.clone())
+                .or_else(|| current.as_ref().map(|record| record.source_heads.clone()))
+                .unwrap_or_default(),
         };
         let bytes = serde_json::to_vec(&record).map_err(|_| "Public publication invalid")?;
         atomic_write(&record_path, &bytes)?;
@@ -2377,7 +2992,7 @@ pub fn router_with_telemetry(
             "/health",
             get(|| async { Json(json!({"status": "ok", "mode": "blind", "buildSha": crate::build_identity::build_sha(),
                 "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
-                "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1}})) }),
+                "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1, "publicBoardPublication": 1}})) }),
         )
         .route("/.well-known/mesh-lighthouse", get(discovery))
         .route(
@@ -2449,6 +3064,8 @@ pub fn router_with_telemetry(
                     axum::http::HeaderName::from_static("x-rusty-request-id"),
                     axum::http::HeaderName::from_static("x-rusty-client"),
                     axum::http::HeaderName::from_static("x-rusty-build"),
+                    axum::http::HeaderName::from_static("traceparent"),
+                    axum::http::HeaderName::from_static("tracestate"),
                 ]),
         )
         .layer(axum::middleware::from_fn_with_state(
@@ -2509,6 +3126,18 @@ async fn observe_request(
             matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
         .map(str::to_owned);
+    let traceparent = request
+        .headers()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 128)
+        .map(str::to_owned);
+    let tracestate = request
+        .headers()
+        .get("tracestate")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 512)
+        .map(str::to_owned);
     let response = next.run(request).await;
     let status = response.status();
     let level = if status.is_server_error() {
@@ -2532,7 +3161,7 @@ async fn observe_request(
     if !status.is_success() {
         attrs["error_code"] = json!(format!("http_{}", status.as_u16()));
     }
-    telemetry.emit(
+    telemetry.emit_with_parent(
         level,
         if status.is_client_error() || status.is_server_error() {
             "http.request.failed"
@@ -2544,6 +3173,8 @@ async fn observe_request(
         &scope,
         started.elapsed().as_secs_f64() * 1000.0,
         attrs,
+        traceparent.as_deref(),
+        tracestate.as_deref(),
     );
     response
 }
@@ -2563,9 +3194,9 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
     Ok(Json(
         json!({"protocolVersions": [2], "publicOrigin": state.origin, "displayName": "Rusty", "buildSha": crate::build_identity::build_sha(),
             "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
-            "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1},
+            "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1, "publicBoardPublication": 1},
         "service": {"serviceId": service_id, "publicKey": public_key},
-        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
+        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1,"deliveryVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
     ))
 }
 
@@ -2585,6 +3216,38 @@ async fn public_challenge(
             "No publication controller configured",
         )
     })?;
+    if request.delivery_grant.is_some() {
+        let store = state.store.clone();
+        let owner = owner.clone();
+        let origin = state.origin.clone();
+        let challenge = tokio::task::spawn_blocking(move || {
+            store.create_public_delivery_challenge(request, &owner, &origin)
+        })
+        .await
+        .map_err(|_| {
+            failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Publication storage unavailable",
+            )
+        })?
+        .map_err(|message| {
+            failure(
+                if message.contains("capacity") {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else if message.contains("authorized")
+                    || message.contains("signature")
+                    || message.contains("certificate")
+                    || message.contains("device mismatch")
+                {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::CONFLICT
+                },
+                &message,
+            )
+        })?;
+        return Ok(Json(json!({"challenge":challenge})));
+    }
     if !trusted_identity_matches(&request.identity, &owner.identity)
         || !state
             .store

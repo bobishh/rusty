@@ -16,7 +16,7 @@ path = "src/main.rs"
 axum = "0.8"
 base64 = "0.22"
 hmac = "0.12"
-meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "9f9ac7bbeddce4168e7d768fed35ca9f30d11595" }
+meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "9d92a478495b471bf6a8075dcf23e77b412473cc" }
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +25,9 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 time = { version = "0.3.55", features = ["formatting"] }
+opentelemetry = { version = "0.33.1", features = ["logs", "trace"] }
+opentelemetry_sdk = { version = "0.33.1", features = ["logs", "trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["logs", "trace", "http-json", "reqwest-blocking-client", "reqwest-rustls"] }
 
 # Keep receipt signing responsive during local debug replication.
 [profile.dev.package.ed25519-compact]

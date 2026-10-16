@@ -1,27 +1,59 @@
 use super::*;
 
+fn otlp_log_records(payload: &Value) -> Vec<Value> {
+    payload["resourceLogs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|resource| resource["scopeLogs"].as_array().into_iter().flatten())
+        .flat_map(|scope| {
+            scope["logRecords"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned()
+        })
+        .collect()
+}
+
+fn log_attribute(record: &Value, key: &str) -> Option<String> {
+    record["attributes"]
+        .as_array()?
+        .iter()
+        .find(|attribute| attribute["key"] == key)?["value"]["stringValue"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn log_event(record: &Value) -> Option<String> {
+    log_attribute(record, "event.name")
+}
+
 // Given durable writes and a duplicate retry, telemetry reports actual disk growth
 // and quota refusal, while ciphertext and bearer credentials remain absent.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
     let received = Arc::new(Mutex::new(Vec::<Value>::new()));
     let records = received.clone();
-    let sink = Router::new().route(
-        "/events",
-        axum::routing::post(move |Json(body): Json<Value>| {
-            let records = records.clone();
-            async move {
-                records
-                    .lock()
-                    .unwrap()
-                    .extend(body["events"].as_array().unwrap().iter().cloned());
-                StatusCode::OK
-            }
-        }),
-    );
+    let sink = Router::new()
+        .route(
+            "/v1/logs",
+            axum::routing::post(move |Json(body): Json<Value>| {
+                let records = records.clone();
+                async move {
+                    records.lock().unwrap().extend(otlp_log_records(&body));
+                    Json(serde_json::json!({}))
+                }
+            }),
+        )
+        .route(
+            "/v1/traces",
+            axum::routing::post(|| async { Json(serde_json::json!({})) }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/events", listener.local_addr().unwrap());
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, sink).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     let telemetry = Telemetry::start(
         crate::telemetry::Config::new(
             "debug",
@@ -85,13 +117,14 @@ async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
             "Diagnostic labels cannot grant write access"
         );
     }
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    store.telemetry.force_flush();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if received
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|event| event["event"] == "http.request.failed")
+                .filter(|record| log_event(record).as_deref() == Some("http.request.failed"))
                 .count()
                 >= 2
             {
@@ -103,19 +136,18 @@ async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
     .await
     .unwrap();
     let records = received.lock().unwrap();
-    assert!(
-        records
-            .iter()
-            .any(|record| record["attrs"]["client"] == "tincanban"
-                && record["attrs"]["client_build"] == "a".repeat(40))
-    );
-    assert!(
-        records
-            .iter()
-            .any(|record| record["event"] == "http.request.failed"
-                && record["attrs"].get("client").is_none()
-                && record["attrs"].get("client_build").is_none())
-    );
+    let expected_build = "a".repeat(40);
+    assert!(records.iter().any(|record| {
+        log_event(record).as_deref() == Some("http.request.failed")
+            && log_attribute(record, "rusty.client").as_deref() == Some("tincanban")
+            && log_attribute(record, "rusty.client_build").as_deref()
+                == Some(expected_build.as_str())
+    }));
+    assert!(records.iter().any(|record| {
+        log_event(record).as_deref() == Some("http.request.failed")
+            && log_attribute(record, "rusty.client").is_none()
+            && log_attribute(record, "rusty.client_build").is_none()
+    }));
     assert!(
         !serde_json::to_string(&*records)
             .unwrap()
@@ -123,20 +155,32 @@ async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
     );
     let stored = records
         .iter()
-        .find(|value| value["event"] == "storage.object.stored")
+        .find(|value| log_event(value).as_deref() == Some("storage.object.stored"))
         .unwrap();
-    assert_eq!(stored["attrs"]["stored_bytes_before"], 0);
-    assert!(stored["attrs"]["stored_bytes"].as_u64().unwrap() > 0);
-    assert_eq!(stored["attrs"]["object_count"], 1);
+    assert_eq!(
+        log_attribute(stored, "rusty.stored_bytes_before").as_deref(),
+        Some("0")
+    );
     assert!(
-        records
-            .iter()
-            .any(|value| value["event"] == "storage.object.reused")
+        log_attribute(stored, "rusty.stored_bytes")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        log_attribute(stored, "rusty.object_count").as_deref(),
+        Some("1")
     );
     assert!(
         records
             .iter()
-            .any(|value| value["event"] == "storage.quota.exceeded")
+            .any(|value| log_event(value).as_deref() == Some("storage.object.reused"))
+    );
+    assert!(
+        records
+            .iter()
+            .any(|value| log_event(value).as_deref() == Some("storage.quota.exceeded"))
     );
     assert!(
         !serde_json::to_string(&*records)
@@ -186,7 +230,7 @@ async fn service_root_opens_connection_instructions_without_exposing_storage() {
     );
     assert_eq!(
         health["readers"],
-        serde_json::json!({"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1})
+        serde_json::json!({"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1, "publicBoardPublication": 1})
     );
     let response = reqwest::get(format!("{origin}/")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);

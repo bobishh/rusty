@@ -942,6 +942,9 @@ impl BlindStore {
             .lock
             .lock()
             .map_err(|_| "Management storage unavailable")?;
+        if let Some(source_heads) = request.source_heads.as_deref() {
+            validate_source_heads(source_heads)?;
+        }
         if !self.management_authorized(
             owner,
             &request.identity,
@@ -961,6 +964,61 @@ impl BlindStore {
             &request.device_id,
             device_key_id,
             origin,
+            None,
+            request.source_heads.as_deref(),
+        )
+    }
+
+    pub(super) fn create_public_delivery_challenge(
+        &self,
+        request: PublicChallengeRequest,
+        owner: &TrustedOwner,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "Management storage unavailable")?;
+        let publication = self
+            .current_publication(&request.board_id)?
+            .ok_or("Public publication unavailable")?;
+        let grant = request
+            .delivery_grant
+            .as_ref()
+            .ok_or("Missing public delivery grant")?;
+        let source_heads = request
+            .source_heads
+            .as_deref()
+            .ok_or("Missing public source heads")?;
+        let device_key = verify_device_certificate_chain(
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+            "MATCH/1",
+        )?;
+        let device_key_id = public_key_id(&device_key)?;
+        if device_key_id != request.device_id {
+            return Err("Public delivery device mismatch".into());
+        }
+        let binding = authorize_public_delivery_writer(
+            &publication,
+            owner,
+            &request.board_id,
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+            grant,
+            source_heads,
+            now_ms()?,
+        )?;
+        self.create_public_challenge_unlocked(
+            &request.board_id,
+            &request.identity.person_id,
+            &request.device_id,
+            &device_key_id,
+            origin,
+            Some(&binding),
+            None,
         )
     }
 }

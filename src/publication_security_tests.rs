@@ -1,5 +1,8 @@
 use super::*;
-use meta_mesh_core::{DeviceCertificatePayload, sign_device_certificate};
+use meta_mesh_core::{
+    AutomationGrantColumns, AutomationGrantScope, DeviceCertificatePayload, WorkspaceGrant,
+    WorkspaceGrantPayload, WorkspaceRole, sign_device_certificate,
+};
 
 const ORIGIN: &str = "https://rusty.example";
 const BOARD: &str = "selected-public-board";
@@ -232,6 +235,28 @@ impl Drop for Fixture {
 fn projection() -> Value {
     json!({"kind":"tincanban-public-board","version":1,"board":{"id":BOARD,"title":"Confirmed content"},
         "columns":[],"fields":[],"cards":[],"discussions":[],"files":[]})
+}
+fn automation_projection(card: Option<Value>) -> Value {
+    let mut cards = vec![json!({
+        "id":"existing-card", "parentId":null, "columnId":"lead", "title":"Existing",
+        "body":"Existing role", "values":{"source":"old", "private":null}, "rank":"0/1"
+    })];
+    if let Some(card) = card {
+        cards.push(card);
+    }
+    json!({"kind":"tincanban-public-board","version":1,
+        "board":{"id":BOARD,"title":"Automation board","presentation":{"archiveColumnId":null}},
+        "columns":[
+            {"id":"lead","title":"Lead","rank":"0/1"},
+            {"id":"applied","title":"Applied","rank":"1/2"},
+            {"id":"interview","title":"Interview","rank":"1/1"},
+            {"id":"rejected","title":"Rejected","rank":"3/2"}
+        ],
+        "fields":[
+            {"id":"source","title":"Source","valueType":"text","required":false,"rank":"0/1","options":[]},
+            {"id":"private","title":"Private","valueType":"text","required":false,"rank":"1/2","options":[]}
+        ],
+        "cards":cards,"discussions":[],"files":[]})
 }
 
 #[test]
@@ -482,6 +507,45 @@ fn public_asset_staging_checks_exact_bytes_signature_and_replay_but_allows_fresh
     );
 }
 
+#[test]
+fn public_file_links_remain_current_only_while_their_hash_is_in_the_active_manifest() {
+    let fixture = Fixture::new();
+    let bytes = b"stable public attachment";
+    let sha256 = digest(bytes);
+    fixture.stage(fixture.asset_request(bytes)).unwrap();
+
+    let mut published = projection();
+    published["files"] = json!([{"id":"file","parentId":BOARD,"title":"Handout",
+        "fileName":"handout.txt","mediaType":"text/plain","byteLength":bytes.len(),"sha256":sha256}]);
+    fixture
+        .mutate(fixture.request("publish", Some(published.clone()), fixture.challenge()))
+        .unwrap();
+
+    published["board"]["title"] = json!("Updated board title");
+    fixture
+        .mutate(fixture.request("update", Some(published), fixture.challenge()))
+        .unwrap();
+
+    // Revision is a cache-busting hint. Existing links keep working while the
+    // same bytes remain part of the active, non-withdrawn projection.
+    assert_eq!(fixture.store.publication_file(BOARD, 1, &sha256).unwrap().0, bytes);
+    assert_eq!(fixture.store.publication_file(BOARD, 2, &sha256).unwrap().0, bytes);
+    assert!(fixture.store.publication_file(BOARD, 0, &sha256).is_err());
+    assert!(fixture.store.publication_file(BOARD, 3, &sha256).is_err());
+
+    let mut without_file = projection();
+    without_file["board"]["title"] = json!("File removed");
+    fixture
+        .mutate(fixture.request("update", Some(without_file), fixture.challenge()))
+        .unwrap();
+    assert!(fixture.store.publication_file(BOARD, 1, &sha256).is_err());
+
+    fixture
+        .mutate(fixture.request("unpublish", None, fixture.challenge()))
+        .unwrap();
+    assert!(fixture.store.publication_file(BOARD, 1, &sha256).is_err());
+}
+
 fn age_file(path: &Path) {
     let modified = SystemTime::now() - std::time::Duration::from_secs(25 * 60 * 60);
     File::options()
@@ -580,4 +644,465 @@ fn given_visitor_presentation_when_validating_publication_then_keep_only_public_
     projection["board"]["presentation"]["preset"]["bindings"]["field.company"] = json!("company");
     projection["board"]["presentation"]["ownerKey"] = json!("private");
     assert!(validate_public_projection(&projection).is_err());
+}
+
+#[test]
+fn given_shared_archive_surface_when_validating_projection_then_require_archive_roots() {
+    let projection = json!({"kind":"tincanban-public-board","version":1,
+        "board":{"id":BOARD,"title":"Jobs","presentation":{"archiveColumnId":"archive"}},
+        "columns":[{"id":"archive","title":"Archive","rank":"1/1","archive":true}],
+        "fields":[],
+        "cards":[{"id":"archived","parentId":null,"columnId":"archive","title":"Old","body":"","values":{},"rank":"0/1"}],
+        "discussions":[],"files":[]});
+    assert!(validate_public_projection(&projection).is_ok());
+
+    let mut nested = projection;
+    nested["cards"][0]["parentId"] = json!("parent");
+    assert!(validate_public_projection(&nested).is_err());
+}
+
+#[test]
+fn given_owner_challenge_when_source_frontier_is_supplied_then_bind_it_privately() {
+    let fixture = Fixture::new();
+    let source_heads = vec!["a".repeat(64), "b".repeat(64)];
+    let challenge = fixture
+        .store
+        .create_public_challenge_unlocked(
+            BOARD,
+            &fixture.owner.identity.person_id,
+            &fixture.device_id,
+            &fixture.device_id,
+            ORIGIN,
+            None,
+            Some(&source_heads),
+        )
+        .unwrap();
+    assert_eq!(challenge.payload["currentSourceHeads"], json!([]));
+    assert_eq!(
+        challenge.payload["sourceHeadsHash"],
+        json!(digest(&serde_json::to_vec(&source_heads).unwrap()))
+    );
+    assert!(validate_source_heads(&source_heads).is_ok());
+    assert!(
+        validate_source_heads(&source_heads.iter().rev().cloned().collect::<Vec<_>>()).is_err()
+    );
+}
+
+#[test]
+fn given_owner_signed_board_policy_when_editor_grant_is_current_then_delivery_is_authorized() {
+    let fixture = Fixture::new();
+    let editor_key = public_key_from_seed(&[71; 32]).unwrap();
+    let editor_id = public_key_id(&editor_key).unwrap();
+    let grant_payload = WorkspaceGrantPayload {
+        kind: "workspace-grant".into(),
+        version: 1,
+        grant_id: "editor-grant-1".into(),
+        workspace_id: "workspace-one".into(),
+        person_id: editor_id,
+        role: WorkspaceRole::Editor,
+        access_epoch: Some(3),
+        automation: None,
+    };
+    let grant = sign_json_envelope(
+        &[61; 32],
+        serde_json::to_value(&grant_payload).unwrap(),
+        &fixture.owner.identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let grant: WorkspaceGrant =
+        serde_json::from_value(serde_json::to_value(grant).unwrap()).unwrap();
+    let payload = PublicBoardDeliveryPolicy {
+        kind: "rusty-public-board-delivery-policy".into(),
+        version: 1,
+        workspace_id: "workspace-one".into(),
+        board_id: BOARD.into(),
+        generation: 1,
+        access_epoch: 3,
+        enabled: true,
+        accepted_grants: vec![grant],
+        revoked_grant_ids: vec![],
+        revoked_device_ids: vec![],
+    };
+    let policy = sign_json_envelope(
+        &[61; 32],
+        serde_json::to_value(payload).unwrap(),
+        &fixture.owner.identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let evidence = PublicBoardDeliveryPolicyEvidence {
+        policy: serde_json::from_value(serde_json::to_value(policy).unwrap()).unwrap(),
+        owner_certificates: vec![],
+    };
+    assert!(
+        validate_public_board_delivery_policy(
+            &evidence,
+            &fixture.owner,
+            BOARD,
+            None,
+            1_800_000_000_000,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn given_revoked_or_out_of_scope_grant_when_validating_delivery_policy_then_reject() {
+    let fixture = Fixture::new();
+    let editor_id = public_key_id(&public_key_from_seed(&[71; 32]).unwrap()).unwrap();
+    let automation_payload = WorkspaceGrantPayload {
+        kind: "workspace-grant".into(),
+        version: 1,
+        grant_id: "automation-grant-1".into(),
+        workspace_id: "workspace-one".into(),
+        person_id: editor_id,
+        role: WorkspaceRole::Automation,
+        access_epoch: Some(3),
+        automation: Some(AutomationGrantScope {
+            version: 1,
+            board_id: "another-board".into(),
+            columns: AutomationGrantColumns {
+                lead: "lead".into(),
+                applied: None,
+                interview: "interview".into(),
+                rejected: "rejected".into(),
+            },
+            field_ids: vec!["field".into()],
+            expires_at: 1_900_000_000_000,
+        }),
+    };
+    let grant = sign_json_envelope(
+        &[61; 32],
+        serde_json::to_value(automation_payload).unwrap(),
+        &fixture.owner.identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let grant: WorkspaceGrant =
+        serde_json::from_value(serde_json::to_value(grant).unwrap()).unwrap();
+    let payload = PublicBoardDeliveryPolicy {
+        kind: "rusty-public-board-delivery-policy".into(),
+        version: 1,
+        workspace_id: "workspace-one".into(),
+        board_id: BOARD.into(),
+        generation: 1,
+        access_epoch: 3,
+        enabled: true,
+        accepted_grants: vec![grant],
+        revoked_grant_ids: vec!["automation-grant-1".into()],
+        revoked_device_ids: vec![],
+    };
+    let policy = sign_json_envelope(
+        &[61; 32],
+        serde_json::to_value(payload).unwrap(),
+        &fixture.owner.identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let evidence = PublicBoardDeliveryPolicyEvidence {
+        policy: serde_json::from_value(serde_json::to_value(policy).unwrap()).unwrap(),
+        owner_certificates: vec![],
+    };
+    assert!(
+        validate_public_board_delivery_policy(
+            &evidence,
+            &fixture.owner,
+            BOARD,
+            None,
+            1_800_000_000_000,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn given_active_delivery_policy_when_editor_updates_then_allow_content_but_reject_withdrawal() {
+    let fixture = Fixture::new();
+    let writer = DeliveryWriter::editor(&fixture);
+    let mut publish = fixture.request("publish", Some(projection()), fixture.challenge());
+    attach_delivery_policy(&fixture, &mut publish, &writer.policy);
+    fixture.mutate(publish).unwrap();
+
+    let updated = fixture
+        .mutate(writer.request(&fixture, "update", Some(projection())))
+        .unwrap();
+    assert_eq!(updated.payload["revision"], 2);
+    let asset = fixture
+        .stage(writer.asset_request(&fixture, b"writer selected bytes"))
+        .unwrap();
+    assert_eq!(asset.payload["kind"], "rusty-public-asset-receipt");
+    assert_eq!(
+        fixture
+            .store
+            .current_publication(BOARD)
+            .unwrap()
+            .unwrap()
+            .controller_person_id,
+        fixture.owner.identity.person_id
+    );
+
+    let withdrawal = writer.request(&fixture, "unpublish", None);
+    assert!(fixture.mutate(withdrawal).is_err());
+    assert_eq!(
+        fixture
+            .store
+            .current_publication(BOARD)
+            .unwrap()
+            .unwrap()
+            .revision,
+        2
+    );
+}
+
+#[test]
+fn given_automation_scope_when_public_board_delta_stays_scoped_then_allow_but_reject_extra_field() {
+    let fixture = Fixture::new();
+    let writer = DeliveryWriter::automation(&fixture);
+    let before = automation_projection(None);
+    let mut publish = fixture.request("publish", Some(before.clone()), fixture.challenge());
+    attach_delivery_policy(&fixture, &mut publish, &writer.policy);
+    fixture.mutate(publish).unwrap();
+
+    let scoped = automation_projection(Some(json!({
+        "id":"automated-card", "parentId":null, "columnId":"lead", "title":"Acme",
+        "body":"Role", "values":{"source":"https://example.test"}, "rank":"0/1"
+    })));
+    let accepted = fixture.mutate(writer.request(&fixture, "update", Some(scoped.clone())));
+    assert!(
+        accepted.is_ok(),
+        "scoped automation update should pass: {accepted:?}"
+    );
+
+    let unscoped = automation_projection(Some(json!({
+        "id":"automated-card", "parentId":null, "columnId":"lead", "title":"Acme",
+        "body":"Role", "values":{"source":"https://example.test", "private":"leak"}, "rank":"0/1"
+    })));
+    assert!(
+        fixture
+            .mutate(writer.request(&fixture, "update", Some(unscoped)))
+            .is_err()
+    );
+}
+
+fn attach_delivery_policy(
+    fixture: &Fixture,
+    request: &mut Value,
+    policy: &PublicBoardDeliveryPolicyEvidence,
+) {
+    let evidence = serde_json::to_value(policy).unwrap();
+    request["deliveryPolicy"] = evidence.clone();
+    let mut command = request["authorization"]["payload"].clone();
+    command["deliveryPolicyHash"] = json!(digest(canonicalize_json(&evidence).unwrap().as_bytes()));
+    request["authorization"] = serde_json::to_value(
+        sign_json_envelope(&[62; 32], command, &fixture.device_id, "MATCH/1").unwrap(),
+    )
+    .unwrap();
+}
+
+struct DeliveryWriter {
+    identity: PublicIdentity,
+    device_id: String,
+    device_seed: [u8; 32],
+    certificate: meta_mesh_core::DeviceCertificate,
+    grant: WorkspaceGrant,
+    policy: PublicBoardDeliveryPolicyEvidence,
+    source_heads: Vec<String>,
+}
+
+impl DeliveryWriter {
+    fn editor(fixture: &Fixture) -> Self {
+        Self::new(fixture, WorkspaceRole::Editor)
+    }
+
+    fn automation(fixture: &Fixture) -> Self {
+        Self::new(fixture, WorkspaceRole::Automation)
+    }
+
+    fn new(fixture: &Fixture, role: WorkspaceRole) -> Self {
+        let person_key = public_key_from_seed(&[71; 32]).unwrap();
+        let person_id = public_key_id(&person_key).unwrap();
+        let device_seed = [72; 32];
+        let device_key = public_key_from_seed(&device_seed).unwrap();
+        let device_id = public_key_id(&device_key).unwrap();
+        let certificate = sign_device_certificate(
+            &[71; 32],
+            DeviceCertificatePayload {
+                kind: "device-certificate".into(),
+                version: 1,
+                person_id: person_id.clone(),
+                device_id: device_id.clone(),
+                device_public_key: device_key,
+                issuer_certificate_hash: None,
+                can_enroll_devices: true,
+            },
+            &person_id,
+            "MATCH/1",
+        )
+        .unwrap();
+        let identity = serde_json::from_value(json!({
+            "personId": person_id,
+            "publicKey": person_key,
+            "displayName": "Editor"
+        }))
+        .unwrap();
+        let grant_payload = WorkspaceGrantPayload {
+            kind: "workspace-grant".into(),
+            version: 1,
+            grant_id: "editor-grant-1".into(),
+            workspace_id: "workspace-one".into(),
+            person_id,
+            role,
+            access_epoch: Some(3),
+            automation: (role == WorkspaceRole::Automation).then_some(AutomationGrantScope {
+                version: 1,
+                board_id: BOARD.into(),
+                columns: AutomationGrantColumns {
+                    lead: "lead".into(),
+                    applied: Some("applied".into()),
+                    interview: "interview".into(),
+                    rejected: "rejected".into(),
+                },
+                field_ids: vec!["source".into()],
+                expires_at: 1_900_000_000_000,
+            }),
+        };
+        let grant: WorkspaceGrant = serde_json::from_value(
+            serde_json::to_value(
+                sign_json_envelope(
+                    &[61; 32],
+                    serde_json::to_value(&grant_payload).unwrap(),
+                    &fixture.owner.identity.person_id,
+                    "MATCH/1",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let policy_payload = PublicBoardDeliveryPolicy {
+            kind: "rusty-public-board-delivery-policy".into(),
+            version: 1,
+            workspace_id: "workspace-one".into(),
+            board_id: BOARD.into(),
+            generation: 1,
+            access_epoch: 3,
+            enabled: true,
+            accepted_grants: vec![grant.clone()],
+            revoked_grant_ids: vec![],
+            revoked_device_ids: vec![],
+        };
+        let policy = PublicBoardDeliveryPolicyEvidence {
+            policy: serde_json::from_value(
+                serde_json::to_value(
+                    sign_json_envelope(
+                        &[61; 32],
+                        serde_json::to_value(policy_payload).unwrap(),
+                        &fixture.owner.identity.person_id,
+                        "MATCH/1",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            owner_certificates: vec![],
+        };
+        Self {
+            identity,
+            device_id,
+            device_seed,
+            certificate,
+            grant,
+            policy,
+            source_heads: vec!["a".repeat(64), "b".repeat(64)],
+        }
+    }
+
+    fn challenge(&self, fixture: &Fixture) -> SignedEnvelope<Value> {
+        let request: PublicChallengeRequest = serde_json::from_value(json!({
+            "version": 1,
+            "boardId": BOARD,
+            "identity": self.identity,
+            "deviceId": self.device_id,
+            "certificates": [self.certificate],
+            "deliveryGrant": self.grant,
+            "sourceHeads": self.source_heads,
+        }))
+        .unwrap();
+        fixture
+            .store
+            .create_public_delivery_challenge(request, &fixture.owner, ORIGIN)
+            .unwrap()
+    }
+
+    fn request(&self, fixture: &Fixture, action: &str, projection: Option<Value>) -> Value {
+        let challenge = self.challenge(fixture);
+        let projection_hash = projection
+            .as_ref()
+            .map(|value| digest(canonicalize_json(value).unwrap().as_bytes()))
+            .unwrap_or_else(|| digest(b"null"));
+        let source_heads_hash = digest(&serde_json::to_vec(&self.source_heads).unwrap());
+        let payload = &challenge.payload;
+        let authorization = sign_json_envelope(
+            &self.device_seed,
+            json!({
+                "kind":"rusty-publication-command", "version":1,
+                "challengeId":payload["challengeId"], "nonce":payload["nonce"],
+                "serviceId":payload["serviceId"], "publicOrigin":ORIGIN, "boardId":BOARD,
+                "action":action, "projectionHash":projection_hash,
+                "expectedRevision":payload["expectedRevision"], "expiresAt":payload["expiresAt"],
+                "deliveryGeneration":1, "deliveryGrantId":"editor-grant-1",
+                "sourceHeadsHash":source_heads_hash
+            }),
+            &self.device_id,
+            "MATCH/1",
+        )
+        .unwrap();
+        json!({
+            "challenge":challenge,
+            "identity":self.identity,
+            "deviceId":self.device_id,
+            "certificates":[self.certificate],
+            "deliveryGrant":self.grant,
+            "sourceHeads":self.source_heads,
+            "action":action,
+            "projection":projection,
+            "authorization":authorization
+        })
+    }
+
+    fn asset_request(&self, fixture: &Fixture, bytes: &[u8]) -> Value {
+        let challenge = self.challenge(fixture);
+        let hash = digest(bytes);
+        let payload = &challenge.payload;
+        let source_heads_hash = digest(&serde_json::to_vec(&self.source_heads).unwrap());
+        let authorization = sign_json_envelope(
+            &self.device_seed,
+            json!({
+                "kind":"rusty-publication-command", "version":1,
+                "challengeId":payload["challengeId"], "nonce":payload["nonce"],
+                "serviceId":payload["serviceId"], "publicOrigin":ORIGIN, "boardId":BOARD,
+                "action":"stage-file", "projectionHash":hash,
+                "expectedRevision":payload["expectedRevision"], "expiresAt":payload["expiresAt"],
+                "byteLength":bytes.len(), "deliveryGeneration":1,
+                "deliveryGrantId":"editor-grant-1", "sourceHeadsHash":source_heads_hash
+            }),
+            &self.device_id,
+            "MATCH/1",
+        )
+        .unwrap();
+        json!({
+            "challenge":challenge,
+            "identity":self.identity,
+            "deviceId":self.device_id,
+            "certificates":[self.certificate],
+            "deliveryGrant":self.grant,
+            "sourceHeads":self.source_heads,
+            "sha256":hash,
+            "byteLength":bytes.len(),
+            "bytes":URL_SAFE_NO_PAD.encode(bytes),
+            "authorization":authorization
+        })
+    }
 }

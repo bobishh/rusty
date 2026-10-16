@@ -1,0 +1,135 @@
+name: Deploy Rusty
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Exact successful Rusty CI run to deploy (rollback selects an older run)
+        required: true
+        type: string
+      source_run_attempt:
+        description: Exact attempt that produced the sealed artifact
+        required: true
+        type: string
+
+concurrency:
+  group: rusty-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+jobs:
+  deploy:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GHCR_USER: ${{ github.repository_owner }}
+      RUSTY_DEPLOY_SPEC: ${{ vars.RUSTY_DEPLOY_SPEC }}
+      RUSTY_TRUSTED_OWNER: ${{ secrets.RUSTY_TRUSTED_OWNER }}
+      RUSTY_TELEMETRY_TOKEN: ${{ secrets.RUSTY_TELEMETRY_TOKEN }}
+      CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
+      RUSTY_TELEMETRY_PROJECT: ${{ vars.RUSTY_TELEMETRY_PROJECT }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.4.7
+      - name: Install pinned Kamal
+        run: gem install kamal --version 2.10.1 --no-document
+      - name: Select exact source run and attempt
+        id: source
+        env:
+          SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || inputs.source_run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ && "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT")
+          test "$(jq -r .repository.full_name <<< "$run")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r .head_branch <<< "$run")" = main
+          test "$(jq -r .conclusion <<< "$run")" = success
+          test "$(jq -r .event <<< "$run")" = push
+          test "$(jq -r .path <<< "$run")" = .github/workflows/ci.yml
+          test "$(jq -r .run_attempt <<< "$run")" = "$SOURCE_RUN_ATTEMPT"
+          {
+            echo "run_id=$SOURCE_RUN_ID"
+            echo "attempt=$SOURCE_RUN_ATTEMPT"
+            echo "sha=$(jq -r .head_sha <<< "$run")"
+          } >> "$GITHUB_OUTPUT"
+      - name: Download exact sealed Rusty artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: rusty-release-${{ steps.source.outputs.sha }}-${{ steps.source.outputs.attempt }}
+          path: .release/rusty/
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.source.outputs.run_id }}
+      - name: Verify release seal and executable bytes
+        run: python3 scripts/verify_release.py .release/rusty
+      - name: Fetch the pinned existing Kamal configuration
+        run: node scripts/fetch_deploy_config.mjs
+      - name: Prepare trusted host access
+        env:
+          RUSTY_DEPLOY_SSH_KEY: ${{ secrets.RUSTY_DEPLOY_SSH_KEY }}
+          RUSTY_DEPLOY_KNOWN_HOSTS: ${{ secrets.RUSTY_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$RUSTY_DEPLOY_SSH_KEY"
+          test -n "$RUSTY_DEPLOY_KNOWN_HOSTS"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$RUSTY_DEPLOY_SSH_KEY" > "$RUNNER_TEMP/rusty-deploy-key"
+          chmod 600 "$RUNNER_TEMP/rusty-deploy-key"
+          printf '%s\n' "$RUSTY_DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          echo "RUSTY_SSH_KEY_FILE=$RUNNER_TEMP/rusty-deploy-key" >> "$GITHUB_ENV"
+      - name: Prepare private Rusty runtime secrets
+        env:
+          DEPLOY_CONFIG_DIR: .release-config/hetzner_playground
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUSTY_TRUSTED_OWNER"
+          test -n "$CLICKHOUSE_PASSWORD"
+          case "$RUSTY_TRUSTED_OWNER$RUSTY_TELEMETRY_TOKEN$CLICKHOUSE_PASSWORD$OTEL_EXPORTER_OTLP_ENDPOINT$RUSTY_TELEMETRY_PROJECT" in *$'\n'*|*$'\r'*) exit 1;; esac
+          install -m 700 -d "$DEPLOY_CONFIG_DIR/.kamal"
+          umask 077
+          {
+            printf 'RUSTY_TRUSTED_OWNER=%s\nCLICKHOUSE_PASSWORD=%s\n' "$RUSTY_TRUSTED_OWNER" "$CLICKHOUSE_PASSWORD"
+            [ -z "$RUSTY_TELEMETRY_TOKEN" ] || printf 'RUSTY_TELEMETRY_TOKEN=%s\n' "$RUSTY_TELEMETRY_TOKEN"
+            [ -z "$OTEL_EXPORTER_OTLP_ENDPOINT" ] || printf 'OTEL_EXPORTER_OTLP_ENDPOINT=%s\n' "$OTEL_EXPORTER_OTLP_ENDPOINT"
+            [ -z "$RUSTY_TELEMETRY_PROJECT" ] || printf 'RUSTY_TELEMETRY_PROJECT=%s\n' "$RUSTY_TELEMETRY_PROJECT"
+          } > "$DEPLOY_CONFIG_DIR/.kamal/secrets"
+          chmod 600 "$DEPLOY_CONFIG_DIR/.kamal/secrets"
+      - name: Deploy sealed image with existing-volume handoff
+        run: node scripts/deploy_release.mjs .release/rusty/artifact.json "$(node -p "JSON.parse(require('fs').readFileSync('.release/rusty/artifact.json')).artifactSha256")"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: rusty-deployment-${{ steps.source.outputs.sha }}-${{ steps.source.outputs.attempt }}
+          path: .release/rusty/
+          if-no-files-found: ignore
+          retention-days: 90

@@ -51,6 +51,9 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Verify blind storage and public publication
@@ -60,7 +63,9 @@ jobs:
       - name: Verify real process discovery and restart
         run: python3 scripts/smoke_service.py target/debug/mesh-lighthouse
       - name: Verify immutable release sealing
-        run: python3 -m unittest discover -s scripts -p test_seal_release.py
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          node --test scripts/test_deploy_release.mjs
 
   publish-container:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
