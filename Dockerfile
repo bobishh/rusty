@@ -21,6 +21,7 @@ RUN touch src/lib.rs src/main.rs \
     && cargo build --release --locked
 
 FROM debian:bookworm-slim
+LABEL service="mesh-lighthouse"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /data lighthouse \

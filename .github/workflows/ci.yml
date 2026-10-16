@@ -80,6 +80,8 @@ jobs:
         run: |
           sdk_sha=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["dependencies"]["meta-mesh-core"]["rev"])')
           docker build --build-arg "RUSTY_BUILD_SHA=$GITHUB_SHA" --build-arg "RUSTY_SDK_SHA=$sdk_sha" --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/bobishh/rusty" --tag "ghcr.io/bobishh/rusty:$GITHUB_SHA" .
+      - name: Verify the existing Kamal service identity
+        run: test "$(docker inspect --format '{{index .Config.Labels "service"}}' "ghcr.io/bobishh/rusty:$GITHUB_SHA")" = mesh-lighthouse
       - name: Publish immutable service image
         run: docker push "ghcr.io/bobishh/rusty:$GITHUB_SHA"
       - name: Capture the exact published executable and immutable image identity
