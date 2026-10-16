@@ -528,8 +528,14 @@ fn public_file_links_remain_current_only_while_their_hash_is_in_the_active_manif
 
     // Revision is a cache-busting hint. Existing links keep working while the
     // same bytes remain part of the active, non-withdrawn projection.
-    assert_eq!(fixture.store.publication_file(BOARD, 1, &sha256).unwrap().0, bytes);
-    assert_eq!(fixture.store.publication_file(BOARD, 2, &sha256).unwrap().0, bytes);
+    assert_eq!(
+        fixture.store.publication_file(BOARD, 1, &sha256).unwrap().0,
+        bytes
+    );
+    assert_eq!(
+        fixture.store.publication_file(BOARD, 2, &sha256).unwrap().0,
+        bytes
+    );
     assert!(fixture.store.publication_file(BOARD, 0, &sha256).is_err());
     assert!(fixture.store.publication_file(BOARD, 3, &sha256).is_err());
 
