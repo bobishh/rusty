@@ -39,7 +39,7 @@ jobs:
     environment: production
     env:
       GH_TOKEN: ${{ github.token }}
-      GHCR_USER: ${{ github.repository_owner }}
+      DOCKER_REGISTRY_USERNAME: ${{ github.repository_owner }}
       RUSTY_DEPLOY_SPEC: ${{ vars.RUSTY_DEPLOY_SPEC }}
       RUSTY_TRUSTED_OWNER: ${{ secrets.RUSTY_TRUSTED_OWNER }}
       RUSTY_TELEMETRY_TOKEN: ${{ secrets.RUSTY_TELEMETRY_TOKEN }}

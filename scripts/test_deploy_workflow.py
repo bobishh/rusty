@@ -13,6 +13,7 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("RUSTY_DEPLOY_SPEC", workflow)
         self.assertIn("RUSTY_DEPLOY_SSH_KEY", workflow)
         self.assertIn("packages: write", workflow)
+        self.assertIn("DOCKER_REGISTRY_USERNAME: ${{ github.repository_owner }}", workflow)
         self.assertNotIn("Confirm live Rusty executable", workflow)
         self.assertNotIn("bobishh/tincanban", workflow)
         self.assertNotIn("RUSTY_REVISION", workflow)
