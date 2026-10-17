@@ -1,7 +1,7 @@
 use super::*;
 use meta_mesh_core::{
-    sign_device_certificate, AutomationGrantColumns, AutomationGrantScope,
-    DeviceCertificatePayload, WorkspaceGrant, WorkspaceGrantPayload, WorkspaceRole,
+    AutomationGrantColumns, AutomationGrantScope, DeviceCertificatePayload, WorkspaceGrant,
+    WorkspaceGrantPayload, WorkspaceRole, sign_device_certificate,
 };
 
 const ORIGIN: &str = "https://rusty.example";
@@ -312,9 +312,11 @@ fn signed_publication_rejects_cross_board_payload_expired_challenge_replay_and_s
     let stale = fixture.request("publish", Some(projection()), fixture.challenge());
     let mut foreign = projection();
     foreign["board"]["id"] = json!("another-board");
-    assert!(fixture
-        .mutate(fixture.request("publish", Some(foreign), fixture.challenge()))
-        .is_err());
+    assert!(
+        fixture
+            .mutate(fixture.request("publish", Some(foreign), fixture.challenge()))
+            .is_err()
+    );
     let expired = fixture.challenge();
     let pending_path = fixture
         .directory
@@ -326,9 +328,11 @@ fn signed_publication_rejects_cross_board_payload_expired_challenge_replay_and_s
     let mut pending: Value = serde_json::from_slice(&fs::read(&pending_path).unwrap()).unwrap();
     pending["expiresAt"] = json!(0);
     fs::write(pending_path, serde_json::to_vec(&pending).unwrap()).unwrap();
-    assert!(fixture
-        .mutate(fixture.request("publish", Some(projection()), expired))
-        .is_err());
+    assert!(
+        fixture
+            .mutate(fixture.request("publish", Some(projection()), expired))
+            .is_err()
+    );
     fixture.mutate(first.clone()).unwrap();
     assert!(
         fixture.mutate(first).is_err(),
@@ -352,14 +356,18 @@ fn incomplete_attachment_manifest_and_invalid_threads_preserve_confirmed_snapsho
     fixture.publish();
     let mut missing_file = projection();
     missing_file["files"] = json!([{"id":"public-file","parentId":BOARD,"title":"Missing","fileName":"missing.txt","mediaType":"text/plain","byteLength":1,"sha256":digest(b"x")}]);
-    assert!(fixture
-        .mutate(fixture.request("update", Some(missing_file), fixture.challenge()))
-        .is_err());
+    assert!(
+        fixture
+            .mutate(fixture.request("update", Some(missing_file), fixture.challenge()))
+            .is_err()
+    );
     let mut invalid_thread = projection();
     invalid_thread["discussions"] = json!([{"id":"message","threadId":"missing-root","replyTo":null,"targets":[{"type":"board","id":BOARD}],"author":"Author","createdAt":"2026-10-10T10:00:00Z","body":"Invalid thread"}]);
-    assert!(fixture
-        .mutate(fixture.request("update", Some(invalid_thread), fixture.challenge()))
-        .is_err());
+    assert!(
+        fixture
+            .mutate(fixture.request("update", Some(invalid_thread), fixture.challenge()))
+            .is_err()
+    );
     assert_eq!(
         fixture
             .store
@@ -381,9 +389,11 @@ fn withdrawal_keeps_revision_continuity_and_prevents_stale_resurrection() {
         .unwrap();
     assert_eq!(withdrawn.payload["revision"], 2);
     assert!(fixture.mutate(stale).is_err());
-    assert!(fixture
-        .mutate(fixture.request("update", Some(projection()), fixture.challenge()))
-        .is_err());
+    assert!(
+        fixture
+            .mutate(fixture.request("update", Some(projection()), fixture.challenge()))
+            .is_err()
+    );
     let republished = fixture
         .mutate(fixture.request("publish", Some(projection()), fixture.challenge()))
         .unwrap();
@@ -484,13 +494,17 @@ fn public_asset_staging_checks_exact_bytes_signature_and_replay_but_allows_fresh
         verify_signed_envelope(&receipt, &fixture.store.public_key().unwrap(), DOMAIN).unwrap()
     );
     assert!(fixture.stage(request).is_err());
-    assert!(fixture
-        .stage(fixture.asset_request(b"selected bytes"))
-        .is_ok());
-    assert!(fixture
-        .store
-        .publication_file(BOARD, 1, &digest(b"selected bytes"))
-        .is_err());
+    assert!(
+        fixture
+            .stage(fixture.asset_request(b"selected bytes"))
+            .is_ok()
+    );
+    assert!(
+        fixture
+            .store
+            .publication_file(BOARD, 1, &digest(b"selected bytes"))
+            .is_err()
+    );
 }
 
 #[test]
@@ -727,14 +741,16 @@ fn given_owner_signed_board_policy_when_editor_grant_is_current_then_delivery_is
         policy: serde_json::from_value(serde_json::to_value(policy).unwrap()).unwrap(),
         owner_certificates: vec![],
     };
-    assert!(validate_public_board_delivery_policy(
-        &evidence,
-        &fixture.owner,
-        BOARD,
-        None,
-        1_800_000_000_000,
-    )
-    .is_ok());
+    assert!(
+        validate_public_board_delivery_policy(
+            &evidence,
+            &fixture.owner,
+            BOARD,
+            None,
+            1_800_000_000_000,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -794,14 +810,16 @@ fn given_revoked_or_out_of_scope_grant_when_validating_delivery_policy_then_reje
         policy: serde_json::from_value(serde_json::to_value(policy).unwrap()).unwrap(),
         owner_certificates: vec![],
     };
-    assert!(validate_public_board_delivery_policy(
-        &evidence,
-        &fixture.owner,
-        BOARD,
-        None,
-        1_800_000_000_000,
-    )
-    .is_err());
+    assert!(
+        validate_public_board_delivery_policy(
+            &evidence,
+            &fixture.owner,
+            BOARD,
+            None,
+            1_800_000_000_000,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -866,9 +884,11 @@ fn given_automation_scope_when_public_board_delta_stays_scoped_then_allow_but_re
         "id":"automated-card", "parentId":null, "columnId":"lead", "title":"Acme",
         "body":"Role", "values":{"source":"https://example.test", "private":"leak"}, "rank":"0/1"
     })));
-    assert!(fixture
-        .mutate(writer.request(&fixture, "update", Some(unscoped)))
-        .is_err());
+    assert!(
+        fixture
+            .mutate(writer.request(&fixture, "update", Some(unscoped)))
+            .is_err()
+    );
 }
 
 fn attach_delivery_policy(
@@ -1094,8 +1114,8 @@ impl DeliveryWriter {
 }
 
 #[test]
-fn given_configured_card_fields_when_publishing_then_preserve_declared_formats_and_reject_private_references(
-) {
+fn given_configured_card_fields_when_publishing_then_preserve_declared_formats_and_reject_private_references()
+ {
     let mut projection = json!({"kind":"tincanban-public-board","version":1,
         "board":{"id":BOARD,"title":"Configured board","presentation":{
             "preset":{"key":"custom","version":1,"bindings":{}},

@@ -1,21 +1,21 @@
 //! Durable opaque object replication. This module never loads application documents.
 use crate::telemetry::{Level, Telemetry};
 use axum::{
+    Json, Router,
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, put},
-    Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use meta_mesh_core::{
+    DeviceCertificate, PublicIdentity, SignedEnvelope, WorkspaceGrant, WorkspaceRole,
     canonicalize_json, public_key_from_seed, public_key_id, sign_json_envelope,
     verify_device_certificate_chain, verify_signed_envelope, verify_workspace_grant,
-    DeviceCertificate, PublicIdentity, SignedEnvelope, WorkspaceGrant, WorkspaceRole,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
