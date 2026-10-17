@@ -155,6 +155,7 @@ fn validate_public_presentation(
             "preset",
             "cardStageButtons",
             "cardAgingPolicy",
+            "cardPresentation",
         ],
     ) || value
         .get("entityName")
@@ -168,9 +169,28 @@ fn validate_public_presentation(
     {
         return Err("Invalid public archive column binding".into());
     }
+    if let Some(config) = value.get("cardPresentation") {
+        if !exact_keys_with_optional(config, &[], &["openAfterSave", "titleFieldIds", "summaryFieldIds", "narrativeFieldId"])
+            || config.get("openAfterSave").is_some_and(|flag| !flag.is_boolean())
+        {
+            return Err("Invalid public card presentation".into());
+        }
+        for key in ["titleFieldIds", "summaryFieldIds"] {
+            if let Some(value) = config.get(key) {
+                let ids = value.as_array().filter(|ids| ids.len() <= 200)
+                    .ok_or("Invalid public card field list")?;
+                if ids.iter().any(|id| !id.as_str().is_some_and(|id| visible_ids.contains(id))) {
+                    return Err("Public card field is outside publication".into());
+                }
+            }
+        }
+        if config.get("narrativeFieldId").is_some_and(|id| !id.as_str().is_some_and(|id| visible_ids.contains(id))) {
+            return Err("Public narrative field is outside publication".into());
+        }
+    }
     if let Some(preset) = value.get("preset").filter(|preset| !preset.is_null()) {
         if !exact_keys(preset, &["key", "version", "bindings"])
-            || !matches!(preset["key"].as_str(), Some("job-search" | "blank"))
+            || !preset["key"].as_str().is_some_and(|key| !key.is_empty() && key.encode_utf16().count() <= 128)
             || preset["version"] != 1
         {
             return Err("Invalid public preset".into());
@@ -563,7 +583,7 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
         if !exact_keys_with_optional(
             field,
             &["id", "title", "valueType", "required", "rank", "options"],
-            &["min", "max"],
+            &["min", "max", "format"],
         ) || ["min", "max"].iter().any(|key| {
             field.get(*key).is_some_and(|value| {
                 !value.is_null() && !value.as_f64().is_some_and(f64::is_finite)
@@ -583,6 +603,11 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
         .contains(&value_type)
         {
             return Err("Invalid public field type".into());
+        }
+        if let Some(format) = field.get("format") {
+            if value_type != "text" || !matches!(format.as_str(), Some("plain" | "markdown" | "json" | "code")) {
+                return Err("Invalid public text field format".into());
+            }
         }
         let options = field["options"]
             .as_array()
@@ -3196,7 +3221,7 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
             "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
             "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1, "publicBoardPublication": 1},
         "service": {"serviceId": service_id, "publicKey": public_key},
-        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1,"deliveryVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
+        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1,"fieldConfigurationVersion":1,"deliveryVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
     ))
 }
 

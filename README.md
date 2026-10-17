@@ -10,7 +10,8 @@ hash; it does not claim to inspect private workspace history. Public copies incl
 selected-board/card discussions and attachments, plus allowlisted visitor display
 settings (preset bindings, column accents, stage labels and aging). The
 `publicBoardPublication.presentationVersion: 1` capability advertises support; older
-projections remain valid. Owner-controlled access determines whether a board is
+projections remain valid. `fieldConfigurationVersion: 1` additionally advertises generic
+card field bindings and explicit plain/Markdown/JSON/code text formats. Owner-controlled access determines whether a board is
 available for anonymous reads; accepted deliveries from currently authorized
 writers advance its public revision. Disabling access stops future reads but
 cannot recall bytes already received. Configure the public frontend origin in `RUSTY_CORS_ORIGINS`

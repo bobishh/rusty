@@ -1112,3 +1112,26 @@ impl DeliveryWriter {
         })
     }
 }
+
+#[test]
+fn given_configured_card_fields_when_publishing_then_preserve_declared_formats_and_reject_private_references() {
+    let mut projection = json!({"kind":"tincanban-public-board","version":1,
+        "board":{"id":BOARD,"title":"Configured board","presentation":{
+            "preset":{"key":"custom","version":1,"bindings":{}},
+            "cardPresentation":{"titleFieldIds":["source"],"summaryFieldIds":["source"],"narrativeFieldId":"source","openAfterSave":true}}},
+        "columns":[{"id":"column","title":"Queue","rank":"0/1"}],
+        "fields":[{"id":"source","title":"Source text","valueType":"text","format":"plain","required":false,"rank":"0/1","options":[]}],
+        "cards":[],"discussions":[],"files":[]});
+    for format in ["plain", "markdown", "json", "code"] {
+        projection["fields"][0]["format"] = json!(format);
+        assert!(validate_public_projection(&projection).is_ok());
+    }
+    projection["fields"][0]["format"] = json!("script");
+    assert!(validate_public_projection(&projection).is_err());
+    projection["fields"][0]["format"] = json!("plain");
+    projection["fields"][0]["valueType"] = json!("boolean");
+    assert!(validate_public_projection(&projection).is_err());
+    projection["fields"][0]["valueType"] = json!("text");
+    projection["board"]["presentation"]["cardPresentation"]["narrativeFieldId"] = json!("private-field");
+    assert!(validate_public_projection(&projection).is_err());
+}
