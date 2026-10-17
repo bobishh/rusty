@@ -1,21 +1,21 @@
 //! Durable opaque object replication. This module never loads application documents.
 use crate::telemetry::{Level, Telemetry};
 use axum::{
-    Json, Router,
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, put},
+    Json, Router,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
 use meta_mesh_core::{
-    DeviceCertificate, PublicIdentity, SignedEnvelope, WorkspaceGrant, WorkspaceRole,
     canonicalize_json, public_key_from_seed, public_key_id, sign_json_envelope,
     verify_device_certificate_chain, verify_signed_envelope, verify_workspace_grant,
+    DeviceCertificate, PublicIdentity, SignedEnvelope, WorkspaceGrant, WorkspaceRole,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -170,27 +170,47 @@ fn validate_public_presentation(
         return Err("Invalid public archive column binding".into());
     }
     if let Some(config) = value.get("cardPresentation") {
-        if !exact_keys_with_optional(config, &[], &["openAfterSave", "titleFieldIds", "summaryFieldIds", "narrativeFieldId"])
-            || config.get("openAfterSave").is_some_and(|flag| !flag.is_boolean())
+        if !exact_keys_with_optional(
+            config,
+            &[],
+            &[
+                "openAfterSave",
+                "titleFieldIds",
+                "summaryFieldIds",
+                "narrativeFieldId",
+            ],
+        ) || config
+            .get("openAfterSave")
+            .is_some_and(|flag| !flag.is_boolean())
         {
             return Err("Invalid public card presentation".into());
         }
         for key in ["titleFieldIds", "summaryFieldIds"] {
             if let Some(value) = config.get(key) {
-                let ids = value.as_array().filter(|ids| ids.len() <= 200)
+                let ids = value
+                    .as_array()
+                    .filter(|ids| ids.len() <= 200)
                     .ok_or("Invalid public card field list")?;
-                if ids.iter().any(|id| !id.as_str().is_some_and(|id| visible_ids.contains(id))) {
+                if ids
+                    .iter()
+                    .any(|id| !id.as_str().is_some_and(|id| visible_ids.contains(id)))
+                {
                     return Err("Public card field is outside publication".into());
                 }
             }
         }
-        if config.get("narrativeFieldId").is_some_and(|id| !id.as_str().is_some_and(|id| visible_ids.contains(id))) {
+        if config
+            .get("narrativeFieldId")
+            .is_some_and(|id| !id.as_str().is_some_and(|id| visible_ids.contains(id)))
+        {
             return Err("Public narrative field is outside publication".into());
         }
     }
     if let Some(preset) = value.get("preset").filter(|preset| !preset.is_null()) {
         if !exact_keys(preset, &["key", "version", "bindings"])
-            || !preset["key"].as_str().is_some_and(|key| !key.is_empty() && key.encode_utf16().count() <= 128)
+            || !preset["key"]
+                .as_str()
+                .is_some_and(|key| !key.is_empty() && key.encode_utf16().count() <= 128)
             || preset["version"] != 1
         {
             return Err("Invalid public preset".into());
@@ -605,7 +625,12 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
             return Err("Invalid public field type".into());
         }
         if let Some(format) = field.get("format") {
-            if value_type != "text" || !matches!(format.as_str(), Some("plain" | "markdown" | "json" | "code")) {
+            if value_type != "text"
+                || !matches!(
+                    format.as_str(),
+                    Some("plain" | "markdown" | "json" | "code")
+                )
+            {
                 return Err("Invalid public text field format".into());
             }
         }
