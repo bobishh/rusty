@@ -59,6 +59,13 @@ or keys already obtained. Local acceptance does not establish a production rollo
 
 ## Storage protocol
 
+Signed publication challenges include `deliveryPolicyContentHash` for the current
+verified policy. It hashes canonical JSON containing `policy.payload`,
+`policy.signerKeyId`, and `ownerCertificates`, excluding only the policy's signature.
+Clients compare it to detect changed permissions without assuming deterministic
+signature bytes. `deliveryPolicyHash` still binds the complete signed evidence in
+publication commands; signature verification and revision checks remain required.
+
 Scope enrollment advertises `capabilities.scopeEnrollmentRetry.version: 1`.
 The latest completed signed receipt and a hash of the exact normalized request
 commit atomically with the scope's token MACs. An identical request can recover

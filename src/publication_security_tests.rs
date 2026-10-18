@@ -891,6 +891,43 @@ fn given_automation_scope_when_public_board_delta_stays_scoped_then_allow_but_re
     );
 }
 
+#[test]
+fn given_signed_delivery_policy_when_reading_status_then_content_hash_ignores_resigning_but_binds_rights()
+ {
+    let fixture = Fixture::new();
+    let writer = DeliveryWriter::editor(&fixture);
+    let mut publish = fixture.request("publish", Some(projection()), fixture.challenge());
+    attach_delivery_policy(&fixture, &mut publish, &writer.policy);
+    fixture.mutate(publish).unwrap();
+
+    let challenge = fixture.challenge();
+    let expected = public_delivery_policy_content_hash(&writer.policy).unwrap();
+    assert_eq!(challenge.payload["deliveryPolicyContentHash"], expected);
+    let mut resigned = writer.policy.clone();
+    // Stored policies are already authenticated. Signature bytes identify the wire
+    // envelope, not the policy's meaning (CryptoKit randomizes Ed25519 signatures).
+    resigned.policy.signature = "different-signature".into();
+    assert_eq!(
+        public_delivery_policy_content_hash(&resigned).unwrap(),
+        expected
+    );
+    resigned
+        .policy
+        .payload
+        .revoked_grant_ids
+        .push("revoked-grant".into());
+    assert_ne!(
+        public_delivery_policy_content_hash(&resigned).unwrap(),
+        expected
+    );
+    resigned = writer.policy.clone();
+    resigned.policy.signer_key_id = "different-device".into();
+    assert_ne!(
+        public_delivery_policy_content_hash(&resigned).unwrap(),
+        expected
+    );
+}
+
 fn attach_delivery_policy(
     fixture: &Fixture,
     request: &mut Value,

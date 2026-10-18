@@ -286,6 +286,21 @@ struct PublicBoardDeliveryPolicyEvidence {
     owner_certificates: Vec<DeviceCertificate>,
 }
 
+// A verified policy's meaning must not depend on randomized signature bytes.
+// The existing wire hash still binds the exact signed command and receipt.
+fn public_delivery_policy_content_hash(
+    evidence: &PublicBoardDeliveryPolicyEvidence,
+) -> Result<String, String> {
+    let value = json!({
+        "policy": {
+            "payload": evidence.policy.payload,
+            "signerKeyId": evidence.policy.signer_key_id,
+        },
+        "ownerCertificates": evidence.owner_certificates,
+    });
+    canonicalize_json(&value).map(|canonical| digest(canonical.as_bytes()))
+}
+
 fn validate_public_board_delivery_policy(
     evidence: &PublicBoardDeliveryPolicyEvidence,
     owner: &TrustedOwner,
@@ -1688,6 +1703,11 @@ impl BlindStore {
                 .as_ref()
                 .map(|policy| policy.policy.payload.generation)
         });
+        let delivery_policy_content_hash = current
+            .delivery_policy
+            .as_ref()
+            .map(public_delivery_policy_content_hash)
+            .transpose()?;
         let envelope = sign_json_envelope(
             &self.seed,
             json!({
@@ -1699,7 +1719,8 @@ impl BlindStore {
                 "deliveryGrantId":delivery.map(|binding| binding.grant_id.as_str()),
                 "sourceHeadsHash":source_heads_hash,
                 "currentSourceHeads":current.source_heads,
-                "deliveryPolicyHash":current_delivery_policy_hash
+                "deliveryPolicyHash":current_delivery_policy_hash,
+                "deliveryPolicyContentHash":delivery_policy_content_hash
             }),
             service_id,
             DOMAIN,
