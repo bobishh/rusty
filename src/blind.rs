@@ -826,6 +826,7 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
     }
     let mut total_file_bytes = 0u64;
     let mut discussion_ids = HashSet::new();
+    let mut discussion_author_ids = HashSet::new();
     let mut discussion_threads: HashMap<String, (String, Option<String>)> = HashMap::new();
     for discussion in discussions {
         if !exact_keys_with_optional(
@@ -848,9 +849,12 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
             || !public_string(&discussion["body"], 8000)
             || discussion
                 .get("authorId")
-                .is_some_and(|author| !author.as_str().is_some_and(|id| author_ids.contains(id)))
+                .is_some_and(|author| !author.as_str().is_some_and(|id| valid_id(id)))
         {
             return Err("Invalid public discussion".into());
+        }
+        if let Some(author_id) = discussion["authorId"].as_str() {
+            discussion_author_ids.insert(author_id.to_owned());
         }
         if !discussion["replyTo"].is_null()
             && !valid_id(discussion["replyTo"].as_str().unwrap_or(""))
@@ -895,6 +899,12 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
                 discussion["replyTo"].as_str().map(str::to_owned),
             ),
         );
+    }
+    if author_ids
+        .iter()
+        .any(|id| !discussion_author_ids.contains(id))
+    {
+        return Err("Public discussion author metadata is not referenced".into());
     }
     for discussion in discussions {
         if discussion["replyTo"]

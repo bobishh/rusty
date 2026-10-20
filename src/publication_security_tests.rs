@@ -666,6 +666,10 @@ fn given_public_discussion_author_metadata_when_validating_publication_then_acce
         "files":[]});
     assert!(validate_public_projection(&projection).is_ok());
 
+    projection["discussionAuthors"] = json!([]);
+    assert!(validate_public_projection(&projection).is_ok());
+    projection["discussionAuthors"] = json!([{"id":author_id,
+        "avatarData":"data:image/webp;base64,UklGRhYAAABXRUJQVlA4WAoAAAAAAAAAfwAAfwAA"}]);
     projection["discussionAuthors"][0]["avatarData"] = json!("data:image/svg+xml;base64,PHN2Zz4=");
     assert!(validate_public_projection(&projection).is_err());
 
