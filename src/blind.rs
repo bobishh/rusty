@@ -7,7 +7,10 @@ use axum::{
     response::IntoResponse,
     routing::{get, put},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use hmac::{Hmac, Mac};
 use meta_mesh_core::{
     DeviceCertificate, PublicIdentity, SignedEnvelope, WorkspaceGrant, WorkspaceRole,
@@ -110,6 +113,28 @@ fn public_string(value: &Value, max: usize) -> bool {
     value
         .as_str()
         .is_some_and(|text| text.encode_utf16().count() <= max)
+}
+fn valid_public_avatar_data(value: &Value) -> bool {
+    let Some(data) = value.as_str() else {
+        return false;
+    };
+    let Some((mime, encoded)) = data.split_once(",") else {
+        return false;
+    };
+    if data.len() > 22_000 || !matches!(mime, "data:image/webp;base64" | "data:image/jpeg;base64") {
+        return false;
+    }
+    let Ok(bytes) = STANDARD.decode(encoded) else {
+        return false;
+    };
+    if bytes.len() > 16 * 1024 {
+        return false;
+    }
+    if mime == "data:image/webp;base64" {
+        bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
+    } else {
+        bytes.len() >= 4 && bytes[0..2] == [0xff, 0xd8] && bytes[bytes.len() - 2..] == [0xff, 0xd9]
+    }
 }
 fn public_rank(value: &Value) -> bool {
     let Some(rank) = value.as_str().filter(|rank| rank.len() <= 128) else {
@@ -549,7 +574,7 @@ fn validate_automation_publication_delta(
 }
 
 fn validate_public_projection(value: &Value) -> Result<(), String> {
-    if !exact_keys(
+    if !exact_keys_with_optional(
         value,
         &[
             "kind",
@@ -561,6 +586,7 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
             "discussions",
             "files",
         ],
+        &["discussionAuthors"],
     ) || value["kind"] != "tincanban-public-board"
         || value["version"] != 1
         || !exact_keys_with_optional(&value["board"], &["id", "title"], &["presentation"])
@@ -579,6 +605,27 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
     }
     let mut ids = HashSet::new();
     ids.insert(value["board"]["id"].as_str().unwrap().to_owned());
+    let mut author_ids = HashSet::new();
+    if let Some(authors) = value.get("discussionAuthors") {
+        let authors = authors
+            .as_array()
+            .ok_or("Invalid public discussion authors")?;
+        if authors.len() > 128 {
+            return Err("Public projection collection limit exceeded".into());
+        }
+        for author in authors {
+            if !exact_keys_with_optional(author, &["id"], &["avatarData"])
+                || !valid_id(author["id"].as_str().unwrap_or(""))
+                || !author_ids.insert(author["id"].as_str().unwrap().to_owned())
+                || !ids.insert(author["id"].as_str().unwrap().to_owned())
+                || author
+                    .get("avatarData")
+                    .is_some_and(|avatar| !valid_public_avatar_data(avatar))
+            {
+                return Err("Invalid public discussion author".into());
+            }
+        }
+    }
     let mut column_ids = HashSet::new();
     let mut archive_column_ids = HashSet::new();
     for column in columns {
@@ -781,7 +828,7 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
     let mut discussion_ids = HashSet::new();
     let mut discussion_threads: HashMap<String, (String, Option<String>)> = HashMap::new();
     for discussion in discussions {
-        if !exact_keys(
+        if !exact_keys_with_optional(
             discussion,
             &[
                 "id",
@@ -792,12 +839,16 @@ fn validate_public_projection(value: &Value) -> Result<(), String> {
                 "createdAt",
                 "body",
             ],
+            &["authorId"],
         ) || !valid_id(discussion["id"].as_str().unwrap_or(""))
             || !ids.insert(discussion["id"].as_str().unwrap().to_owned())
             || !valid_id(discussion["threadId"].as_str().unwrap_or(""))
             || !public_string(&discussion["author"], 500)
             || !public_string(&discussion["createdAt"], 128)
             || !public_string(&discussion["body"], 8000)
+            || discussion
+                .get("authorId")
+                .is_some_and(|author| !author.as_str().is_some_and(|id| author_ids.contains(id)))
         {
             return Err("Invalid public discussion".into());
         }

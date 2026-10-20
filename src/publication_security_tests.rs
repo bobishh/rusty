@@ -653,6 +653,29 @@ fn given_visitor_presentation_when_validating_publication_then_keep_only_public_
 }
 
 #[test]
+fn given_public_discussion_author_metadata_when_validating_publication_then_accept_bounded_avatar_links()
+ {
+    let author_id = "A".repeat(43);
+    let mut projection = json!({"kind":"tincanban-public-board","version":1,
+        "board":{"id":BOARD,"title":"Jobs"},"columns":[],"fields":[],"cards":[],
+        "discussions":[{"id":"message","threadId":"message","replyTo":null,
+            "targets":[{"type":"board","id":BOARD}],"authorId":author_id,"author":"Alice",
+            "createdAt":"2026-10-16T10:00:00Z","body":"Hi"}],
+        "discussionAuthors":[{"id":author_id,
+            "avatarData":"data:image/webp;base64,UklGRhYAAABXRUJQVlA4WAoAAAAAAAAAfwAAfwAA"}],
+        "files":[]});
+    assert!(validate_public_projection(&projection).is_ok());
+
+    projection["discussionAuthors"][0]["avatarData"] = json!("data:image/svg+xml;base64,PHN2Zz4=");
+    assert!(validate_public_projection(&projection).is_err());
+
+    projection["discussionAuthors"][0]["avatarData"] =
+        json!("data:image/webp;base64,UklGRhYAAABXRUJQVlA4WAoAAAAAAAAAfwAAfwAA");
+    projection["discussions"][0]["authorId"] = json!("unknown-author");
+    assert!(validate_public_projection(&projection).is_err());
+}
+
+#[test]
 fn given_shared_archive_surface_when_validating_projection_then_require_archive_roots() {
     let projection = json!({"kind":"tincanban-public-board","version":1,
         "board":{"id":BOARD,"title":"Jobs","presentation":{"archiveColumnId":"archive"}},
