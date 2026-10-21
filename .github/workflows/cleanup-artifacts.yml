@@ -1,0 +1,43 @@
+name: Prune Actions artifacts
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_run:
+    workflows: [CI, Deploy Rusty]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview eligible artifacts without deleting them
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: rusty-artifact-cleanup
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Check cleanup safety scenarios
+        run: node --test scripts/test_prune_artifacts.cjs
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: await require('./.github/scripts/prune-artifacts.cjs')({ github, context, core })

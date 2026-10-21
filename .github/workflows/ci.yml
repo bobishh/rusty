@@ -41,7 +41,7 @@ jobs:
           name: rusty-tlc-${{ github.sha }}
           path: ${{ runner.temp }}/rusty-tlc/
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 1
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -66,6 +66,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p 'test_*.py'
           node --test scripts/test_deploy_release.mjs
+          node --test scripts/test_prune_artifacts.cjs
 
   publish-container:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -125,4 +126,4 @@ jobs:
           name: rusty-release-${{ github.sha }}-${{ github.run_attempt }}
           path: .release/rusty/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
