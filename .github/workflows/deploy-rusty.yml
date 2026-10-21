@@ -41,7 +41,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       DOCKER_REGISTRY_USERNAME: ${{ github.repository_owner }}
       RUSTY_DEPLOY_SPEC: ${{ vars.RUSTY_DEPLOY_SPEC }}
-      RUSTY_TRUSTED_OWNER: ${{ secrets.RUSTY_TRUSTED_OWNER }}
       RUSTY_TELEMETRY_TOKEN: ${{ secrets.RUSTY_TELEMETRY_TOKEN }}
       CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
@@ -112,13 +111,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$RUSTY_TRUSTED_OWNER"
           test -n "$CLICKHOUSE_PASSWORD"
-          case "$RUSTY_TRUSTED_OWNER$RUSTY_TELEMETRY_TOKEN$CLICKHOUSE_PASSWORD$OTEL_EXPORTER_OTLP_ENDPOINT$RUSTY_TELEMETRY_PROJECT" in *$'\n'*|*$'\r'*) exit 1;; esac
+          case "$RUSTY_TELEMETRY_TOKEN$CLICKHOUSE_PASSWORD$OTEL_EXPORTER_OTLP_ENDPOINT$RUSTY_TELEMETRY_PROJECT" in *$'\n'*|*$'\r'*) exit 1;; esac
           install -m 700 -d "$DEPLOY_CONFIG_DIR/.kamal"
           umask 077
           {
-            printf 'RUSTY_TRUSTED_OWNER=%s\nCLICKHOUSE_PASSWORD=%s\n' "$RUSTY_TRUSTED_OWNER" "$CLICKHOUSE_PASSWORD"
+            printf 'CLICKHOUSE_PASSWORD=%s\n' "$CLICKHOUSE_PASSWORD"
             [ -z "$RUSTY_TELEMETRY_TOKEN" ] || printf 'RUSTY_TELEMETRY_TOKEN=%s\n' "$RUSTY_TELEMETRY_TOKEN"
             [ -z "$OTEL_EXPORTER_OTLP_ENDPOINT" ] || printf 'OTEL_EXPORTER_OTLP_ENDPOINT=%s\n' "$OTEL_EXPORTER_OTLP_ENDPOINT"
             [ -z "$RUSTY_TELEMETRY_PROJECT" ] || printf 'RUSTY_TELEMETRY_PROJECT=%s\n' "$RUSTY_TELEMETRY_PROJECT"

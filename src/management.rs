@@ -207,13 +207,64 @@ impl BlindStore {
             && !cap.revoked_device_ids.iter().any(|id| id == device_id))
     }
 
+    fn resource_identity_allowed(
+        &self,
+        kind: &str,
+        id: &str,
+        identity: &PublicIdentity,
+    ) -> Result<bool, String> {
+        if let Some(record) = self.management_record(kind, id)? {
+            return Ok(trusted_identity_matches(&record.identity, identity));
+        }
+        match kind {
+            "scope" if self.policy_revision(id)? > 0 => Ok(self
+                .policy(id)?
+                .owner_person_id
+                .as_ref()
+                .is_none_or(|owner| owner == &identity.person_id)),
+            "board" => Ok(self
+                .current_publication(id)?
+                .is_none_or(|publication| publication.controller_person_id == identity.person_id)),
+            "person" => Ok(id == identity.person_id),
+            "scope" => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    // Editor delivery is verified against the stored board owner's public key.
+    // Never promote the requesting editor to owner when the global pin is absent.
+    pub(super) fn publication_owner(
+        &self,
+        board_id: &str,
+        requester: &PublicIdentity,
+    ) -> Result<ResourceOwner, String> {
+        if let Some(record) = self.management_record("board", board_id)? {
+            return Ok(ResourceOwner {
+                identity: record.identity,
+            });
+        }
+        if !self.resource_identity_allowed("board", board_id, requester)? {
+            return Err("Publication owner management policy required".into());
+        }
+        Ok(ResourceOwner {
+            identity: requester.clone(),
+        })
+    }
+
     fn resource_creation_authorized(
         &self,
         kind: &str,
         request: &UpdateRequest,
-        owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
     ) -> Result<bool, String> {
+        if !self.resource_identity_allowed(
+            kind,
+            &request.authorization.payload.resource_id,
+            &request.identity,
+        )? {
+            return Ok(false);
+        }
         if request.management_capability.is_some() {
             return Ok(false);
         }
@@ -236,12 +287,14 @@ impl BlindStore {
                 .payload
                 .person_management_revision
                 .is_none()
-            && trusted_controller_device(
-                owner,
+            && trusted_identity_matches(&request.identity, &owner.identity)
+            && verify_device_certificate_chain(
                 &request.identity,
                 &request.device_id,
                 &request.certificates,
-            ))
+                "MATCH/1",
+            )
+            .is_ok())
     }
 
     fn management_status(
@@ -249,7 +302,7 @@ impl BlindStore {
         kind: &str,
         id: &str,
         request: StatusRequest,
-        owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
     ) -> Result<(Option<SignedEnvelope<Value>>, bool, SignedEnvelope<Value>), String> {
         let _guard = self
@@ -259,6 +312,7 @@ impl BlindStore {
         resource(kind, id)?;
         if request.version != 1
             || (kind == "person" && id != request.identity.person_id)
+            || !self.resource_identity_allowed(kind, id, &request.identity)?
             || !trusted_identity_matches(&request.identity, &owner.identity)
             || request.certificates.is_empty()
             || request.certificates.len() > 32
@@ -599,7 +653,7 @@ impl BlindStore {
     }
     pub(super) fn management_authorized(
         &self,
-        owner: &TrustedOwner,
+        owner: &ResourceOwner,
         identity: &PublicIdentity,
         device_id: &str,
         certificates: &[DeviceCertificate],
@@ -609,7 +663,8 @@ impl BlindStore {
         presented: Option<&SignedEnvelope<Value>>,
         origin: &str,
     ) -> Result<bool, String> {
-        if !trusted_identity_matches(identity, &owner.identity)
+        if !self.resource_identity_allowed(kind, id, identity)?
+            || !trusted_identity_matches(identity, &owner.identity)
             || (kind == "person" && id != identity.person_id)
             || certificates.is_empty()
             || certificates.len() > 32
@@ -630,8 +685,7 @@ impl BlindStore {
                 && (kind == "person"
                     || self
                         .management_record("person", &identity.person_id)?
-                        .is_none())
-                && trusted_controller_device(owner, identity, device_id, certificates));
+                        .is_none()));
         };
         let current = capability(&record.capability)?;
         Ok(presented.is_some_and(|value| value == &record.capability)
@@ -663,7 +717,7 @@ impl BlindStore {
         kind: &str,
         id: &str,
         request: UpdateRequest,
-        owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self
@@ -892,7 +946,7 @@ impl BlindStore {
     pub(super) fn create_managed_enrollment_challenge(
         &self,
         request: EnrollmentChallengeRequest,
-        owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
         device_key_id: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
@@ -934,7 +988,7 @@ impl BlindStore {
     pub(super) fn create_managed_public_challenge(
         &self,
         request: PublicChallengeRequest,
-        owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
         device_key_id: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
@@ -972,7 +1026,7 @@ impl BlindStore {
     pub(super) fn create_public_delivery_challenge(
         &self,
         request: PublicChallengeRequest,
-        owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self
@@ -1028,9 +1082,9 @@ pub(super) async fn status(
     RoutePath((kind, id)): RoutePath<(String, String)>,
     Json(request): Json<StatusRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let owner = state
-        .trusted_owner
-        .ok_or_else(|| failure(StatusCode::FORBIDDEN, "No management owner configured"))?;
+    let owner = ResourceOwner {
+        identity: request.identity.clone(),
+    };
     let (capability, pending, receipt) = tokio::task::spawn_blocking(move || {
         state
             .store
@@ -1067,9 +1121,9 @@ pub(super) async fn update(
     RoutePath((kind, id)): RoutePath<(String, String)>,
     Json(request): Json<UpdateRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let owner = state
-        .trusted_owner
-        .ok_or_else(|| failure(StatusCode::FORBIDDEN, "No management owner configured"))?;
+    let owner = ResourceOwner {
+        identity: request.identity.clone(),
+    };
     let result = tokio::task::spawn_blocking(move || {
         state
             .store

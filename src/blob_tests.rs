@@ -8,7 +8,7 @@ async fn coverage_response(
 ) -> (StatusCode, axum::http::HeaderMap, Value) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(store, origin.clone(), None, vec![]).unwrap();
+    let app = router(store, origin.clone(), vec![]).unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let response = reqwest::Client::new()
         .post(format!("{origin}/v2/scopes/opaque-scope/blob-coverage"))

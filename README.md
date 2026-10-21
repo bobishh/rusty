@@ -4,8 +4,8 @@ Rusty stores and serves immutable encrypted objects over HTTP. It does not load 
 
 Rusty also supports a separate public-board publication namespace. Authorized clients
 send a strictly validated, selected-board projection and separate public file copies
-after confirming source-board owner rights locally. Rusty verifies its configured
-owner root/device proof, resource-management authority, challenge-bound signatures, expected revision and snapshot
+after confirming source-board owner rights locally. Rusty verifies each resource owner’s
+root/device proof, resource-management authority, challenge-bound signatures, expected revision and snapshot
 hash; it does not claim to inspect private workspace history. Public copies include
 selected-board/card discussions and attachments, plus allowlisted visitor display
 settings (preset bindings, column accents, stage labels and aging). The
@@ -20,13 +20,12 @@ keys or user board content in service configuration.
 
 ```sh
 cargo build --release --locked
-RUSTY_TRUSTED_OWNER='{"identity":{"personId":"…","publicKey":"…","displayName":"Owner"},"allowedControllerDeviceIds":["…"]}' \
 RUSTY_PUBLIC_ORIGIN='https://rusty.example' \
 RUSTY_CORS_ORIGINS='https://tincanban.example' \
 ./target/release/mesh-lighthouse /fresh-private-directory 0.0.0.0:8080
 ```
 
-`RUSTY_TRUSTED_OWNER` is public trust configuration, not a secret. It pins the owner's root identity. The optional `allowedControllerDeviceIds` list authorizes legacy provisioning and one initial migration of person management policy. Before that person policy is confirmed, only devices with configured legacy controller ancestry can bootstrap management. After confirmation, scope and board policy creation requires the exact person capability and its signed revision; later owner devices need only a valid certificate chain for the same person, not the original controller ancestry. Legacy controller pins may then be empty. They cannot bypass a removed operation or current person/device revocation. Resource capabilities remain separately scoped, and Rusty never receives the root private key. Missing or invalid owner trust disables provisioning. Keep private keys on authorized client devices only. For local development, use `127.0.0.1:8080`; the default origin is then loopback HTTP. Public hosting requires HTTPS, normally through the deployment proxy. CORS accepts a comma-separated allowlist of exact frontend origins and defaults to none. `LIGHTHOUSE_PUBLIC_ORIGIN` and `LIGHTHOUSE_CORS_ORIGINS` remain configuration aliases.
+Rusty accepts independently authenticated owners; no deployment-wide owner identity or controller-device allowlist is required. Each device proves its identity with its root-signed certificate chain and a signed, scoped request. Existing person, scope and board policies remain bound to their recorded owner. Another identity cannot read management capabilities, replace policies or rotate another owner's storage access. Current person/resource capabilities and cumulative device revocations still apply. Rusty never receives a root private key. Keep private keys on authorized client devices only. For local development, use `127.0.0.1:8080`; the default origin is then loopback HTTP. Public hosting requires HTTPS, normally through the deployment proxy. CORS accepts a comma-separated allowlist of exact frontend origins and defaults to none. `LIGHTHOUSE_PUBLIC_ORIGIN` and `LIGHTHOUSE_CORS_ORIGINS` remain configuration aliases.
 
 In tincanban, connect by entering the Rusty address. The owner device proves its identity with a short-lived Rusty challenge and a device-signed authorization. The browser creates a random opaque scope, separate read/write storage tokens, and a 32-byte AES-GCM reading key. It sends only scope and storage tokens to Rusty; Rusty stores keyed token hashes. The service never returns bearer tokens. The browser pins the service public key and verifies signed policy and upload receipts before saving access locally or marking a snapshot replicated. Access transfer to additional already-enrolled devices requires a separate encrypted device-settings channel and is not part of this protocol.
 
@@ -50,7 +49,7 @@ IndexedDB, outside shared board state. Same-person enrollment and authenticated
 device-state exchange transfer portable access while retaining each device's own
 cursor. The normal client loop can add a separate identity scope for a previously
 board-only Rusty origin. Native HTTP acceptance covers person-policy setup,
-same-person devices after legacy controller pins are removed and cold photo
+same-person devices and independent owners without server identity pins and cold photo
 delivery. Desktop-to-mobile WebKit acceptance covers cold reopening after a photo
 change without another upload. A device that never received access still needs a
 current key holder or recovery package. **Disconnect locally** stops that device;
@@ -99,9 +98,7 @@ scope management. `PUT /v2/management/person/{personId}` stores person policy un
 resource ID equal to `personId`. Its service-signed
 `rusty-person-management-capability@1` allows only `management.update` and
 `resource.create` and carries a monotonically increasing revision and cumulative
-revoked-device list. The first update is the one-time explicit legacy-controller
-migration; later person-policy updates require the current person capability. This
-legacy proof is not a recurring first-resource requirement: after confirmation,
+revoked-device list. The first person update requires a valid device certificate chain and signed request for that same person; later person-policy updates require the current person capability. After confirmation,
 scope and board policy creation use the exact parent capability and revision, not
 controller ancestry. The service persists
 immutable signed policy evidence before atomically publishing the current pointer.
@@ -111,9 +108,8 @@ resource update and signs the exact `personManagementRevision` into its
 authorization. A stale, missing or substituted parent capability cannot create a
 resource. Each new resource receives its own capability and operation set; person
 authority does not widen later operations on that resource. After initial person
-policy confirmation, any valid non-revoked device of the pinned person can create
-resources even when the legacy controller pins are empty and that controller is
-offline.
+policy confirmation, any valid non-revoked device of that person can create
+resources without a server-side controller-device pin.
 
 Confirmed person revocation gates resource-policy and status requests, publication
 challenges and staged files, checkpoints, and scope enrollment even when the
@@ -147,14 +143,13 @@ Discovery advertises `capabilities.scopeManagement.version: 1`.
 `migrationPending` and a service-signed status receipt. It requires a complete
 owner device proof and a `MATCH/1` signature over `rusty-management-policy-status`
 version 1: exact service/origin/person/device/resource, nonce-like request ID,
-issuance and expiry. Current non-revoked owner devices may query without a legacy
-controller pin. Unsigned reads, invalid signatures, other identities and revoked
+issuance and expiry. Current non-revoked owner devices may query without a server-side identity pin. Unsigned reads, invalid signatures, other identities and revoked
 devices receive no capability. Status nonces are single-use, persisted through
 restart and bounded to 128 live requests. A lost response requires a fresh signed
 status request. Status receipts bind request ID/full authorization hash,
 capability hash, revision and pending state. Responses prohibit caching and never
 return storage tokens or content keys. `kind` is `scope`, `board` or `person`.
-For `person`, `id` must equal the exact pinned `personId`; scope and board IDs are
+For `person`, `id` must equal the requesting identity’s exact `personId`; scope and board IDs are
 exact opaque resources.
 
 `PUT /v2/management/{kind}/{id}` takes `{version:1, identity, deviceId,
@@ -163,7 +158,7 @@ device-signed `rusty-management-policy-update` version 1, binding service ID,
 configured origin, person/device, resource kind/ID, expected revision, sorted
 operations, sorted cumulative revoked-device IDs, request ID, issuance and expiry.
 Expiry is at most 120 seconds after issuance; future issuance is bounded to 30
-seconds. First migration requires legacy operator-approved authority. Later
+seconds. First policy creation verifies the requesting owner and any existing scope/publication owner binding. Later
 updates require the exact current capability and `management.update`.
 
 The confirmed `RUSTY/2` capability binds those resource/person/service rights,
@@ -174,7 +169,7 @@ positive revision, request ID and full authorization hash. Scope operations are
 `management.update`. Device revocations are cumulative and cannot be undone by
 a later policy. Migrated enrollment, publication, asset and checkpoint requests
 must include `managementCapability`; missing or stale evidence cannot fall back
-to legacy ancestry. Management revocation is separate from rotating previously
+to pre-policy certificate authority. Management revocation is separate from rotating previously
 disclosed storage tokens and future content keys.
 
 Original signed policy evidence is immutable under `management/records`. Current
@@ -377,7 +372,7 @@ device-signed authorization payload contains `kind: rusty-snapshot-checkpoint`,
 `expectedSequence`, `objectId`, `requestId`, `issuedAt`, and `expiresAt`.
 Times are epoch milliseconds; expiry may be at most 120 seconds after issuance,
 and issuance may be at most 30 seconds ahead of server time. Rusty verifies the
-configured root/controller certificate chain and the scope policy's owner.
+requesting owner’s root/device certificate chain and the scope policy's owner.
 
 The device must first durably merge the full inventory and confirm that its
 current raw Automerge document has no pending or quarantined changes, retaining
@@ -428,7 +423,7 @@ checkpoint hash/path and contiguous retained range before completing cleanup.
 Back up the volume before rollout: an older Rusty binary cannot read a compacted
 volume because it expects object sequences to start at 1.
 
-Public publication API (requires `RUSTY_TRUSTED_OWNER`; anonymous readers use only
+Public publication API (requires scoped owner/device authorization; anonymous readers use only
 the GET endpoints):
 
 - `POST /v1/public/challenges`: controller identity, device certificate chain and
@@ -532,7 +527,7 @@ Kamal service. The production environment should require its normal reviewer
 approval. Deployment variables/secrets belong only to this repository:
 `RUSTY_DEPLOY_SPEC` (same pinned service/host JSON contract used before the
 release split), `RUSTY_DEPLOY_SSH_KEY`, `RUSTY_DEPLOY_KNOWN_HOSTS`,
-`RUSTY_TRUSTED_OWNER`, `RUSTY_TELEMETRY_TOKEN`, and `CLICKHOUSE_PASSWORD`.
+`RUSTY_TELEMETRY_TOKEN` and `CLICKHOUSE_PASSWORD`.
 `release/deployment-config.json` pins the public infrastructure repository and
 commit. Optional telemetry endpoint/project values are configuration, not
 deployment gates.

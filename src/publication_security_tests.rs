@@ -56,12 +56,13 @@ fn given_enrolled_device_when_publishing_then_trusted_controller_delegation_is_a
 }
 
 #[test]
-fn given_unlisted_root_device_when_trusted_certificate_is_appended_then_publication_stays_denied() {
+fn given_forged_root_certificate_when_valid_certificate_is_appended_then_publication_stays_denied()
+{
     let fixture = Fixture::new();
     let public_key = public_key_from_seed(&[63; 32]).unwrap();
     let device_id = public_key_id(&public_key).unwrap();
     let certificate = sign_device_certificate(
-        &[61; 32],
+        &[60; 32],
         DeviceCertificatePayload {
             kind: "device-certificate".into(),
             version: 1,
@@ -104,7 +105,7 @@ fn given_unlisted_root_device_when_trusted_certificate_is_appended_then_publicat
 struct Fixture {
     directory: PathBuf,
     store: BlindStore,
-    owner: TrustedOwner,
+    owner: ResourceOwner,
     device_id: String,
     certificate: DeviceCertificate,
 }
@@ -140,10 +141,7 @@ impl Fixture {
         Self {
             directory,
             store,
-            owner: TrustedOwner {
-                identity,
-                allowed_controller_device_ids: vec![device_id.clone()],
-            },
+            owner: ResourceOwner { identity },
             device_id,
             certificate,
         }
@@ -1107,7 +1105,15 @@ impl DeliveryWriter {
     }
 
     fn request(&self, fixture: &Fixture, action: &str, projection: Option<Value>) -> Value {
-        let challenge = self.challenge(fixture);
+        self.request_with_challenge(self.challenge(fixture), action, projection)
+    }
+
+    fn request_with_challenge(
+        &self,
+        challenge: SignedEnvelope<Value>,
+        action: &str,
+        projection: Option<Value>,
+    ) -> Value {
         let projection_hash = projection
             .as_ref()
             .map(|value| digest(canonicalize_json(value).unwrap().as_bytes()))
@@ -1200,4 +1206,141 @@ fn given_configured_card_fields_when_publishing_then_preserve_declared_formats_a
     projection["board"]["presentation"]["cardPresentation"]["narrativeFieldId"] =
         json!("private-field");
     assert!(validate_public_projection(&projection).is_err());
+}
+
+#[tokio::test]
+async fn given_stored_board_owner_when_editor_delivers_over_http_then_use_scoped_owner_without_global_pin()
+ {
+    let fixture = Fixture::new();
+    let writer = DeliveryWriter::editor(&fixture);
+    let mut publication = fixture.request("publish", Some(projection()), fixture.challenge());
+    attach_delivery_policy(&fixture, &mut publication, &writer.policy);
+    fixture.mutate(publication).unwrap();
+    let app = router(fixture.store.clone(), ORIGIN.into(), vec![]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let now = now_ms().unwrap();
+    let authorization = sign_json_envelope(&[62;32], json!({
+        "kind":"rusty-management-policy-update", "version":1,
+        "serviceId":public_key_id(&fixture.store.public_key().unwrap()).unwrap(), "origin":ORIGIN,
+        "personId":fixture.owner.identity.person_id, "deviceId":fixture.device_id,
+        "resourceKind":"board", "resourceId":BOARD, "expectedRevision":0,
+        "operations":["management.update", "publication.status", "publication.update"],
+        "revokedDeviceIds":[], "requestId":URL_SAFE_NO_PAD.encode(rand::random::<[u8;32]>()),
+        "issuedAt":now, "expiresAt":now+60000,
+    }), &fixture.device_id, "MATCH/1").unwrap();
+    let owner_request = json!({
+        "version":1, "identity":fixture.owner.identity, "deviceId":fixture.device_id,
+        "certificates":[fixture.certificate], "authorization":authorization,
+    });
+    let mut foreign_request = owner_request.clone();
+    foreign_request["identity"] = serde_json::to_value(&writer.identity).unwrap();
+    foreign_request["deviceId"] = json!(writer.device_id);
+    foreign_request["certificates"] = json!([writer.certificate]);
+    foreign_request["authorization"]["payload"]["personId"] = json!(writer.identity.person_id);
+    foreign_request["authorization"]["payload"]["deviceId"] = json!(writer.device_id);
+    foreign_request["authorization"] = serde_json::to_value(
+        sign_json_envelope(
+            &writer.device_seed,
+            foreign_request["authorization"]["payload"].clone(),
+            &writer.device_id,
+            "MATCH/1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        client
+            .put(format!("{url}/v2/management/board/{BOARD}"))
+            .json(&foreign_request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
+        "an existing legacy publication cannot be claimed by another identity during first management setup"
+    );
+    let response = client
+        .put(format!("{url}/v2/management/board/{BOARD}"))
+        .json(&owner_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = client
+        .post(format!("{url}/v1/public/challenges"))
+        .json(&json!({
+            "version":1, "boardId":BOARD, "identity":writer.identity, "deviceId":writer.device_id,
+            "certificates":[writer.certificate], "deliveryGrant":writer.grant,
+            "sourceHeads":writer.source_heads,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "editor challenge must use recorded owner: {body}"
+    );
+    let challenge =
+        serde_json::from_value(serde_json::from_str::<Value>(&body).unwrap()["challenge"].clone())
+            .unwrap();
+    let request = writer.request_with_challenge(challenge, "update", Some(projection()));
+    let response = client
+        .put(format!("{url}/v1/public/boards/{BOARD}"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "editor content delivery remains authorized: {body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["payload"]["revision"],
+        2
+    );
+    let asset = writer.asset_request(&fixture, b"scoped editor bytes");
+    let response = client
+        .put(format!("{url}/v1/public/boards/{BOARD}/files"))
+        .json(&asset)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "editor staging does not require owner's management capability: {body}"
+    );
+    let takeover = writer.request(&fixture, "unpublish", None);
+    assert!(
+        client
+            .put(format!("{url}/v1/public/boards/{BOARD}"))
+            .json(&takeover)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .current_publication(BOARD)
+            .unwrap()
+            .unwrap()
+            .controller_person_id,
+        fixture.owner.identity.person_id
+    );
+    server.abort();
+    let _ = server.await;
 }

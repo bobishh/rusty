@@ -43,26 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err("Set RUSTY_PUBLIC_ORIGIN to the external HTTPS origin; HTTP is allowed only on loopback".into());
     }
     let origin = public_origin.origin().ascii_serialization();
-    let trusted_owner = std::env::var("RUSTY_TRUSTED_OWNER")
-        .ok()
-        .map(|value| serde_json::from_str::<blind::TrustedOwner>(&value))
-        .transpose()?;
-    if let Some(owner) = &trusted_owner {
-        if meta_mesh_core::public_key_id(&owner.identity.public_key)? != owner.identity.person_id
-            || owner.allowed_controller_device_ids.len() > 32
-            || owner.allowed_controller_device_ids.iter().any(|id| {
-                id.is_empty()
-                    || id.len() > 128
-                    || !id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-            })
-        {
-            return Err(
-                "RUSTY_TRUSTED_OWNER has invalid identity or controller device allowlist".into(),
-            );
-        }
-    }
     let origins = std::env::var("RUSTY_CORS_ORIGINS")
         .or_else(|_| std::env::var("LIGHTHOUSE_CORS_ORIGINS"))
         .unwrap_or_default()
@@ -92,8 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         0.0,
         serde_json::json!({"scope_limit_bytes": max_scope_bytes}),
     );
-    let app =
-        blind::router_with_telemetry(store, origin, trusted_owner, origins, telemetry.clone())?;
+    let app = blind::router_with_telemetry(store, origin, origins, telemetry.clone())?;
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

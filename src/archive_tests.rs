@@ -4,7 +4,7 @@ use super::*;
 async fn server(store: BlindStore) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(store, origin.clone(), None, vec![]).unwrap();
+    let app = router(store, origin.clone(), vec![]).unwrap();
     (
         origin,
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),

@@ -328,7 +328,7 @@ fn public_delivery_policy_content_hash(
 
 fn validate_public_board_delivery_policy(
     evidence: &PublicBoardDeliveryPolicyEvidence,
-    owner: &TrustedOwner,
+    owner: &ResourceOwner,
     board_id: &str,
     expected_generation: Option<u64>,
     now: u64,
@@ -424,7 +424,7 @@ fn validate_source_heads(source_heads: &[String]) -> Result<String, String> {
 
 fn authorize_public_delivery_writer(
     publication: &PublicPublication,
-    owner: &TrustedOwner,
+    owner: &ResourceOwner,
     board_id: &str,
     identity: &PublicIdentity,
     device_id: &str,
@@ -1166,42 +1166,6 @@ fn trusted_identity_matches(identity: &PublicIdentity, trusted: &PublicIdentity)
     identity.person_id == trusted.person_id && identity.public_key == trusted.public_key
 }
 
-// Legacy provisioning/first migration only. Migrated resource rights use the
-// current explicit capability, independent of controller certificate ancestry.
-fn trusted_controller_device(
-    owner: &TrustedOwner,
-    identity: &PublicIdentity,
-    device_id: &str,
-    certificates: &[DeviceCertificate],
-) -> bool {
-    if !trusted_identity_matches(identity, &owner.identity)
-        || verify_device_certificate_chain(identity, device_id, certificates, "MATCH/1").is_err()
-    {
-        return false;
-    }
-    let mut current = certificates
-        .iter()
-        .find(|certificate| certificate.payload.device_id == device_id);
-    for _ in 0..32 {
-        let Some(certificate) = current else {
-            return false;
-        };
-        if owner
-            .allowed_controller_device_ids
-            .contains(&certificate.payload.device_id)
-        {
-            return true;
-        }
-        let Some(issuer_hash) = certificate.payload.issuer_certificate_hash.as_ref() else {
-            return false;
-        };
-        current = certificates.iter().find(|candidate| {
-            meta_mesh_core::certificate_hash(candidate).as_ref() == Ok(issuer_hash)
-        });
-    }
-    false
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BlindObject {
@@ -1264,12 +1228,10 @@ struct CompletedScopeEnrollment {
 fn legacy_writer_version() -> u8 {
     1
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TrustedOwner {
-    pub identity: PublicIdentity,
-    #[serde(default)]
-    pub allowed_controller_device_ids: Vec<String>,
+// Owner proof for one resource, derived from the request or stored policy.
+#[derive(Clone)]
+struct ResourceOwner {
+    identity: PublicIdentity,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1809,7 +1771,7 @@ impl BlindStore {
         &self,
         board_id: &str,
         request: PublicAssetRequest,
-        trusted_owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
@@ -1817,62 +1779,61 @@ impl BlindStore {
             return Err("Untrusted publication controller or device".into());
         }
         let current = self.current_publication(board_id)?;
-        let delivery_binding =
-            if trusted_identity_matches(&request.identity, &trusted_owner.identity) {
-                if request.delivery_grant.is_some() {
-                    return Err("Owner publication cannot use a delivery grant".into());
-                }
-                request
-                    .source_heads
-                    .as_deref()
-                    .map(validate_source_heads)
-                    .transpose()?;
-                if current
-                    .as_ref()
-                    .is_some_and(|record| !record.source_heads.is_empty())
-                    && request.source_heads.is_none()
-                {
-                    return Err("Publication file staging requires a source frontier".into());
-                }
-                if !self.management_authorized(
-                    trusted_owner,
-                    &request.identity,
-                    &request.device_id,
-                    &request.certificates,
-                    "board",
-                    board_id,
-                    "publication.stage-file",
-                    request.management_capability.as_ref(),
-                    origin,
-                )? {
-                    return Err("Untrusted publication controller or device".into());
-                }
-                None
-            } else {
-                if request.management_capability.is_some() {
-                    return Err("Public delivery writers cannot manage publication".into());
-                }
-                let publication = current.as_ref().ok_or("Public publication unavailable")?;
-                let grant = request
-                    .delivery_grant
-                    .as_ref()
-                    .ok_or("Missing public delivery grant")?;
-                let source_heads = request
-                    .source_heads
-                    .as_deref()
-                    .ok_or("Missing public source heads")?;
-                Some(authorize_public_delivery_writer(
-                    publication,
-                    trusted_owner,
-                    board_id,
-                    &request.identity,
-                    &request.device_id,
-                    &request.certificates,
-                    grant,
-                    source_heads,
-                    now_ms()?,
-                )?)
-            };
+        let delivery_binding = if trusted_identity_matches(&request.identity, &owner.identity) {
+            if request.delivery_grant.is_some() {
+                return Err("Owner publication cannot use a delivery grant".into());
+            }
+            request
+                .source_heads
+                .as_deref()
+                .map(validate_source_heads)
+                .transpose()?;
+            if current
+                .as_ref()
+                .is_some_and(|record| !record.source_heads.is_empty())
+                && request.source_heads.is_none()
+            {
+                return Err("Publication file staging requires a source frontier".into());
+            }
+            if !self.management_authorized(
+                owner,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+                "board",
+                board_id,
+                "publication.stage-file",
+                request.management_capability.as_ref(),
+                origin,
+            )? {
+                return Err("Untrusted publication controller or device".into());
+            }
+            None
+        } else {
+            if request.management_capability.is_some() {
+                return Err("Public delivery writers cannot manage publication".into());
+            }
+            let publication = current.as_ref().ok_or("Public publication unavailable")?;
+            let grant = request
+                .delivery_grant
+                .as_ref()
+                .ok_or("Missing public delivery grant")?;
+            let source_heads = request
+                .source_heads
+                .as_deref()
+                .ok_or("Missing public source heads")?;
+            Some(authorize_public_delivery_writer(
+                publication,
+                owner,
+                board_id,
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+                grant,
+                source_heads,
+                now_ms()?,
+            )?)
+        };
         if request.sha256.len() != 43
             || !request
                 .sha256
@@ -1980,7 +1941,7 @@ impl BlindStore {
             None => return Err("Unexpected public delivery binding".into()),
         }
         let owner_source_heads_hash = if delivery_binding.is_none()
-            && trusted_identity_matches(&request.identity, &trusted_owner.identity)
+            && trusted_identity_matches(&request.identity, &owner.identity)
         {
             request
                 .source_heads
@@ -1999,11 +1960,11 @@ impl BlindStore {
         {
             return Err("Public source frontier binding mismatch".into());
         }
-        if !self.management_revision_matches(
-            "board",
-            board_id,
-            optional_management_revision(command)?,
-        )? {
+        let management_revision = optional_management_revision(command)?;
+        if (delivery_binding.is_some() && management_revision.is_some())
+            || (delivery_binding.is_none()
+                && !self.management_revision_matches("board", board_id, management_revision)?)
+        {
             return Err("Public asset management revision binding invalid".into());
         }
         let current_revision = current.as_ref().map(|record| record.revision).unwrap_or(0);
@@ -2055,7 +2016,7 @@ impl BlindStore {
         &self,
         board_id: &str,
         request: PublicMutationRequest,
-        trusted_owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
@@ -2063,13 +2024,13 @@ impl BlindStore {
             return Err("Untrusted publication controller or device".into());
         }
         let current = self.current_publication(board_id)?;
-        let is_owner = trusted_identity_matches(&request.identity, &trusted_owner.identity);
+        let is_owner = trusted_identity_matches(&request.identity, &owner.identity);
         let delivery_binding = if is_owner {
             if request.delivery_grant.is_some() {
                 return Err("Owner publication cannot use a delivery grant".into());
             }
             if !self.management_authorized(
-                trusted_owner,
+                owner,
                 &request.identity,
                 &request.device_id,
                 &request.certificates,
@@ -2100,7 +2061,7 @@ impl BlindStore {
                 .ok_or("Missing public source heads")?;
             Some(authorize_public_delivery_writer(
                 publication,
-                trusted_owner,
+                owner,
                 board_id,
                 &request.identity,
                 &request.device_id,
@@ -2292,11 +2253,11 @@ impl BlindStore {
         {
             return Err("Public delivery policy binding mismatch".into());
         }
-        if !self.management_revision_matches(
-            "board",
-            board_id,
-            optional_management_revision(command)?,
-        )? {
+        let management_revision = optional_management_revision(command)?;
+        if (delivery_binding.is_some() && management_revision.is_some())
+            || (delivery_binding.is_none()
+                && !self.management_revision_matches("board", board_id, management_revision)?)
+        {
             return Err("Publication management revision binding invalid".into());
         }
         let expected_revision = challenge_payload
@@ -2309,7 +2270,7 @@ impl BlindStore {
         }
         if current
             .as_ref()
-            .is_some_and(|record| record.controller_person_id != trusted_owner.identity.person_id)
+            .is_some_and(|record| record.controller_person_id != owner.identity.person_id)
         {
             return Err("Publication controller conflict".into());
         }
@@ -2336,7 +2297,7 @@ impl BlindStore {
                 .map(|policy| policy.policy.payload.generation);
             validate_public_board_delivery_policy(
                 evidence,
-                trusted_owner,
+                owner,
                 board_id,
                 current_generation,
                 now_ms()?,
@@ -2599,14 +2560,14 @@ impl BlindStore {
         &self,
         scope: &str,
         request: ScopeEnrollmentRequest,
-        trusted_owner: &TrustedOwner,
+        owner: &ResourceOwner,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
-        if !trusted_identity_matches(&request.identity, &trusted_owner.identity)
+        if !trusted_identity_matches(&request.identity, &owner.identity)
             || request.certificates.is_empty()
             || !self.management_authorized(
-                trusted_owner,
+                owner,
                 &request.identity,
                 &request.device_id,
                 &request.certificates,
@@ -3077,7 +3038,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[derive(Clone)]
 struct HttpState {
     store: BlindStore,
-    trusted_owner: Option<TrustedOwner>,
     origin: String,
 }
 fn bearer(headers: &HeaderMap) -> Result<String, ApiError> {
@@ -3089,18 +3049,12 @@ fn bearer(headers: &HeaderMap) -> Result<String, ApiError> {
         .map(str::to_owned)
         .ok_or_else(|| failure(StatusCode::UNAUTHORIZED, "Storage authentication required"))
 }
-pub fn router(
-    store: BlindStore,
-    origin: String,
-    trusted_owner: Option<TrustedOwner>,
-    origins: Vec<String>,
-) -> Result<Router, String> {
-    router_with_telemetry(store, origin, trusted_owner, origins, Telemetry::disabled())
+pub fn router(store: BlindStore, origin: String, origins: Vec<String>) -> Result<Router, String> {
+    router_with_telemetry(store, origin, origins, Telemetry::disabled())
 }
 pub fn router_with_telemetry(
     store: BlindStore,
     origin: String,
-    trusted_owner: Option<TrustedOwner>,
     origins: Vec<String>,
     telemetry: Telemetry,
 ) -> Result<Router, String> {
@@ -3109,11 +3063,7 @@ pub fn router_with_telemetry(
         .map(|value| value.parse())
         .collect::<Result<Vec<axum::http::HeaderValue>, _>>()
         .map_err(|_| "Invalid CORS origin")?;
-    let state = HttpState {
-        trusted_owner,
-        store,
-        origin,
-    };
+    let state = HttpState { store, origin };
     Ok(Router::new()
         .route(
             "/",
@@ -3342,12 +3292,10 @@ async fn public_challenge(
             "Invalid publication challenge request",
         ));
     }
-    let owner = state.trusted_owner.as_ref().ok_or_else(|| {
-        failure(
-            StatusCode::FORBIDDEN,
-            "No publication controller configured",
-        )
-    })?;
+    let owner = state
+        .store
+        .publication_owner(&request.board_id, &request.identity)
+        .map_err(|message| failure(StatusCode::FORBIDDEN, &message))?;
     if request.delivery_grant.is_some() {
         let store = state.store.clone();
         let owner = owner.clone();
@@ -3380,21 +3328,20 @@ async fn public_challenge(
         })?;
         return Ok(Json(json!({"challenge":challenge})));
     }
-    if !trusted_identity_matches(&request.identity, &owner.identity)
-        || !state
-            .store
-            .management_authorized(
-                owner,
-                &request.identity,
-                &request.device_id,
-                &request.certificates,
-                "board",
-                &request.board_id,
-                "publication.status",
-                request.management_capability.as_ref(),
-                &state.origin,
-            )
-            .map_err(|message| failure(StatusCode::SERVICE_UNAVAILABLE, &message))?
+    if !state
+        .store
+        .management_authorized(
+            &owner,
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+            "board",
+            &request.board_id,
+            "publication.status",
+            request.management_capability.as_ref(),
+            &state.origin,
+        )
+        .map_err(|message| failure(StatusCode::SERVICE_UNAVAILABLE, &message))?
     {
         return Err(failure(
             StatusCode::FORBIDDEN,
@@ -3454,12 +3401,10 @@ async fn public_mutation(
     RoutePath(board_id): RoutePath<String>,
     Json(request): Json<PublicMutationRequest>,
 ) -> Result<Json<SignedEnvelope<Value>>, ApiError> {
-    let owner = state.trusted_owner.clone().ok_or_else(|| {
-        failure(
-            StatusCode::FORBIDDEN,
-            "No publication controller configured",
-        )
-    })?;
+    let owner = state
+        .store
+        .publication_owner(&board_id, &request.identity)
+        .map_err(|message| failure(StatusCode::FORBIDDEN, &message))?;
     let origin = state.origin.clone();
     let receipt = tokio::task::spawn_blocking(move || {
         state
@@ -3501,12 +3446,10 @@ async fn public_asset(
     RoutePath(board_id): RoutePath<String>,
     Json(request): Json<PublicAssetRequest>,
 ) -> Result<Json<SignedEnvelope<Value>>, ApiError> {
-    let owner = state.trusted_owner.clone().ok_or_else(|| {
-        failure(
-            StatusCode::FORBIDDEN,
-            "No publication controller configured",
-        )
-    })?;
+    let owner = state
+        .store
+        .publication_owner(&board_id, &request.identity)
+        .map_err(|message| failure(StatusCode::FORBIDDEN, &message))?;
     let origin = state.origin.clone();
     let receipt = tokio::task::spawn_blocking(move || {
         state
@@ -3684,27 +3627,23 @@ async fn enrollment_challenge(
             "Invalid enrollment request",
         ));
     }
-    let trusted_owner = state.trusted_owner.as_ref().ok_or_else(|| {
-        failure(
-            StatusCode::FORBIDDEN,
-            "No trusted owner controller configured",
+    let owner = ResourceOwner {
+        identity: request.identity.clone(),
+    };
+    if !state
+        .store
+        .management_authorized(
+            &owner,
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+            "scope",
+            &request.scope_id,
+            "scope.policy",
+            request.management_capability.as_ref(),
+            &state.origin,
         )
-    })?;
-    if !trusted_identity_matches(&request.identity, &trusted_owner.identity)
-        || !state
-            .store
-            .management_authorized(
-                trusted_owner,
-                &request.identity,
-                &request.device_id,
-                &request.certificates,
-                "scope",
-                &request.scope_id,
-                "scope.policy",
-                request.management_capability.as_ref(),
-                &state.origin,
-            )
-            .map_err(|message| failure(StatusCode::SERVICE_UNAVAILABLE, &message))?
+        .map_err(|message| failure(StatusCode::SERVICE_UNAVAILABLE, &message))?
     {
         return Err(failure(
             StatusCode::FORBIDDEN,
@@ -3726,7 +3665,7 @@ async fn enrollment_challenge(
     let device_key_id = public_key_id(&device_public_key)
         .map_err(|_| failure(StatusCode::FORBIDDEN, "Invalid controller device key"))?;
     let store = state.store.clone();
-    let owner = trusted_owner.clone();
+    let owner = owner.clone();
     let origin = state.origin.clone();
     let challenge = tokio::task::spawn_blocking(move || {
         store.create_managed_enrollment_challenge(request, &owner, &origin, &device_key_id)
@@ -3760,17 +3699,12 @@ async fn approve_scope(
     if !valid_id(&scope) {
         return Err(failure(StatusCode::BAD_REQUEST, "Invalid scope ID"));
     }
-    let trusted_owner = state.trusted_owner.clone().ok_or_else(|| {
-        failure(
-            StatusCode::FORBIDDEN,
-            "No trusted owner controller configured",
-        )
-    })?;
+    let owner = ResourceOwner {
+        identity: request.identity.clone(),
+    };
     let origin = state.origin.clone();
     let receipt = tokio::task::spawn_blocking(move || {
-        state
-            .store
-            .approve_signed(&scope, request, &trusted_owner, &origin)
+        state.store.approve_signed(&scope, request, &owner, &origin)
     })
     .await
     .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "Storage unavailable"))?

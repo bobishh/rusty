@@ -1,7 +1,7 @@
 use super::tests::{approve_fixture, encrypted_fixture, owner_controller_fixture};
 use super::*;
 
-fn checkpoint_fixture() -> (PathBuf, BlindStore, TrustedOwner, Value) {
+fn checkpoint_fixture() -> (PathBuf, BlindStore, ResourceOwner, Value) {
     let directory =
         std::env::temp_dir().join(format!("rusty-checkpoint-crash-{}", rand::random::<u64>()));
     let store = BlindStore::open(directory.clone()).unwrap();
@@ -28,9 +28,8 @@ fn checkpoint_fixture() -> (PathBuf, BlindStore, TrustedOwner, Value) {
         "serviceId":public_key_id(&store.public_key().unwrap()).unwrap(),"origin":"https://rusty.example",
         "scopeId":"opaque-scope","keyEpoch":1,"policyRevision":1,"expectedSequence":2,
         "objectId":object.id().unwrap(),"requestId":"checkpoint-crash","issuedAt":issued,"expiresAt":issued+120000}), &device_id,"MATCH/1").unwrap();
-    let trusted = TrustedOwner {
+    let trusted = ResourceOwner {
         identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
     };
     (
         directory,
@@ -246,15 +245,9 @@ fn archives_consume_shared_capacity_and_reduce_checkpoint_retention_budget() {
 
 #[tokio::test]
 async fn checkpoint_requires_signed_current_writer_version_before_cleanup() {
-    let (directory, store, trusted, mut request) = checkpoint_fixture();
+    let (directory, store, _trusted, mut request) = checkpoint_fixture();
     set_scope_writer_floor_for_test(&store, "opaque-scope", 2);
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -372,19 +365,6 @@ fn checkpoint_owner_signature_binding_expiry_and_current_policy_fail_closed() {
                 &"w".repeat(43),
                 serde_json::from_value(request.clone()).unwrap(),
                 &wrong_root,
-                "https://rusty.example"
-            )
-            .is_err()
-    );
-    let mut unlisted = trusted.clone();
-    unlisted.allowed_controller_device_ids.clear();
-    assert!(
-        store
-            .checkpoint(
-                "opaque-scope",
-                &"w".repeat(43),
-                serde_json::from_value(request).unwrap(),
-                &unlisted,
                 "https://rusty.example"
             )
             .is_err()
@@ -627,19 +607,6 @@ fn completed_checkpoint_retry_survives_expiry_but_never_bypasses_current_device_
             .payload["sequence"],
         3
     );
-    let mut revoked = trusted.clone();
-    revoked.allowed_controller_device_ids.clear();
-    assert!(
-        store
-            .checkpoint(
-                "opaque-scope",
-                &"w".repeat(43),
-                serde_json::from_value(request).unwrap(),
-                &revoked,
-                "https://rusty.example"
-            )
-            .is_err()
-    );
     assert_eq!(store.objects("opaque-scope").unwrap().len(), 1);
     drop(store);
     fs::remove_dir_all(directory).unwrap();
@@ -870,13 +837,9 @@ async fn owner_checkpoint_prunes_confirmed_frontier_retries_and_preserves_concur
             .unwrap();
     }
     let service_key = store.public_key().unwrap();
-    let trusted = TrustedOwner {
-        identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
-    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(store.clone(), origin.clone(), Some(trusted), vec![]).unwrap();
+    let app = router(store.clone(), origin.clone(), vec![]).unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let client = reqwest::Client::new();
     let endpoint = format!("{origin}/v2/scopes/opaque-scope/checkpoint");

@@ -88,7 +88,6 @@ async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
     let app = router_with_telemetry(
         store.clone(),
         origin.clone(),
-        None,
         vec![],
         store.telemetry.clone(),
     )
@@ -204,7 +203,7 @@ async fn storage_growth_logs_distinguish_new_objects_retries_and_quota() {
 async fn service_root_opens_connection_instructions_without_exposing_storage() {
     let directory = std::env::temp_dir().join(format!("rusty-root-{}", rand::random::<u64>()));
     let store = BlindStore::open(directory.clone()).unwrap();
-    let app = router(store, "https://rusty.example".into(), None, vec![]).unwrap();
+    let app = router(store, "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -455,17 +454,7 @@ async fn writer_policy_floor_rejects_old_snapshot_writes_after_signed_scope_migr
         std::env::temp_dir().join(format!("rusty-writer-floor-{}", rand::random::<u64>()));
     let store = BlindStore::open(directory.clone()).unwrap();
     let (identity, device_id, certificate, _) = owner_controller_fixture();
-    let trusted = TrustedOwner {
-        identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
-    };
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -625,11 +614,7 @@ async fn address_only_owner_connection_gets_signed_enrollment_challenge() {
         std::env::temp_dir().join(format!("rusty-enroll-red-{}", rand::random::<u64>()));
     let store = BlindStore::open(directory.clone()).unwrap();
     let (identity, device_id, certificate, _person_id) = owner_controller_fixture();
-    let trusted = TrustedOwner {
-        identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
-    };
-    let app = router(store, "https://rusty.example".into(), Some(trusted), vec![]).unwrap();
+    let app = router(store, "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -678,10 +663,6 @@ async fn parallel_equivalent_scope_enrollments_confirm_without_rewriting_policy(
     let store = BlindStore::open(directory.clone()).unwrap();
     let service_key = store.public_key().unwrap();
     let (identity, device_id, certificate, _) = owner_controller_fixture();
-    let trusted = TrustedOwner {
-        identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
-    };
     let read_token = "r".repeat(43);
     let write_token = "w".repeat(43);
     store
@@ -695,13 +676,7 @@ async fn parallel_equivalent_scope_enrollments_confirm_without_rewriting_policy(
             },
         )
         .unwrap();
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -918,10 +893,6 @@ async fn fresh_equivalent_floor_two_enrollments_keep_current_policy_revision() {
         .unwrap(),
     )
     .unwrap();
-    let trusted = TrustedOwner {
-        identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![desktop_id.clone(), phone_id.clone()],
-    };
     let read_token = "r".repeat(43);
     let write_token = "w".repeat(43);
     store
@@ -935,13 +906,7 @@ async fn fresh_equivalent_floor_two_enrollments_keep_current_policy_revision() {
             },
         )
         .unwrap();
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1134,17 +1099,10 @@ async fn signed_scope_enrollment_retries_exactly_without_reauthorizing_consumed_
     let store = BlindStore::open(directory.clone()).unwrap();
     let service_key = store.public_key().unwrap();
     let (identity, device_id, certificate, owner_id) = owner_controller_fixture();
-    let trusted = TrustedOwner {
+    let trusted = ResourceOwner {
         identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
     };
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted.clone()),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -1239,13 +1197,7 @@ async fn signed_scope_enrollment_retries_exactly_without_reauthorizing_consumed_
     let _ = server.await;
     drop(store);
     let store = BlindStore::open(directory.clone()).unwrap();
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted.clone()),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -1472,17 +1424,7 @@ async fn enrollment_rejects_foreign_controller_expired_nonce_and_excess_pending_
         std::env::temp_dir().join(format!("rusty-enroll-bounds-{}", rand::random::<u64>()));
     let store = BlindStore::open(directory.clone()).unwrap();
     let (identity, device_id, certificate, _owner_id) = owner_controller_fixture();
-    let trusted = TrustedOwner {
-        identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
-    };
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -1612,7 +1554,7 @@ async fn attachment_http_namespace_is_durable_and_independent_of_snapshots() {
     let id = object.id().unwrap();
     let key = store.public_key().unwrap();
     let client = reqwest::Client::new();
-    let app = router(store.clone(), "https://rusty.example".into(), None, vec![]).unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1680,13 +1622,7 @@ async fn attachment_http_namespace_is_durable_and_independent_of_snapshots() {
     let restarted = BlindStore::open(directory.clone()).unwrap();
     assert_eq!(restarted.public_key().unwrap(), key);
     assert!(restarted.objects("opaque-scope").unwrap().is_empty());
-    let app = router(
-        restarted.clone(),
-        "https://rusty.example".into(),
-        None,
-        vec![],
-    )
-    .unwrap();
+    let app = router(restarted.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1791,7 +1727,7 @@ async fn two_http_clients_replicate_ciphertext_and_plaintext_intake_is_absent() 
     let directory = std::env::temp_dir().join(format!("rusty-http-{}", rand::random::<u64>()));
     let store = BlindStore::open(directory.clone()).unwrap();
     approve_fixture(&store);
-    let app = router(store.clone(), "https://rusty.example".into(), None, vec![]).unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -1867,17 +1803,7 @@ async fn anonymous_public_board_route_serves_a_confirmed_projection() {
         std::env::temp_dir().join(format!("rusty-public-board-{}", rand::random::<u64>()));
     let store = BlindStore::open(directory.clone()).unwrap();
     let (identity, device_id, certificate, _) = owner_controller_fixture();
-    let trusted = TrustedOwner {
-        identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
-    };
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2057,17 +1983,7 @@ async fn public_assets_and_discussions_survive_restart_and_withdrawal() {
         std::env::temp_dir().join(format!("rusty-public-assets-{}", rand::random::<u64>()));
     let store = BlindStore::open(directory.clone()).unwrap();
     let (identity, device_id, certificate, _) = owner_controller_fixture();
-    let trusted = TrustedOwner {
-        identity: serde_json::from_value(identity.clone()).unwrap(),
-        allowed_controller_device_ids: vec![device_id.clone()],
-    };
-    let app = router(
-        store.clone(),
-        "https://rusty.example".into(),
-        Some(trusted.clone()),
-        vec![],
-    )
-    .unwrap();
+    let app = router(store.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2167,13 +2083,7 @@ async fn public_assets_and_discussions_survive_restart_and_withdrawal() {
     drop(store);
 
     let restarted = BlindStore::open(directory.clone()).unwrap();
-    let app = router(
-        restarted.clone(),
-        "https://rusty.example".into(),
-        Some(trusted),
-        vec![],
-    )
-    .unwrap();
+    let app = router(restarted.clone(), "https://rusty.example".into(), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

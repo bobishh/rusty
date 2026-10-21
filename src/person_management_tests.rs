@@ -44,7 +44,7 @@ fn creation(f: &Fixture, kind: &str, id: &str, seed: u8, parent: &Value) -> Valu
 }
 
 #[tokio::test]
-async fn given_person_policy_when_unrelated_owner_devices_create_scopes_after_pins_are_removed_then_rights_do_not_depend_on_ancestry()
+async fn given_person_policy_when_other_certified_devices_create_resources_after_restart_then_authority_remains_scoped()
  {
     let mut f = Fixture::new().await;
     let parent = person_policy(
@@ -58,7 +58,7 @@ async fn given_person_policy_when_unrelated_owner_devices_create_scopes_after_pi
         parent["payload"]["kind"],
         "rusty-person-management-capability"
     );
-    f.restart(vec![]).await;
+    f.restart().await;
     for (seed, scope) in [(41, "new-scope-a"), (42, "new-scope-b")] {
         let request = creation(&f, "scope", scope, seed, &parent);
         let response = f.put_resource("scope", scope, &request).await;
@@ -74,7 +74,7 @@ async fn given_person_policy_when_unrelated_owner_devices_create_scopes_after_pi
             StatusCode::OK
         );
     }
-    f.restart(vec![]).await;
+    f.restart().await;
     assert_eq!(
         f.put_resource(
             "board",
@@ -105,7 +105,7 @@ async fn given_person_authority_when_missing_stale_substituted_or_unsigned_paren
         Some(old.clone()),
     )
     .await;
-    f.restart(vec![]).await;
+    f.restart().await;
     let mut requests = vec![creation(&f, "scope", "denied", 41, &old)];
     let mut missing = creation(&f, "scope", "denied", 41, &current);
     missing
@@ -142,7 +142,7 @@ async fn given_person_authority_when_missing_stale_substituted_or_unsigned_paren
 }
 
 #[tokio::test]
-async fn given_person_creation_right_is_removed_then_pinned_controller_cannot_bypass_it_and_existing_scope_rights_are_not_broadened()
+async fn given_person_creation_right_is_removed_then_owner_device_cannot_bypass_it_and_existing_scope_rights_are_not_broadened()
  {
     let mut f = Fixture::new().await;
     let parent = person_policy(
@@ -200,7 +200,7 @@ async fn given_person_creation_right_is_removed_then_pinned_controller_cannot_by
         f.challenge(41, Some(created), RESOURCE).await.status(),
         StatusCode::OK
     );
-    f.restart(vec![]).await;
+    f.restart().await;
 }
 
 #[tokio::test]
@@ -231,7 +231,7 @@ async fn given_global_device_revocation_then_existing_scope_status_enrollment_an
         Some(parent),
     )
     .await;
-    f.restart(vec![]).await;
+    f.restart().await;
     assert_eq!(
         f.status_as(41).send().await.unwrap().status(),
         StatusCode::FORBIDDEN
@@ -284,7 +284,7 @@ async fn given_person_policy_pointer_fault_then_resources_stop_until_exact_retry
         f.challenge(32, None, RESOURCE).await.status(),
         StatusCode::FORBIDDEN
     );
-    f.restart(vec![device(32, &f.owner.identity).0]).await;
+    f.restart().await;
     let mut status = f.status_request(32, 32);
     status["authorization"]["payload"]["resourceKind"] = json!("person");
     status["authorization"]["payload"]["resourceId"] = json!(f.owner.identity.person_id);

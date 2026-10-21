@@ -160,7 +160,7 @@ impl BlindStore {
         scope: &str,
         token: &str,
         request: Request,
-        trusted: &TrustedOwner,
+        trusted: &ResourceOwner,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
@@ -394,9 +394,9 @@ pub(super) async fn checkpoint(
     let request = body
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid checkpoint request"))?
         .0;
-    let trusted = state
-        .trusted_owner
-        .ok_or_else(|| failure(StatusCode::FORBIDDEN, "Checkpoint owner is not configured"))?;
+    let trusted = ResourceOwner {
+        identity: request.identity.clone(),
+    };
     state.store.telemetry.emit(
         Level::Info,
         "storage.checkpoint.requested",

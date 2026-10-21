@@ -31,7 +31,7 @@ fn device(seed: u8, identity: &PublicIdentity) -> (String, DeviceCertificate) {
 struct Fixture {
     directory: PathBuf,
     store: Option<BlindStore>,
-    owner: TrustedOwner,
+    owner: ResourceOwner,
     client: reqwest::Client,
     url: String,
     server: Option<tokio::task::JoinHandle<()>>,
@@ -41,10 +41,9 @@ impl Fixture {
         let directory =
             std::env::temp_dir().join(format!("rusty-management-{}", rand::random::<u64>()));
         let store = BlindStore::open(directory.clone()).unwrap();
-        let (identity, device_id, _, _) = super::tests::owner_controller_fixture();
-        let owner = TrustedOwner {
+        let (identity, _, _, _) = super::tests::owner_controller_fixture();
+        let owner = ResourceOwner {
             identity: serde_json::from_value(identity).unwrap(),
-            allowed_controller_device_ids: vec![device_id],
         };
         let mut fixture = Self {
             directory,
@@ -58,13 +57,7 @@ impl Fixture {
         fixture
     }
     async fn start_server(&mut self) {
-        let app = router(
-            self.store().clone(),
-            ORIGIN.into(),
-            Some(self.owner.clone()),
-            vec![],
-        )
-        .unwrap();
+        let app = router(self.store().clone(), ORIGIN.into(), vec![]).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}", listener.local_addr().unwrap());
         self.server = Some(tokio::spawn(async move {
@@ -77,11 +70,10 @@ impl Fixture {
             let _ = server.await;
         }
     }
-    async fn restart(&mut self, allowed_controller_device_ids: Vec<String>) {
+    async fn restart(&mut self) {
         self.stop_server().await;
         self.store.take();
         self.store = Some(BlindStore::open(self.directory.clone()).unwrap());
-        self.owner.allowed_controller_device_ids = allowed_controller_device_ids;
         self.start_server().await;
     }
     fn update(
@@ -263,7 +255,7 @@ async fn given_signed_private_status_when_replayed_after_restart_then_deny_and_b
         receipt.payload["revision"],
         result["capability"]["payload"]["revision"]
     );
-    fixture.restart(vec![]).await;
+    fixture.restart().await;
     let replay = fixture
         .client
         .post(format!(
@@ -371,16 +363,12 @@ async fn given_policy_revocation_when_old_capability_or_removed_device_retries_t
 }
 
 #[tokio::test]
-async fn given_unapproved_identity_device_when_bootstrapping_management_then_existing_operator_policy_remains_binding()
- {
+async fn given_forged_device_signature_when_bootstrapping_management_then_no_policy_is_created() {
     let fixture = Fixture::new().await;
-    assert_eq!(
-        fixture
-            .put(&fixture.update(0, vec![], None, 33))
-            .await
-            .status(),
-        StatusCode::FORBIDDEN
-    );
+    let mut request = fixture.update(0, vec![], None, 33);
+    request["authorization"]["signature"] = json!(URL_SAFE_NO_PAD.encode([0u8; 64]));
+    assert_eq!(fixture.put(&request).await.status(), StatusCode::FORBIDDEN);
+    assert!(!fixture.directory.join("management/policy.json").exists());
     let read = fixture.unsigned_status().send().await.unwrap();
     assert!(
         !read.status().is_success(),
@@ -389,12 +377,13 @@ async fn given_unapproved_identity_device_when_bootstrapping_management_then_exi
 }
 
 #[tokio::test]
-async fn given_migrated_policy_when_owner_root_device_reads_status_then_allow_without_legacy_pin() {
+async fn given_existing_policy_when_other_certified_owner_device_reads_status_after_restart_then_authorize()
+ {
     let mut fixture = Fixture::new().await;
     let created = fixture.put(&fixture.update(0, vec![], None, 32)).await;
     assert_eq!(created.status(), StatusCode::OK);
     let capability = created.json::<Value>().await.unwrap()["capability"].clone();
-    fixture.restart(vec![]).await;
+    fixture.restart().await;
 
     let response = fixture.status_as(33).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -768,8 +757,7 @@ async fn given_interrupted_first_migration_when_pointer_is_not_published_then_ke
         status["migrationPending"], true,
         "interrupted migration must remain explicit"
     );
-    let legacy_controller = fixture.owner.allowed_controller_device_ids.clone();
-    fixture.restart(legacy_controller).await;
+    fixture.restart().await;
     assert_eq!(
         fixture
             .status()
@@ -893,7 +881,7 @@ async fn given_policy_and_receipt_after_restart_then_preserve_latest_retry_and_i
         .unwrap()["capability"]
         .clone();
 
-    fixture.restart(vec![]).await;
+    fixture.restart().await;
 
     let status = fixture
         .status()
@@ -1057,4 +1045,158 @@ async fn given_migrated_management_capability_when_stale_update_or_removed_opera
         StatusCode::FORBIDDEN,
         "controller ancestry cannot restore the removed scope.policy operation"
     );
+}
+
+fn independent_owner_request(mut request: Value, root_seed: u8) -> Value {
+    let public_key = public_key_from_seed(&[root_seed; 32]).unwrap();
+    let identity = PublicIdentity {
+        person_id: public_key_id(&public_key).unwrap(),
+        public_key,
+        display_name: "Independent owner".into(),
+    };
+    let device_key = public_key_from_seed(&[32; 32]).unwrap();
+    let device_id = public_key_id(&device_key).unwrap();
+    let certificate = sign_device_certificate(
+        &[root_seed; 32],
+        DeviceCertificatePayload {
+            kind: "device-certificate".into(),
+            version: 1,
+            person_id: identity.person_id.clone(),
+            device_id: device_id.clone(),
+            device_public_key: device_key,
+            issuer_certificate_hash: None,
+            can_enroll_devices: true,
+        },
+        &identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    request["identity"] = serde_json::to_value(&identity).unwrap();
+    request["certificates"] = json!([certificate]);
+    request["authorization"]["payload"]["personId"] = json!(identity.person_id);
+    if request["authorization"]["payload"]["resourceKind"] == "person" {
+        request["authorization"]["payload"]["resourceId"] = json!(identity.person_id);
+    }
+    request["authorization"] = serde_json::to_value(
+        sign_json_envelope(
+            &[32; 32],
+            request["authorization"]["payload"].clone(),
+            &device_id,
+            "MATCH/1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    request
+}
+
+#[tokio::test]
+async fn given_independent_owners_when_using_one_rusty_then_each_controls_only_own_resources_after_restart()
+ {
+    let mut f = Fixture::new().await;
+    // Given two unrelated identities, each bootstraps its own person authority.
+    let mut capabilities = Vec::new();
+    for (root_seed, scope) in [(31, "first-owner-scope"), (61, "second-owner-scope")] {
+        let person = independent_owner_request(
+            f.update_resource(
+                "person",
+                &f.owner.identity.person_id,
+                0,
+                vec![],
+                None,
+                32,
+                vec!["management.update", "resource.create"],
+            ),
+            root_seed,
+        );
+        let person_id = person["identity"]["personId"].as_str().unwrap();
+        let response = f.put_resource("person", person_id, &person).await;
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "independent owner must bootstrap: {body}"
+        );
+        let parent = serde_json::from_str::<Value>(&body).unwrap()["capability"].clone();
+        let mut request = independent_owner_request(
+            f.update_resource(
+                "scope",
+                scope,
+                0,
+                vec![],
+                None,
+                32,
+                vec!["management.update", "scope.policy", "snapshot.checkpoint"],
+            ),
+            root_seed,
+        );
+        request["personManagementCapability"] = parent.clone();
+        request["authorization"]["payload"]["personManagementRevision"] =
+            parent["payload"]["revision"].clone();
+        f.resign(&mut request, 32);
+        let response = f.put_resource("scope", scope, &request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        capabilities.push(response.json::<Value>().await.unwrap()["capability"].clone());
+    }
+    // When storage is reopened, ownership remains bound to each exact resource.
+    f.restart().await;
+    for (index, (root_seed, scope)) in [(31, "first-owner-scope"), (61, "second-owner-scope")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut status = independent_owner_request(f.status_request(32, 32), root_seed);
+        status["authorization"]["payload"]["resourceId"] = json!(scope);
+        f.resign(&mut status, 32);
+        let url = format!("{}/v2/management/scope/{scope}/status", f.url);
+        let response = f.client.post(&url).json(&status).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["capability"],
+            capabilities[index]
+        );
+        // Then another valid owner cannot read management rights or replace policy,
+        // even if it presents the victim's valid service capability.
+        let mut foreign =
+            independent_owner_request(status.clone(), if root_seed == 31 { 61 } else { 31 });
+        f.resign(&mut foreign, 32);
+        assert_eq!(
+            f.client
+                .post(&url)
+                .json(&foreign)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let takeover = independent_owner_request(
+            f.update_resource(
+                "scope",
+                scope,
+                1,
+                vec![],
+                Some(capabilities[index].clone()),
+                32,
+                vec!["management.update", "scope.policy", "snapshot.checkpoint"],
+            ),
+            if root_seed == 31 { 61 } else { 31 },
+        );
+        assert_eq!(
+            f.put_resource("scope", scope, &takeover).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut forged = status;
+        forged["authorization"]["signature"] = json!(URL_SAFE_NO_PAD.encode([0u8; 64]));
+        assert_eq!(
+            f.client
+                .post(&url)
+                .json(&forged)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 }
