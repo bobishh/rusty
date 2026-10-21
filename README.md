@@ -514,8 +514,11 @@ GitHub Actions checks formatting, storage/publication protocols, formal models,
 and discovery/durable identity across real service-process restarts. Rusty CI
 seals the exact executable hash, immutable image digest and SDK revision as build
 provenance. Rusty's own protected deployment workflow consumes that artifact,
-performs the existing single-writer storage handoff, and confirms the live image
-digest and reader floors. Its rollback selects an earlier sealed Rusty artifact;
+pulls and verifies the image on the host before the single-writer storage handoff,
+boots that prepared image without another registry pull, and confirms the live
+image digest and reader floors. Image preparation failures leave the previous
+writer running; failed activation restores it. This bounds the handoff to service
+activation but does not provide simultaneous blue/green writers on one volume. Its rollback selects an earlier sealed Rusty artifact;
 it does not activate tincanban or change the retained volume.
 
 ### Deployment and rollback

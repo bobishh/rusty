@@ -98,6 +98,16 @@ function ensureReleaseAlias(run, artifact, releaseId) {
   return { alias, sourceDigest };
 }
 
+function verifyPreparedImage(run, spec, version, artifact) {
+  const args = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=20'];
+  if (process.env.RUSTY_SSH_KEY_FILE) args.push('-i', process.env.RUSTY_SSH_KEY_FILE);
+  const image = `ghcr.io/bobishh/rusty:${version}`;
+  const script = `set -eu\nimage_id=$(docker image inspect --format '{{.Id}}' "$1")\nrepo_digests=$(docker image inspect --format '{{json .RepoDigests}}' "$image_id")\nprintf '{"image":"%s","containerImageId":"%s","repoDigests":%s}\\n' "$2" "$image_id" "$repo_digests"\n`;
+  const remote = ['sh', '-s', '--', image, artifact.image].map(value => `'${String(value).replaceAll("'", "'\\''")}'`).join(' ');
+  const output = run('ssh', [...args, `root@${spec.server}`, remote], { input: script, timeout: 60000 });
+  return assertRustyRuntimeImageReceipt(JSON.parse(output.trim().split('\n').at(-1)), artifact);
+}
+
 function verifyOnHost(run, spec, version, artifact) {
   const keyArgs = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=20'];
   if (process.env.RUSTY_SSH_KEY_FILE) keyArgs.push('-i', process.env.RUSTY_SSH_KEY_FILE);
@@ -167,9 +177,11 @@ export async function deployRustyArtifact(artifact, releaseId, rawSpec = process
     const options = { cwd: infraDirectory, env: environment, timeout: 900000, stdio: 'inherit' };
     const configArgs = ['--skip-hooks', '--version', version, '--config-file', temporaryConfig];
     run('kamal', ['build', 'pull', ...configArgs], options);
+    verifyPreparedImage(run, spec, version, artifact);
     try {
       storageHandoff(run, spec, releaseId, 'stop');
-      run('kamal', ['deploy', '--skip-push', ...configArgs], options);
+      // app boot activates the verified local image; deploy --skip-push would delete and pull it again.
+      run('kamal', ['app', 'boot', ...configArgs], options);
       receipt = verifyOnHost(run, spec, version, artifact);
       if (!receipt.repoDigests.includes(`ghcr.io/bobishh/rusty@${sourceDigest}`)) throw new Error('Running Rusty image differs from the sealed release digest');
       if (ports.verifyLive) await ports.verifyLive(spec.origin, artifact);

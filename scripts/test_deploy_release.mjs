@@ -44,7 +44,7 @@ test('failed live reader-floor verification restores the previous writer', async
   let aliasCreated = false;
   const calls = [];
   const run = (command, args, options = {}) => {
-    calls.push([command, args]);
+    calls.push([command, args, options]);
     if (command === 'git' && args[2] === 'rev-parse') return `${configSha}\n`;
     if (command === 'git' && args[2] === 'show') return config;
     if (command === 'docker' && args[0] === 'buildx' && args[1] === 'imagetools' && args[2] === 'inspect') {
@@ -53,7 +53,7 @@ test('failed live reader-floor verification restores the previous writer', async
     }
     if (command === 'docker' && args[2] === 'create') { aliasCreated = true; return ''; }
     if (command === 'ssh' && options.input?.includes("handoff(action")) return '{"version":"release-previous"}\n';
-    if (command === 'ssh' && options.input?.includes('docker inspect')) {
+    if (command === 'ssh' && (options.input?.includes('docker inspect') || options.input?.includes('docker image inspect'))) {
       return JSON.stringify({ image: artifact.image, containerImageId: `sha256:${'b'.repeat(64)}`, repoDigests: [`ghcr.io/bobishh/rusty@${digest}`] });
     }
     return '';
@@ -73,6 +73,30 @@ test('failed live reader-floor verification restores the previous writer', async
       verifyRestored: async () => {},
     }), /reader floor missing/);
     assert.ok(calls.some(([command, args]) => command === 'kamal' && args[0] === 'app' && args[1] === 'start' && args.includes('release-previous')));
+    const stopped = calls.findIndex(([command, args]) => command === 'ssh' && args.at(-1).includes("'stop'"));
+    const pulled = calls.findIndex(([command, args]) => command === 'kamal' && args[0] === 'build' && args[1] === 'pull');
+    const prepared = calls.findIndex(([command, args, options]) => command === 'ssh' && options.input?.includes('docker image inspect'));
+    assert.ok(pulled >= 0 && prepared > pulled && stopped > prepared, 'the exact image must be pulled and verified before stopping the previous writer');
+    assert.ok(calls.some(([command, args]) => command === 'kamal' && args[0] === 'app' && args[1] === 'boot'));
+    assert.ok(!calls.some(([command, args]) => command === 'kamal' && args[0] === 'deploy'), 'activation must not delete and pull the prepared image again after stopping storage');
+    calls.length = 0;
+    await assert.rejects(deployRustyArtifact(artifact, 'a'.repeat(64), spec, {
+      run: (command, args, options) => {
+        if (command === 'kamal' && args[0] === 'build' && args[1] === 'pull') throw new Error('registry unavailable');
+        return run(command, args, options);
+      }, readConfig: () => config, writeConfig: () => {}, unlinkConfig: () => {},
+    }), /registry unavailable/);
+    assert.ok(!calls.some(([command, args]) => command === 'ssh' && args.at(-1).includes("'stop'")), 'failed image preparation must leave the running writer untouched');
+    calls.length = 0;
+    await assert.rejects(deployRustyArtifact(artifact, 'a'.repeat(64), spec, {
+      run: (command, args, options) => {
+        if (command === 'ssh' && options?.input?.includes('docker image inspect')) {
+          return JSON.stringify({ image: artifact.image, containerImageId: `sha256:${'b'.repeat(64)}`, repoDigests: [`ghcr.io/bobishh/rusty@sha256:${'0'.repeat(64)}`] });
+        }
+        return run(command, args, options);
+      }, readConfig: () => config, writeConfig: () => {}, unlinkConfig: () => {},
+    }), /sealed Rusty image digest/);
+    assert.ok(!calls.some(([command, args]) => command === 'ssh' && args.at(-1).includes("'stop'")), 'wrong prepared image must leave the running writer untouched');
   } finally {
     if (oldWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
     else process.env.GITHUB_WORKSPACE = oldWorkspace;
