@@ -234,7 +234,7 @@ async fn service_root_opens_connection_instructions_without_exposing_storage() {
     let response = reqwest::get(format!("{origin}/")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = response.text().await.unwrap();
-    assert!(html.contains("Board storage is available"));
+    assert!(html.contains("Board storage"));
     assert!(html.contains("View Rusty logs"));
     let discovery: Value = reqwest::get(format!("{origin}/.well-known/mesh-lighthouse"))
         .await

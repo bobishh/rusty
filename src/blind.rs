@@ -3064,11 +3064,12 @@ pub fn router_with_telemetry(
         .map(|value| value.parse())
         .collect::<Result<Vec<axum::http::HeaderValue>, _>>()
         .map_err(|_| "Invalid CORS origin")?;
+    let service_page = crate::service_ui::page(&origins)?;
     let state = HttpState { store, origin };
     Ok(Router::new()
         .route(
             "/",
-            get(|| async { axum::response::Html(include_str!("service.html")) }),
+            get(move || { let page = service_page.clone(); async move { axum::response::Html(page) } }),
         )
         .route("/assets/{name}", get(crate::service_ui::asset))
         .route(

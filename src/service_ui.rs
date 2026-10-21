@@ -5,8 +5,41 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+/// Publish configured frontend origins, never private board/storage inventory.
+pub(crate) fn page(origins: &[String]) -> Result<String, String> {
+    let json = serde_json::to_string(origins).map_err(|_| "Invalid frontend origins")?;
+    Ok(include_str!("service.html")
+        .replace("__RUSTY_FRONTEND_ORIGINS__", &json.replace('<', "\\u003c")))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn frontend_configuration_cannot_terminate_the_json_script() {
+        let origins = vec!["https://example.com/</script><script>alert(1)</script>".to_owned()];
+        let html = super::page(&origins).unwrap();
+        let json = html
+            .split("id=\"frontend-origins\" type=\"application/json\">")
+            .nth(1)
+            .unwrap()
+            .split("</script>")
+            .next()
+            .unwrap();
+        assert!(!json.contains('<'));
+        assert_eq!(serde_json::from_str::<Vec<String>>(json).unwrap(), origins);
+    }
+}
+
 pub(crate) async fn asset(Path(name): Path<String>) -> Response {
     let (mime, bytes): (&str, &[u8]) = match name.as_str() {
+        "storage-status.mjs" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("ui/storage-status.mjs"),
+        ),
+        "storage-status.css" => (
+            "text/css; charset=utf-8",
+            include_bytes!("ui/storage-status.css"),
+        ),
         "OFL-Caveat.txt" => (
             "text/plain; charset=utf-8",
             include_bytes!("ui/OFL-Caveat.txt"),

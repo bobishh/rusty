@@ -9,6 +9,9 @@
     <link rel="apple-touch-icon" sizes="180x180" href="/assets/rusty-head-180.png">
     <link rel="stylesheet" href="/assets/design-system.css">
     <link rel="stylesheet" href="/assets/typography.css">
+    <link rel="stylesheet" href="/assets/storage-status.css">
+    <script id="frontend-origins" type="application/json">__RUSTY_FRONTEND_ORIGINS__</script>
+    <script type="module" src="/assets/storage-status.mjs"></script>
   </head>
   <body>
     <div class="shell keeper-admin">
@@ -20,13 +23,24 @@
       </header>
       <main class="admin-content">
         <section class="keeper-card" aria-labelledby="storage-title">
-          <h2 id="storage-title">Board storage is available</h2>
+          <h2 id="storage-title">Board storage</h2>
+          <p id="service-availability" role="status">Checking storage…</p>
           <p>Rusty keeps encrypted copies of your boards while devices are offline.</p>
           <p>To connect a board, open tincanban → Sync → Rusty, then enter this page's address.</p>
           <nav class="dialog-actions" aria-label="Rusty services">
+            <button id="check-service" class="button" type="button">Check server</button>
             <a class="button" href="https://match.meta-uber-engineer.dev">Open tincanban</a>
             <a class="button" href="https://analytics.meta-uber-engineer.dev/admin/logs/rusty">View Rusty logs</a>
           </nav>
+        </section>
+        <section class="keeper-card" aria-labelledby="boards-title">
+          <h2 id="boards-title">Your boards</h2>
+          <p>Check boards configured on this server using your Tincanban identity in this browser.</p>
+          <label class="status-frontend">Tincanban website <select id="frontend-origin"></select></label>
+          <button id="inspect-boards" class="button" type="button" disabled>View my boards</button>
+          <p id="board-notice" role="status"></p>
+          <p id="board-checked"></p>
+          <div id="board-status-list" class="board-status-list"></div>
         </section>
       </main>
     </div>

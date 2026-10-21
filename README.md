@@ -493,7 +493,19 @@ attempts; completion includes `freed_bytes`, `pruned_count` and remaining
 These labels are untrusted diagnostic metadata and grant no permissions. Tokens,
 signed proofs, encrypted snapshots and readable board contents remain excluded.
 
-The domain root serves connection instructions and a link to the protected logs.
+The domain root shows independent service availability and read-only board status.
+Choose **View my boards** to open an allowed Tincanban frontend in the same browser.
+Tincanban asks before sharing names and checked sync outcomes for boards configured
+on that exact Rusty origin. Confirmation is bound to the original popup, exact
+origins, a fresh request ID, a two-minute deadline and the approving identity/device.
+Keys, tokens, board contents and management capabilities remain in Tincanban.
+Results stay in that Rusty page's memory, display their check time and require a
+new confirmation to refresh. They describe this browser's exchanges, not every
+offline participant. No backend login session or anonymous private-board listing
+is created. Allowed frontends come from `RUSTY_CORS_ORIGINS`; with none configured,
+inspection remains disabled with an operator configuration explanation.
+
+The root also retains connection instructions and a link to the protected logs.
 Its robot, header and Fira Code/Caveat typography preserve the original Rusty UI.
 Styles, fonts and artwork are embedded in the service binary and served from
 `/assets/`; rendering does not depend on TinSink being available. The asset handler

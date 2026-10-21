@@ -65,7 +65,7 @@ jobs:
       - name: Verify immutable release sealing
         run: |
           python3 -m unittest discover -s scripts -p 'test_*.py'
-          node --test scripts/test_deploy_release.mjs
+          node --test scripts/test_deploy_release.mjs scripts/test_storage_status.mjs
 
   publish-container:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
