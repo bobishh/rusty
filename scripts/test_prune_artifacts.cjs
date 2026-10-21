@@ -91,6 +91,32 @@ test('Given unhealthy runtime evidence, when the cleanup entry point runs, then 
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('Given rollback starts after the first delete, when the cleanup entry point continues, then abort before the second delete', async () => {
+  const prune = require('../.github/scripts/prune-artifacts.cjs');
+  const input = fixture();
+  const originalFetch = globalThis.fetch;
+  const deleted = [];
+  const actions = {
+    listArtifactsForRepo: () => {}, listWorkflowRunsForRepo: () => {}, listWorkflowRuns: () => {},
+    getWorkflowRun: async ({ run_id }) => ({ data: await input.getRun(run_id) }),
+    deleteArtifact: async ({ artifact_id }) => { deleted.push(artifact_id); },
+  };
+  const github = { rest: { actions }, paginate: async (method, options) => {
+    if (method === actions.listArtifactsForRepo) return input.artifacts;
+    if (method === actions.listWorkflowRunsForRepo) return deleted.length > 0 && options.status === 'queued'
+      ? [{ id: 31, path: '.github/workflows/deploy-rusty.yml', head_sha: sha('f') }] : [];
+    return input.runs.filter(run => run.path === `.github/workflows/${options.workflow_id}`);
+  } };
+  const summary = { addHeading() { return this; }, addRaw() { return this; }, async write() {} };
+  globalThis.fetch = async () => ({ ok: true, json: async () => health });
+  try {
+    await assert.rejects(prune({ github, context: { repo: { owner: 'bobishh', repo: 'rusty' },
+      eventName: 'workflow_dispatch', payload: { inputs: { dry_run: 'false' } } },
+    core: { info() {}, summary }, ports: { readSeal: input.readSeal } }), /release or active runs changed/);
+    assert.deepEqual(deleted, [5]);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('Given deployment pending, young release, or unknown artifact, then exclude them from deletion', async () => {
   const input = fixture();
   input.activeRuns.push({ id: 30, path: '.github/workflows/deploy-rusty.yml' });

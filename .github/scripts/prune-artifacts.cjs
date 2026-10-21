@@ -146,7 +146,7 @@ async function buildPlan({ artifacts, activeRuns, runs, health, readSeal, getRun
   })), bytes: candidates.reduce((total, artifact) => total + artifact.size_in_bytes, 0) };
 }
 
-module.exports = async ({ github, context, core }) => {
+module.exports = async ({ github, context, core, ports = {} }) => {
   const { owner, repo } = context.repo;
   if (owner !== 'bobishh' || repo !== 'rusty') throw new Error('Rusty artifact cleanup requires bobishh/rusty');
   const api = github.rest.actions;
@@ -167,7 +167,7 @@ module.exports = async ({ github, context, core }) => {
     if (!runCache.has(id)) runCache.set(id, (await api.getWorkflowRun({ owner, repo, run_id: id })).data);
     return runCache.get(id);
   };
-  const readSeal = async artifact => {
+  const readSeal = ports.readSeal ?? (async artifact => {
     const directory = mkdtempSync(join(tmpdir(), 'rusty-retention-'));
     try {
       const archive = join(directory, 'artifact.zip');
@@ -177,15 +177,19 @@ module.exports = async ({ github, context, core }) => {
       const binary = execFileSync('unzip', ['-p', archive, 'mesh-lighthouse'], { maxBuffer: 64 * 1024 * 1024 });
       return verifySeal(manifest, binary, artifact);
     } finally { rmSync(directory, { recursive: true, force: true }); }
-  };
+  });
   const plan = await buildPlan({ artifacts, activeRuns, runs: [...ci, ...deployments], health, getRun, readSeal });
   const dryRun = context.eventName === 'workflow_dispatch' && String(context.payload.inputs?.dry_run) === 'true';
-  // Establish the whole plan before any delete; changed runtime or new work invalidates it.
-  if (!dryRun && (canonical(await readHealth()) !== canonical(health) ||
-      canonical((await active()).map(run => run.id).sort()) !== canonical(activeRuns.map(run => run.id).sort()))) {
-    throw new Error('Rusty release or active runs changed during cleanup planning');
-  }
+  const assertUnchanged = async () => {
+    const [currentHealth, currentRuns] = await Promise.all([readHealth(), active()]);
+    if (canonical(currentHealth) !== canonical(health) ||
+        canonical(currentRuns.map(run => run.id).sort()) !== canonical(activeRuns.map(run => run.id).sort())) {
+      throw new Error('Rusty release or active runs changed during artifact cleanup');
+    }
+  };
   for (const artifact of plan.candidates) {
+    // A manual rollback can start after a previous deletion. Never reuse a stale activation guard.
+    if (!dryRun) await assertUnchanged();
     core.info(`${dryRun ? 'Would delete' : 'Delete'} ${artifact.id} ${artifact.name} (${artifact.size_in_bytes} bytes)`);
     if (!dryRun) await api.deleteArtifact({ owner, repo, artifact_id: artifact.id });
   }
