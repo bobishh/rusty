@@ -105,7 +105,7 @@ function preparePublicImage(run, spec, version, artifact) {
   const script = `set -eu\nconfig_dir=$(mktemp -d /tmp/rusty-image-pull.XXXXXXXX)\ntrap 'rm -rf "$config_dir"' EXIT\ndocker --config "$config_dir" pull "$1"\ndocker image tag "$1" "$2"\n`;
   const alias = `ghcr.io/bobishh/rusty:${version}`;
   const remote = ['sh', '-s', '--', artifact.image, alias].map(value => `'${String(value).replaceAll("'", "'\\''")}'`).join(' ');
-  run('ssh', [...args, `root@${spec.server}`, remote], { input: script, timeout: 180000, stdio: 'inherit' });
+  run('ssh', [...args, `root@${spec.server}`, remote], { input: script, timeout: 180000, stdio: ['pipe', 'inherit', 'inherit'] });
 }
 
 function verifyPreparedImage(run, spec, version, artifact) {

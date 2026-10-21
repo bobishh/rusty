@@ -45,6 +45,9 @@ test('failed live reader-floor verification restores the previous writer', async
   const calls = [];
   const run = (command, args, options = {}) => {
     calls.push([command, args, options]);
+    if (command === 'ssh' && options.input?.includes('docker --config "$config_dir" pull')) {
+      assert.equal(options.stdio[0], 'pipe', 'SSH must receive the preparation script on stdin');
+    }
     if (command === 'git' && args[2] === 'rev-parse') return `${configSha}\n`;
     if (command === 'git' && args[2] === 'show') return config;
     if (command === 'docker' && args[0] === 'buildx' && args[1] === 'imagetools' && args[2] === 'inspect') {
