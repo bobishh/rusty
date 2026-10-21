@@ -2365,6 +2365,7 @@ impl BlindStore {
                 .unwrap_or_default(),
         };
         let bytes = serde_json::to_vec(&record).map_err(|_| "Public publication invalid")?;
+        self.retain_publication_owner(board_id, owner)?;
         atomic_write(&record_path, &bytes)?;
         fs::remove_file(&challenge_path).map_err(|_| "Publication challenge consume failed")?;
         File::open(&challenge_dir)

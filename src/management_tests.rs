@@ -1200,3 +1200,64 @@ async fn given_independent_owners_when_using_one_rusty_then_each_controls_only_o
         );
     }
 }
+
+#[tokio::test]
+async fn given_conflicting_signed_owner_records_when_resolving_publication_owner_then_reject_instead_of_selecting_one()
+ {
+    let fixture = Fixture::new().await;
+    let update = fixture.update_resource(
+        "board",
+        RESOURCE,
+        0,
+        vec![],
+        None,
+        32,
+        vec![
+            "management.update",
+            "publication.status",
+            "publication.update",
+        ],
+    );
+    assert_eq!(
+        fixture
+            .put_resource("board", RESOURCE, &update)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    fixture
+        .store()
+        .retain_publication_owner(RESOURCE, &fixture.owner)
+        .unwrap();
+    let foreign_key = public_key_from_seed(&[71; 32]).unwrap();
+    let foreign = PublicIdentity {
+        person_id: public_key_id(&foreign_key).unwrap(),
+        public_key: foreign_key,
+        display_name: String::new(),
+    };
+    let evidence = sign_json_envelope(
+        &fixture.store().seed,
+        json!({
+            "kind":"rusty-publication-owner", "version":1, "boardId":RESOURCE, "identity":foreign
+        }),
+        &public_key_id(&fixture.store().public_key().unwrap()).unwrap(),
+        DOMAIN,
+    )
+    .unwrap();
+    atomic_write(
+        &fixture
+            .directory
+            .join("management/publication-owners")
+            .join(format!("{RESOURCE}.json")),
+        &serde_json::to_vec(&evidence).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .store()
+            .publication_owner(RESOURCE, &fixture.owner.identity)
+            .err()
+            .expect("conflicting signed ownership must fail")
+            .contains("owner management evidence conflict")
+    );
+}

@@ -58,6 +58,19 @@ or keys already obtained. Local acceptance does not establish a production rollo
 
 ## Storage protocol
 
+Publications retain their verified owner root identity in a service-signed,
+board-bound record under `management/publication-owners`. Authorized editor and
+automation deliveries use that identity after restart even when the board has no
+resource-management policy. The identity is retained only after the entire signed
+publication command passes validation; it cannot be supplied by a delivery writer.
+Owner evidence and every new parent directory are confirmed durable before the
+publication record commits. Retries preserve the exact owner record and reconfirm
+its durability. Existing publication and management-policy schemas are unchanged.
+For older publications without this record, a verified board or person policy can
+supply the original owner's public identity. If neither retains the root key, the
+original owner must confirm a publication command before editor delivery resumes;
+the requesting editor cannot become the owner.
+
 Signed publication challenges include `deliveryPolicyContentHash` for the current
 verified policy. It hashes canonical JSON containing `policy.payload`,
 `policy.signerKeyId`, and `ownerCertificates`, excluding only the policy's signature.

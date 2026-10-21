@@ -68,6 +68,15 @@ struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     person_management_capability: Option<SignedEnvelope<Value>>,
 }
+// Separate from the publication projection so existing readers retain their schema.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicationOwner {
+    kind: String,
+    version: u8,
+    board_id: String,
+    identity: PublicIdentity,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Index {
@@ -213,6 +222,13 @@ impl BlindStore {
         id: &str,
         identity: &PublicIdentity,
     ) -> Result<bool, String> {
+        if kind == "board"
+            && self
+                .stored_publication_owner(id)?
+                .is_some_and(|owner| !trusted_identity_matches(&owner, identity))
+        {
+            return Ok(false);
+        }
         if let Some(record) = self.management_record(kind, id)? {
             return Ok(trusted_identity_matches(&record.identity, identity));
         }
@@ -231,20 +247,134 @@ impl BlindStore {
         }
     }
 
-    // Editor delivery is verified against the stored board owner's public key.
-    // Never promote the requesting editor to owner when the global pin is absent.
+    fn stored_publication_owner(&self, board_id: &str) -> Result<Option<PublicIdentity>, String> {
+        resource("board", board_id)?;
+        let path = self
+            .directory
+            .join("management/publication-owners")
+            .join(format!("{board_id}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        if fs::metadata(&path)
+            .map_err(|_| "Publication owner unavailable")?
+            .len()
+            > 16 * 1024
+        {
+            return Err("Invalid publication owner evidence size".into());
+        }
+        let evidence: SignedEnvelope<PublicationOwner> =
+            serde_json::from_slice(&fs::read(path).map_err(|_| "Publication owner unavailable")?)
+                .map_err(|_| "Invalid publication owner evidence")?;
+        let value: SignedEnvelope<Value> = serde_json::from_value(
+            serde_json::to_value(&evidence).map_err(|_| "Invalid publication owner evidence")?,
+        )
+        .map_err(|_| "Invalid publication owner evidence")?;
+        let service_key = self.public_key()?;
+        let owner = evidence.payload;
+        if owner.kind != "rusty-publication-owner"
+            || owner.version != 1
+            || owner.board_id != board_id
+            || evidence.signer_key_id != public_key_id(&service_key)?
+            || !verify_signed_envelope(&value, &service_key, DOMAIN)?
+            || public_key_id(&owner.identity.public_key)? != owner.identity.person_id
+            || self
+                .current_publication(board_id)?
+                .is_some_and(|publication| {
+                    publication.controller_person_id != owner.identity.person_id
+                })
+        {
+            return Err("Publication owner evidence integrity failure".into());
+        }
+        Ok(Some(owner.identity))
+    }
+
+    // Call only after the complete publication command and projection are verified.
+    // Persist before the projection: a crash retains the authorized original owner.
+    pub(super) fn retain_publication_owner(
+        &self,
+        board_id: &str,
+        owner: &ResourceOwner,
+    ) -> Result<(), String> {
+        let known = self.publication_owner(board_id, &owner.identity)?;
+        if !trusted_identity_matches(&known.identity, &owner.identity) {
+            return Err("Publication owner conflict".into());
+        }
+        let path = self
+            .directory
+            .join("management/publication-owners")
+            .join(format!("{board_id}.json"));
+        if self.stored_publication_owner(board_id)?.is_none() {
+            let identity = PublicIdentity {
+                person_id: owner.identity.person_id.clone(),
+                public_key: owner.identity.public_key.clone(),
+                display_name: String::new(),
+            };
+            let evidence = sign_json_envelope(
+                &self.seed,
+                json!({
+                    "kind":"rusty-publication-owner", "version":1, "boardId":board_id, "identity":identity
+                }),
+                &public_key_id(&self.public_key()?)?,
+                DOMAIN,
+            )?;
+            atomic_write(
+                &path,
+                &serde_json::to_vec(&evidence).map_err(|_| "Invalid publication owner evidence")?,
+            )?;
+        }
+        // A previous rename may have succeeded while its directory sync failed.
+        // Reconfirm the whole hierarchy on retries before publishing a receipt.
+        sync_directory(path.parent().ok_or("Invalid publication owner path")?)
+            .map_err(|_| "Publication owner durability failed")?;
+        sync_directory(&self.directory.join("management"))
+            .map_err(|_| "Publication owner durability failed")?;
+        sync_directory(&self.directory).map_err(|_| "Publication owner durability failed")?;
+        Ok(())
+    }
+
+    // A delivery writer never supplies its own identity as the board owner.
     pub(super) fn publication_owner(
         &self,
         board_id: &str,
         requester: &PublicIdentity,
     ) -> Result<ResourceOwner, String> {
+        let stored = self.stored_publication_owner(board_id)?;
+        let publication = self.current_publication(board_id)?;
         if let Some(record) = self.management_record("board", board_id)? {
+            if stored
+                .as_ref()
+                .is_some_and(|owner| !trusted_identity_matches(owner, &record.identity))
+                || publication.as_ref().is_some_and(|publication| {
+                    publication.controller_person_id != record.identity.person_id
+                })
+            {
+                return Err("Publication owner management evidence conflict".into());
+            }
             return Ok(ResourceOwner {
                 identity: record.identity,
             });
         }
-        if !self.resource_identity_allowed("board", board_id, requester)? {
-            return Err("Publication owner management policy required".into());
+        if let Some(identity) = stored {
+            return Ok(ResourceOwner { identity });
+        }
+        if let Some(publication) = publication {
+            // Legacy publications may already have independently verified owner evidence.
+            if let Some(record) =
+                self.management_record("person", &publication.controller_person_id)?
+            {
+                return Ok(ResourceOwner {
+                    identity: record.identity,
+                });
+            }
+            if publication.controller_person_id != requester.person_id {
+                return Err(
+                    "Publication owner identity unavailable; owner confirmation required".into(),
+                );
+            }
+        }
+        if public_key_id(&requester.public_key)? != requester.person_id {
+            return Err("Invalid publication owner identity".into());
         }
         Ok(ResourceOwner {
             identity: requester.clone(),

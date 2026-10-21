@@ -1344,3 +1344,372 @@ async fn given_stored_board_owner_when_editor_delivers_over_http_then_use_scoped
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test]
+async fn given_publication_without_management_policy_when_writer_delivers_after_restart_then_use_durable_board_owner()
+ {
+    for automated in [false, true] {
+        let fixture = Fixture::new();
+        let writer = if automated {
+            DeliveryWriter::automation(&fixture)
+        } else {
+            DeliveryWriter::editor(&fixture)
+        };
+        let directory = fixture.directory.join("restartable");
+        let store = BlindStore::open(directory.clone()).unwrap();
+        let app = router(store.clone(), ORIGIN.into(), vec![]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{url}/v1/public/challenges"))
+            .json(&json!({
+                "version":1, "boardId":BOARD, "identity":fixture.owner.identity,
+                "deviceId":fixture.device_id, "certificates":[fixture.certificate],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let challenge =
+            serde_json::from_value(response.json::<Value>().await.unwrap()["challenge"].clone())
+                .unwrap();
+        let before = if automated {
+            automation_projection(None)
+        } else {
+            projection()
+        };
+        let mut publish = fixture.request("publish", Some(before), challenge);
+        attach_delivery_policy(&fixture, &mut publish, &writer.policy);
+        let mut forged = publish.clone();
+        forged["authorization"]["signature"] = json!("forged");
+        assert!(
+            client
+                .put(format!("{url}/v1/public/boards/{BOARD}"))
+                .json(&forged)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_client_error()
+        );
+        assert!(
+            !directory.join("management/publication-owners").exists(),
+            "rejected owner commands cannot claim a board"
+        );
+        let response = client
+            .put(format!("{url}/v1/public/boards/{BOARD}"))
+            .json(&publish)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "owner publish: {body}");
+        assert!(!directory.join("management/policy.json").exists());
+        server.abort();
+        let _ = server.await;
+        drop(store);
+
+        let store = BlindStore::open(directory).unwrap();
+        let app = router(store.clone(), ORIGIN.into(), vec![]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let foreign = client
+            .post(format!("{url}/v1/public/challenges"))
+            .json(&json!({
+                "version":1, "boardId":BOARD, "identity":writer.identity,
+                "deviceId":writer.device_id, "certificates":[writer.certificate],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            foreign.status().is_client_error(),
+            "a delivery grant never grants owner management"
+        );
+        let response = client
+            .post(format!("{url}/v1/public/challenges"))
+            .json(&json!({
+                "version":1, "boardId":BOARD, "identity":writer.identity,
+                "deviceId":writer.device_id, "certificates":[writer.certificate],
+                "deliveryGrant":writer.grant, "sourceHeads":writer.source_heads,
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "writer challenge after restart: {body}"
+        );
+        let challenge = serde_json::from_value(
+            serde_json::from_str::<Value>(&body).unwrap()["challenge"].clone(),
+        )
+        .unwrap();
+        let after = if automated {
+            automation_projection(Some(json!({
+                "id":"new-card", "parentId":null, "columnId":"lead", "title":"New",
+                "body":"Role", "values":{"source":"link"}, "rank":"0/1"
+            })))
+        } else {
+            let mut value = projection();
+            value["board"]["title"] = json!("Editor delivery");
+            value
+        };
+        let request = writer.request_with_challenge(challenge, "update", Some(after));
+        let response = client
+            .put(format!("{url}/v1/public/boards/{BOARD}"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "writer delivery after restart: {body}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["payload"]["revision"],
+            2
+        );
+        assert_eq!(
+            store
+                .current_publication(BOARD)
+                .unwrap()
+                .unwrap()
+                .controller_person_id,
+            fixture.owner.identity.person_id
+        );
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn given_retained_owner_before_publication_commit_when_another_identity_claims_board_then_original_owner_can_retry()
+ {
+    let fixture = Fixture::new();
+    fixture.publish();
+    let owner_path = fixture
+        .directory
+        .join("management/publication-owners")
+        .join(format!("{BOARD}.json"));
+    let retained = fs::read(&owner_path).unwrap();
+    // Equivalent to a crash after durable owner evidence but before projection commit.
+    fs::remove_file(
+        fixture
+            .directory
+            .join("publications/records")
+            .join(format!("{BOARD}.json")),
+    )
+    .unwrap();
+    let foreign = DeliveryWriter::editor(&fixture);
+    let app = router(fixture.store.clone(), ORIGIN.into(), vec![]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let now = now_ms().unwrap();
+    let authorization = sign_json_envelope(&foreign.device_seed, json!({
+        "kind":"rusty-management-policy-update", "version":1,
+        "serviceId":public_key_id(&fixture.store.public_key().unwrap()).unwrap(), "origin":ORIGIN,
+        "personId":foreign.identity.person_id, "deviceId":foreign.device_id,
+        "resourceKind":"board", "resourceId":BOARD, "expectedRevision":0,
+        "operations":["management.update", "publication.status", "publication.update"],
+        "revokedDeviceIds":[], "requestId":URL_SAFE_NO_PAD.encode(rand::random::<[u8;32]>()),
+        "issuedAt":now, "expiresAt":now+60000,
+    }), &foreign.device_id, "MATCH/1").unwrap();
+    let response = reqwest::Client::new()
+        .put(format!("{url}/v2/management/board/{BOARD}"))
+        .json(&json!({
+            "version":1, "identity":foreign.identity, "deviceId":foreign.device_id,
+            "certificates":[foreign.certificate], "authorization":authorization,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        fixture
+            .store
+            .publication_owner(BOARD, &foreign.identity)
+            .unwrap()
+            .identity
+            .person_id,
+        fixture.owner.identity.person_id
+    );
+    fixture.publish();
+    assert_eq!(
+        fs::read(owner_path).unwrap(),
+        retained,
+        "exact owner evidence remains unchanged on retry"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn given_legacy_publication_with_person_evidence_when_editor_requests_delivery_then_owner_need_not_be_online()
+ {
+    let fixture = Fixture::new();
+    let writer = DeliveryWriter::editor(&fixture);
+    let mut publish = fixture.request("publish", Some(projection()), fixture.challenge());
+    attach_delivery_policy(&fixture, &mut publish, &writer.policy);
+    fixture.mutate(publish).unwrap();
+    fs::remove_file(
+        fixture
+            .directory
+            .join("management/publication-owners")
+            .join(format!("{BOARD}.json")),
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .store
+            .publication_owner(BOARD, &writer.identity)
+            .is_err()
+    );
+    let app = router(fixture.store.clone(), ORIGIN.into(), vec![]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let now = now_ms().unwrap();
+    let authorization = sign_json_envelope(&[62;32], json!({
+        "kind":"rusty-management-policy-update", "version":1,
+        "serviceId":public_key_id(&fixture.store.public_key().unwrap()).unwrap(), "origin":ORIGIN,
+        "personId":fixture.owner.identity.person_id, "deviceId":fixture.device_id,
+        "resourceKind":"person", "resourceId":fixture.owner.identity.person_id, "expectedRevision":0,
+        "operations":["management.update", "resource.create"], "revokedDeviceIds":[],
+        "requestId":URL_SAFE_NO_PAD.encode(rand::random::<[u8;32]>()), "issuedAt":now, "expiresAt":now+60000,
+    }), &fixture.device_id, "MATCH/1").unwrap();
+    let response = client
+        .put(format!(
+            "{url}/v2/management/person/{}",
+            fixture.owner.identity.person_id
+        ))
+        .json(&json!({
+            "version":1, "identity":fixture.owner.identity, "deviceId":fixture.device_id,
+            "certificates":[fixture.certificate], "authorization":authorization,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "verified person evidence: {body}");
+    let response = client.post(format!("{url}/v1/public/challenges")).json(&json!({
+        "version":1, "boardId":BOARD, "identity":writer.identity, "deviceId":writer.device_id,
+        "certificates":[writer.certificate], "deliveryGrant":writer.grant, "sourceHeads":writer.source_heads,
+    })).send().await.unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "legacy editor uses verified owner evidence: {body}"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[test]
+fn given_retained_publication_owner_when_board_or_signature_is_changed_then_reject_evidence() {
+    let fixture = Fixture::new();
+    fixture.publish();
+    let path = fixture
+        .directory
+        .join("management/publication-owners")
+        .join(format!("{BOARD}.json"));
+    let original = fs::read(&path).unwrap();
+    let mut evidence: Value = serde_json::from_slice(&original).unwrap();
+    evidence["payload"]["boardId"] = json!("another-board");
+    fs::write(&path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    assert!(
+        fixture
+            .store
+            .publication_owner(BOARD, &fixture.owner.identity)
+            .is_err()
+    );
+    fs::write(&path, &original).unwrap();
+    let publication_path = fixture
+        .directory
+        .join("publications/records")
+        .join(format!("{BOARD}.json"));
+    let mut publication: Value =
+        serde_json::from_slice(&fs::read(&publication_path).unwrap()).unwrap();
+    publication["controllerPersonId"] = json!(DeliveryWriter::editor(&fixture).identity.person_id);
+    fs::write(publication_path, serde_json::to_vec(&publication).unwrap()).unwrap();
+    assert!(
+        fixture
+            .store
+            .publication_owner(BOARD, &fixture.owner.identity)
+            .is_err()
+    );
+}
+
+#[test]
+fn given_owner_commit_sync_failure_when_retried_then_no_receipt_until_hierarchy_is_durable_after_restart()
+ {
+    for stage in ["management/publication-owners", "management", ""] {
+        let fixture = Fixture::new();
+        let directory = fixture.directory.join("restartable");
+        let store = BlindStore::open(directory.clone()).unwrap();
+        let challenge = store
+            .create_public_challenge(
+                BOARD,
+                &fixture.owner.identity.person_id,
+                &fixture.device_id,
+                &fixture.device_id,
+                ORIGIN,
+            )
+            .unwrap();
+        let request = fixture.request("publish", Some(projection()), challenge);
+        let mutate = |store: &BlindStore| {
+            store.mutate_publication(
+                BOARD,
+                serde_json::from_value(request.clone()).unwrap(),
+                &fixture.owner,
+                ORIGIN,
+            )
+        };
+        FAILED_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(directory.join(stage)));
+        let first = mutate(&store);
+        let retry = mutate(&store);
+        FAILED_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = None);
+        assert!(
+            first.is_err(),
+            "initial directory sync must fail at {stage}"
+        );
+        assert!(
+            retry.is_err(),
+            "existing owner evidence must retry failed sync at {stage}"
+        );
+        assert!(
+            directory
+                .join("management/publication-owners")
+                .join(format!("{BOARD}.json"))
+                .exists()
+        );
+        assert!(store.current_publication(BOARD).unwrap().is_none());
+        let receipt = mutate(&store).unwrap();
+        assert_eq!(receipt.payload["revision"], 1);
+        drop(store);
+        let reopened = BlindStore::open(directory).unwrap();
+        let outsider = DeliveryWriter::editor(&fixture);
+        assert_eq!(
+            reopened
+                .publication_owner(BOARD, &outsider.identity)
+                .unwrap()
+                .identity
+                .person_id,
+            fixture.owner.identity.person_id
+        );
+    }
+}
