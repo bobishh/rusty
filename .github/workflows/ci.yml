@@ -81,10 +81,33 @@ jobs:
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-      - name: Build verified service revision
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver: docker-container
+      - name: Read pinned SDK revision
+        id: revision
         run: |
           sdk_sha=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["dependencies"]["meta-mesh-core"]["rev"])')
-          docker build --build-arg "RUSTY_BUILD_SHA=$GITHUB_SHA" --build-arg "RUSTY_SDK_SHA=$sdk_sha" --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/bobishh/rusty" --tag "ghcr.io/bobishh/rusty:$GITHUB_SHA" .
+          echo "sdk_sha=$sdk_sha" >> "$GITHUB_OUTPUT"
+      - name: Build verified service revision
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          build-args: |
+            RUSTY_BUILD_SHA=${{ github.sha }}
+            RUSTY_SDK_SHA=${{ steps.revision.outputs.sdk_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/bobishh/rusty
+          tags: ghcr.io/bobishh/rusty:${{ github.sha }}
+          cache-from: type=gha,version=2,scope=rusty-release-linux-amd64,timeout=3m
+          cache-to: type=gha,version=2,scope=rusty-release-linux-amd64,mode=max,timeout=3m,ignore-error=true
       - name: Verify the existing Kamal service identity
         run: test "$(docker inspect --format '{{index .Config.Labels "service"}}' "ghcr.io/bobishh/rusty:$GITHUB_SHA")" = mesh-lighthouse
       - name: Publish immutable service image

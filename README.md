@@ -535,6 +535,15 @@ writer running; failed activation restores it. This bounds the handoff to servic
 activation but does not provide simultaneous blue/green writers on one volume. Its rollback selects an earlier sealed Rusty artifact;
 it does not activate tincanban or change the retained volume.
 
+Container builds reuse the dependency layer through the GitHub Actions v2 cache,
+using one stable `rusty-release-linux-amd64` scope. `mode=max` includes the Rust
+builder stage; source changes still rebuild the service with the current build
+and SDK revisions. Cache export is limited to three minutes and cannot fail the
+release. Docker build-record artifact uploads are disabled. Cache uses GitHub's
+separate repository allowance and eviction policy, not release artifact storage;
+the workflow does not raise the repository cache limit. The loaded image still
+passes service-label verification, push, executable extraction and release sealing.
+
 ### Deployment and rollback
 
 `Deploy Rusty` runs after a successful push build on `main`. It downloads the
