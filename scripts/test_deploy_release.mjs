@@ -74,7 +74,7 @@ test('failed live reader-floor verification restores the previous writer', async
     }), /reader floor missing/);
     assert.ok(calls.some(([command, args]) => command === 'kamal' && args[0] === 'app' && args[1] === 'start' && args.includes('release-previous')));
     const stopped = calls.findIndex(([command, args]) => command === 'ssh' && args.at(-1).includes("'stop'"));
-    const pulled = calls.findIndex(([command, args]) => command === 'kamal' && args[0] === 'build' && args[1] === 'pull');
+    const pulled = calls.findIndex(([command, args, options]) => command === 'ssh' && options.input?.includes('docker --config "$config_dir" pull'));
     const prepared = calls.findIndex(([command, args, options]) => command === 'ssh' && options.input?.includes('docker image inspect'));
     assert.ok(pulled >= 0 && prepared > pulled && stopped > prepared, 'the exact image must be pulled and verified before stopping the previous writer');
     assert.ok(calls.some(([command, args]) => command === 'kamal' && args[0] === 'app' && args[1] === 'boot'));
@@ -82,7 +82,7 @@ test('failed live reader-floor verification restores the previous writer', async
     calls.length = 0;
     await assert.rejects(deployRustyArtifact(artifact, 'a'.repeat(64), spec, {
       run: (command, args, options) => {
-        if (command === 'kamal' && args[0] === 'build' && args[1] === 'pull') throw new Error('registry unavailable');
+        if (command === 'ssh' && options?.input?.includes('docker --config "$config_dir" pull')) throw new Error('registry unavailable');
         return run(command, args, options);
       }, readConfig: () => config, writeConfig: () => {}, unlinkConfig: () => {},
     }), /registry unavailable/);

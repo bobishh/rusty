@@ -98,6 +98,16 @@ function ensureReleaseAlias(run, artifact, releaseId) {
   return { alias, sourceDigest };
 }
 
+function preparePublicImage(run, spec, version, artifact) {
+  const args = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=20'];
+  if (process.env.RUSTY_SSH_KEY_FILE) args.push('-i', process.env.RUSTY_SSH_KEY_FILE);
+  // The release is public. Keep expiring CI registry credentials out of host pull authorization.
+  const script = `set -eu\nconfig_dir=$(mktemp -d /tmp/rusty-image-pull.XXXXXXXX)\ntrap 'rm -rf "$config_dir"' EXIT\ndocker --config "$config_dir" pull "$1"\ndocker image tag "$1" "$2"\n`;
+  const alias = `ghcr.io/bobishh/rusty:${version}`;
+  const remote = ['sh', '-s', '--', artifact.image, alias].map(value => `'${String(value).replaceAll("'", "'\\''")}'`).join(' ');
+  run('ssh', [...args, `root@${spec.server}`, remote], { input: script, timeout: 180000, stdio: 'inherit' });
+}
+
 function verifyPreparedImage(run, spec, version, artifact) {
   const args = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=20'];
   if (process.env.RUSTY_SSH_KEY_FILE) args.push('-i', process.env.RUSTY_SSH_KEY_FILE);
@@ -176,7 +186,7 @@ export async function deployRustyArtifact(artifact, releaseId, rawSpec = process
       DOCKER_REGISTRY_PASSWORD: process.env.DOCKER_REGISTRY_PASSWORD ?? token };
     const options = { cwd: infraDirectory, env: environment, timeout: 900000, stdio: 'inherit' };
     const configArgs = ['--skip-hooks', '--version', version, '--config-file', temporaryConfig];
-    run('kamal', ['build', 'pull', ...configArgs], options);
+    preparePublicImage(run, spec, version, artifact);
     verifyPreparedImage(run, spec, version, artifact);
     try {
       storageHandoff(run, spec, releaseId, 'stop');
