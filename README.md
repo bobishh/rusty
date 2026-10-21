@@ -562,8 +562,9 @@ CI/deployment completion; manual runs default to preview. Cleanup verifies seals
 and executable bytes before protecting the active `/health` identity, the previous
 compatible deployed release, and the latest successful main push CI. It preserves
 in-flight work and pauses release deletion during pending deployments. Missing
-health or required recovery artifacts aborts cleanup before deletion. Older
-completed releases have a one-hour grace period; diagnostics keep their first
+health or required recovery artifacts aborts cleanup before deletion. Runtime
+health and active runs are rechecked before every delete; a change stops the
+remaining plan. Older completed releases have a one-hour grace period; diagnostics keep their first
 24 hours. Runtime data, container images and caches are untouched. The 90-day
 GitHub expiry still applies even to a protected artifact; cleanup cannot extend it.
 
