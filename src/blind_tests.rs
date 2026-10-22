@@ -229,7 +229,7 @@ async fn service_root_opens_connection_instructions_without_exposing_storage() {
     );
     assert_eq!(
         health["readers"],
-        serde_json::json!({"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1, "publicBoardPublication": 1})
+        serde_json::json!({"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1, "publicBoardPublication": 1})
     );
     let response = reqwest::get(format!("{origin}/")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);

@@ -37,7 +37,7 @@ test('failed live reader-floor verification restores the previous writer', async
     binarySha256: 'd'.repeat(64),
     sourceSha: 'e'.repeat(40),
     sdkSha: 'f'.repeat(40),
-    readers: { scopePolicy: 2, managementPolicy: 1, archiveStorage: 1, publicBoardPublication: 1 },
+    readers: { scopePolicy: 2, managementPolicy: 2, archiveStorage: 1, publicBoardPublication: 1 },
   };
   const spec = JSON.stringify({ kind: 'kamal', directory: '.release-config/hetzner_playground',
     configFile: 'config/deploy.mesh-lighthouse.yml', configSha, server: 'rusty.example', origin: 'https://rusty.example' });
@@ -72,7 +72,7 @@ test('failed live reader-floor verification restores the previous writer', async
       writeConfig: () => {},
       unlinkConfig: () => {},
       fetch: async () => Response.json({ status: 'ok', buildSha: artifact.sourceSha,
-        artifactSha256: artifact.binarySha256, readers: { scopePolicy: 1, managementPolicy: 1, archiveStorage: 1, publicBoardPublication: 1 } }),
+        artifactSha256: artifact.binarySha256, readers: { scopePolicy: 1, managementPolicy: 2, archiveStorage: 1, publicBoardPublication: 1 } }),
       verifyRestored: async () => {},
     }), /reader floor missing/);
     assert.ok(calls.some(([command, args]) => command === 'kamal' && args[0] === 'app' && args[1] === 'start' && args.includes('release-previous')));

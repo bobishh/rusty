@@ -13,7 +13,7 @@ class VerifyReleaseTests(unittest.TestCase):
         digest = hashlib.sha256(data).hexdigest()
         body = {"kind": "tincanban-component-artifact", "version": 1, "component": "rusty",
                 "sourceSha": "a" * 40, "sdkSha": "b" * 40, "candidateId": "12-1",
-                "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1,
+                "readers": {"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1,
                             "publicBoardPublication": 1}, "writerVersion": 2,
                 "files": {"mesh-lighthouse": digest},
                 "image": "ghcr.io/bobishh/rusty@sha256:" + "c" * 64, "binarySha256": digest}

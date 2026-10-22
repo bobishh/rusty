@@ -3076,7 +3076,7 @@ pub fn router_with_telemetry(
             "/health",
             get(|| async { Json(json!({"status": "ok", "mode": "blind", "buildSha": crate::build_identity::build_sha(),
                 "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
-                "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1, "publicBoardPublication": 1}})) }),
+                "readers": {"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1, "publicBoardPublication": 1}})) }),
         )
         .route("/.well-known/mesh-lighthouse", get(discovery))
         .route(
@@ -3278,7 +3278,7 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
     Ok(Json(
         json!({"protocolVersions": [2], "publicOrigin": state.origin, "displayName": "Rusty", "buildSha": crate::build_identity::build_sha(),
             "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
-            "readers": {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1, "publicBoardPublication": 1},
+            "readers": {"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1, "publicBoardPublication": 1},
         "service": {"serviceId": service_id, "publicKey": public_key},
         "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1,"fieldConfigurationVersion":1,"deliveryVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"deviceAccessRestoration":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
     ))

@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import sys
 
-REQUIRED_READER_FLOORS = {"scopePolicy": 2, "managementPolicy": 1, "archiveStorage": 1,
+REQUIRED_READER_FLOORS = {"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1,
                           "publicBoardPublication": 1}
 
 

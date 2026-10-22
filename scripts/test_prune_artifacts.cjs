@@ -7,7 +7,7 @@ const now = Date.parse('2026-10-21T16:00:00Z');
 const sha = letter => letter.repeat(40);
 const digest = letter => letter.repeat(64);
 const health = { status: 'ok', buildSha: sha('a'), sdkSha: sha('e'), artifactSha256: digest('a'),
-  readers: { scopePolicy: 2, managementPolicy: 1, archiveStorage: 1, publicBoardPublication: 1 } };
+  readers: { scopePolicy: 2, managementPolicy: 2, archiveStorage: 1, publicBoardPublication: 1 } };
 const manifest = (letter, run) => ({ sourceSha: sha(letter), sdkSha: sha('e'), binarySha256: digest(letter),
   artifactSha256: digest(letter), candidateId: `${run}-1`, readers: health.readers, writerVersion: 2 });
 const artifact = (id, type, letter, run, days = 2) => ({ id, name: `rusty-${type}-${sha(letter)}${type === 'tlc' ? '' : '-1'}`,
