@@ -608,7 +608,7 @@ publication records.
 The retired readable Keeper runtime, pairing console and application grants are
 not reactivated by retaining their Git history.
 
-[Blind-storage TLA+ models](formal/tla/README.md) run in CI alongside native tests.
+[Blind-storage TLA+ models](../formal/tla/README.md) run in CI alongside native tests.
 Duplicate upload and recovered checkpoint retries confirm directory durability
 before issuing a receipt or pruning prior objects, including after a failed rename
 commit. Object IDs, sequences and encrypted storage format remain unchanged.
