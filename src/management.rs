@@ -21,6 +21,8 @@ struct Capability {
     revision: u64,
     operations: Vec<String>,
     revoked_device_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restored_device_ids: Option<Vec<String>>,
     request_id: String,
     authorization_hash: String,
     issued_at: u64,
@@ -39,6 +41,8 @@ struct PolicyUpdate {
     expected_revision: u64,
     operations: Vec<String>,
     revoked_device_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restored_device_ids: Option<Vec<String>>,
     request_id: String,
     issued_at: u64,
     expires_at: u64,
@@ -187,6 +191,10 @@ fn capability(value: &SignedEnvelope<Value>) -> Result<Capability, String> {
         || cap.issued_at > MAX_SAFE_INTEGER
         || !operations(&cap.resource_kind, &cap.operations)
         || !ordered_ids(&cap.revoked_device_ids, MAX_REVOKED_DEVICES)
+        || cap.restored_device_ids.as_ref().is_some_and(|ids| {
+            !ordered_ids(ids, MAX_REVOKED_DEVICES)
+                || ids.iter().any(|id| cap.revoked_device_ids.contains(id))
+        })
         || URL_SAFE_NO_PAD
             .decode(&cap.authorization_hash)
             .map_or(true, |hash| hash.len() != 32)
@@ -949,6 +957,10 @@ impl BlindStore {
             || !valid_id(&update.request_id)
             || !operations(kind, &update.operations)
             || !ordered_ids(&update.revoked_device_ids, MAX_REVOKED_DEVICES)
+            || update.restored_device_ids.as_ref().is_some_and(|ids| {
+                !ordered_ids(ids, MAX_REVOKED_DEVICES)
+                    || ids.iter().any(|id| update.revoked_device_ids.contains(id))
+            })
             || update.issued_at > now.saturating_add(30_000)
             || update.expires_at <= now
             || update.expires_at > MAX_SAFE_INTEGER
@@ -969,10 +981,29 @@ impl BlindStore {
             if capability(&previous.capability)?
                 .revoked_device_ids
                 .iter()
-                .any(|id| !update.revoked_device_ids.contains(id))
+                .any(|id| {
+                    !update.revoked_device_ids.contains(id)
+                        && !update
+                            .restored_device_ids
+                            .as_ref()
+                            .is_some_and(|ids| ids.contains(id))
+                })
             {
                 return Err("Management revocation rollback conflict".into());
             }
+        }
+        let mut restored = current
+            .as_ref()
+            .map(|record| capability(&record.capability))
+            .transpose()?
+            .and_then(|cap| cap.restored_device_ids)
+            .unwrap_or_default();
+        restored.extend(update.restored_device_ids.clone().unwrap_or_default());
+        restored.retain(|id| !update.revoked_device_ids.contains(id));
+        restored.sort();
+        restored.dedup();
+        if restored.len() > MAX_REVOKED_DEVICES {
+            return Err("Too many restored device records".into());
         }
         let payload = Capability {
             kind: if kind == "person" {
@@ -990,6 +1021,7 @@ impl BlindStore {
             revision: revision + 1,
             operations: update.operations.clone(),
             revoked_device_ids: update.revoked_device_ids.clone(),
+            restored_device_ids: (!restored.is_empty()).then_some(restored),
             request_id: update.request_id.clone(),
             authorization_hash: authorization_hash.clone(),
             issued_at: update.issued_at,

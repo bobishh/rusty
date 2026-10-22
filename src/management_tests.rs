@@ -93,6 +93,28 @@ impl Fixture {
             vec!["management.update", "scope.policy", "snapshot.checkpoint"],
         )
     }
+    fn restoring_update(
+        &self,
+        revision: u64,
+        capability: Value,
+        restored: &str,
+        seed: u8,
+    ) -> Value {
+        let mut request = self.update(revision, vec![], Some(capability), seed);
+        let mut payload = request["authorization"]["payload"].clone();
+        payload["restoredDeviceIds"] = json!([restored]);
+        request["authorization"] = serde_json::to_value(
+            sign_json_envelope(
+                &[seed; 32],
+                payload,
+                request["deviceId"].as_str().unwrap(),
+                "MATCH/1",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        request
+    }
     fn update_resource(
         &self,
         kind: &str,
@@ -373,6 +395,73 @@ async fn given_forged_device_signature_when_bootstrapping_management_then_no_pol
     assert!(
         !read.status().is_success(),
         "unsigned status must not disclose management capability"
+    );
+}
+
+#[tokio::test]
+async fn given_removed_device_when_active_owner_explicitly_restores_then_same_key_reconnects_and_can_be_removed_again()
+ {
+    let mut fixture = Fixture::new().await;
+    let first = fixture
+        .put(&fixture.update(0, vec![], None, 32))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap()["capability"]
+        .clone();
+    let device_id = device(33, &fixture.owner.identity).0;
+    let removal = fixture.update(1, vec![device_id.clone()], Some(first), 32);
+    let removed = fixture.put(&removal).await.json::<Value>().await.unwrap()["capability"].clone();
+    assert_eq!(
+        fixture
+            .challenge(33, Some(removed.clone()), RESOURCE)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        fixture
+            .put(&fixture.restoring_update(2, removed.clone(), &device_id, 33))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let restore = fixture.restoring_update(2, removed, &device_id, 32);
+    let response = fixture.put(&restore).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored = response.json::<Value>().await.unwrap()["capability"].clone();
+    assert_eq!(restored["payload"]["restoredDeviceIds"], json!([device_id]));
+    fixture.restart().await;
+    assert_eq!(
+        fixture
+            .challenge(33, Some(restored.clone()), RESOURCE)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(fixture.put(&removal).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        fixture
+            .status()
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["capability"],
+        restored
+    );
+    let response = fixture
+        .put(&fixture.update(3, vec![device_id], Some(restored), 32))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let removed_again = response.json::<Value>().await.unwrap()["capability"].clone();
+    assert_eq!(
+        fixture
+            .challenge(33, Some(removed_again), RESOURCE)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
     );
 }
 
