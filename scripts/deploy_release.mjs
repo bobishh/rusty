@@ -98,6 +98,14 @@ function ensureReleaseAlias(run, artifact, releaseId) {
   return { alias, sourceDigest };
 }
 
+function validateKamalConfig(run, configArgs, options) {
+  try {
+    run('kamal', ['config', ...configArgs], { ...options, stdio: ['ignore', 'ignore', 'ignore'] });
+  } catch (error) {
+    throw new Error(`Kamal config render failed before Rusty storage handoff (exit ${error?.status ?? 'unknown'})`);
+  }
+}
+
 function preparePublicImage(run, spec, version, artifact) {
   const args = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=20'];
   if (process.env.RUSTY_SSH_KEY_FILE) args.push('-i', process.env.RUSTY_SSH_KEY_FILE);
@@ -186,6 +194,7 @@ export async function deployRustyArtifact(artifact, releaseId, rawSpec = process
       DOCKER_REGISTRY_PASSWORD: process.env.DOCKER_REGISTRY_PASSWORD ?? token };
     const options = { cwd: infraDirectory, env: environment, timeout: 900000, stdio: 'inherit' };
     const configArgs = ['--skip-hooks', '--version', version, '--config-file', temporaryConfig];
+    validateKamalConfig(run, configArgs, options);
     preparePublicImage(run, spec, version, artifact);
     verifyPreparedImage(run, spec, version, artifact);
     try {

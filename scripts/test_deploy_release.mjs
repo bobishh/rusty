@@ -79,7 +79,10 @@ test('failed live reader-floor verification restores the previous writer', async
     const stopped = calls.findIndex(([command, args]) => command === 'ssh' && args.at(-1).includes("'stop'"));
     const pulled = calls.findIndex(([command, args, options]) => command === 'ssh' && options.input?.includes('docker --config "$config_dir" pull'));
     const prepared = calls.findIndex(([command, args, options]) => command === 'ssh' && options.input?.includes('docker image inspect'));
+    const rendered = calls.findIndex(([command, args]) => command === 'kamal' && args[0] === 'config');
     assert.ok(pulled >= 0 && prepared > pulled && stopped > prepared, 'the exact image must be pulled and verified before stopping the previous writer');
+    assert.ok(rendered >= 0 && stopped > rendered, 'Kamal must render the deployment config before stopping the previous writer');
+    assert.deepEqual(calls[rendered][2].stdio, ['ignore', 'ignore', 'ignore'], 'rendered config and secret values must stay out of logs');
     assert.ok(calls.some(([command, args]) => command === 'kamal' && args[0] === 'app' && args[1] === 'boot'));
     assert.ok(!calls.some(([command, args]) => command === 'kamal' && args[0] === 'deploy'), 'activation must not delete and pull the prepared image again after stopping storage');
     calls.length = 0;
@@ -100,6 +103,17 @@ test('failed live reader-floor verification restores the previous writer', async
       }, readConfig: () => config, writeConfig: () => {}, unlinkConfig: () => {},
     }), /sealed Rusty image digest/);
     assert.ok(!calls.some(([command, args]) => command === 'ssh' && args.at(-1).includes("'stop'")), 'wrong prepared image must leave the running writer untouched');
+    calls.length = 0;
+    await assert.rejects(deployRustyArtifact(artifact, 'a'.repeat(64), spec, {
+      run: (command, args, options = {}) => {
+        if (command === 'kamal' && args[0] === 'config') {
+          calls.push([command, args, options]);
+          throw Object.assign(new Error('private config detail'), { status: 2 });
+        }
+        return run(command, args, options);
+      }, readConfig: () => config, writeConfig: () => {}, unlinkConfig: () => {},
+    }), /Kamal config render failed before Rusty storage handoff \(exit 2\)/);
+    assert.ok(!calls.some(([command, args]) => command === 'ssh' && args.at(-1).includes("'stop'")), 'invalid Kamal config must leave the running writer untouched');
   } finally {
     if (oldWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
     else process.env.GITHUB_WORKSPACE = oldWorkspace;
