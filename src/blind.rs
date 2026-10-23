@@ -5483,13 +5483,15 @@ async fn identity_authority_update(
             })),
         )),
         Err((message, None)) => {
-            let status = if message.contains("signature")
-                || message.contains("revoked")
-                || message.contains("active")
-                || message.contains("authority")
+            let normalized = message.to_ascii_lowercase();
+            let status = if normalized.contains("signature")
+                || normalized.contains("revoked")
+                || normalized.contains("active")
+                || normalized.contains("authority")
+                || normalized.contains("retired")
             {
                 StatusCode::FORBIDDEN
-            } else if message.contains("nonce") || message.contains("expiry") {
+            } else if normalized.contains("nonce") || normalized.contains("expiry") {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::BAD_REQUEST

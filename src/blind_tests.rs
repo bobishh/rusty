@@ -291,6 +291,13 @@ async fn root_succession_http_commits_dual_root_transition_and_retires_old_ident
         origin,
         now_ms().unwrap(),
     );
+    let response = client
+        .put(format!("{url}/v2/identity/authority"))
+        .json(&old_update)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let store_for_update = store.clone();
     let origin_for_update = origin.to_owned();
     assert!(
