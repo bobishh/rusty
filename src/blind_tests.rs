@@ -1,5 +1,990 @@
 use super::*;
 
+#[tokio::test]
+async fn browser_cors_preflight_allows_configured_clients_and_identity_proof_headers() {
+    let directory =
+        std::env::temp_dir().join(format!("rusty-identity-cors-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service_origin = format!("http://{}", listener.local_addr().unwrap());
+    let configured_origins = vec![
+        "http://localhost:4173".to_owned(),
+        "http://localhost:5173".to_owned(),
+    ];
+    let app = router(
+        store.clone(),
+        service_origin.clone(),
+        configured_origins.clone(),
+    )
+    .unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    for client_origin in &configured_origins {
+        for path in [
+            "/v2/identity/authority",
+            "/v2/identity/succession",
+            "/v2/scopes/cors-scope/purpose",
+            "/v2/scopes/cors-scope/authority",
+            "/v2/scopes/cors-scope/principals/cors-grant",
+            "/v2/identity/succession/person_1/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            let response = client
+                .request(reqwest::Method::OPTIONS, format!("{service_origin}{path}"))
+                .header("origin", client_origin)
+                .header("access-control-request-method", "PUT")
+                .header(
+                    "access-control-request-headers",
+                    "authorization,content-type,x-rusty-identity-proof,x-rusty-request-id",
+                )
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "preflight failed for {path}"
+            );
+            assert_eq!(
+                response.headers()["access-control-allow-origin"],
+                client_origin.as_str()
+            );
+            let allowed_headers = response.headers()["access-control-allow-headers"]
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase();
+            for header in [
+                "authorization",
+                "content-type",
+                "x-rusty-identity-proof",
+                "x-rusty-request-id",
+            ] {
+                assert!(
+                    allowed_headers.contains(header),
+                    "missing CORS header {header} for {path}"
+                );
+            }
+        }
+    }
+
+    let error = client
+        .get(format!(
+            "{service_origin}/v2/identity/authority/person/status"
+        ))
+        .header("origin", &configured_origins[0])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.headers()["access-control-allow-origin"],
+        configured_origins[0].as_str()
+    );
+
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn identity_succession_status_http_returns_signed_bound_missing_state() {
+    let directory = std::env::temp_dir().join(format!(
+        "rusty-identity-succession-status-{}",
+        rand::random::<u64>()
+    ));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let app = router(store.clone(), origin.clone(), vec![]).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let previous_person_id = "previous_person";
+    let transition_hash = URL_SAFE_NO_PAD.encode([42; 32]);
+    let request_id = URL_SAFE_NO_PAD.encode([43; 32]);
+    let request_hash = crate::identity_authority::identity_succession_status_request_hash(
+        previous_person_id,
+        &transition_hash,
+        &request_id,
+    )
+    .unwrap();
+    let response = client
+        .get(format!(
+            "{origin}/v2/identity/succession/{previous_person_id}/{transition_hash}?requestId={request_id}&requestHash={request_hash}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let status: SignedEnvelope<Value> = serde_json::from_value(body["status"].clone()).unwrap();
+    assert!(verify_signed_envelope(&status, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(
+        status.payload["kind"],
+        "rusty-identity-root-succession-status"
+    );
+    assert_eq!(status.payload["origin"], origin);
+    assert_eq!(status.payload["previousPersonId"], previous_person_id);
+    assert_eq!(status.payload["transitionHash"], transition_hash);
+    assert_eq!(status.payload["requestId"], request_id);
+    assert_eq!(status.payload["requestHash"], request_hash);
+    assert_eq!(status.payload["state"], "missing");
+    assert_eq!(status.payload["retired"], false);
+    assert_eq!(status.payload["receipt"], Value::Null);
+
+    let mismatch = client
+        .get(format!(
+            "{origin}/v2/identity/succession/{previous_person_id}/{transition_hash}?requestId={request_id}&requestHash={}",
+            URL_SAFE_NO_PAD.encode([44; 32])
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn root_succession_http_commits_dual_root_transition_and_retires_old_identity() {
+    use crate::identity_authority::{
+        test_authority_update_request, test_authority_view_with_devices,
+        test_identity_root_succession_request,
+    };
+    use meta_mesh_core::{PublicIdentity, public_key_from_seed, public_key_id};
+
+    let directory = std::env::temp_dir().join(format!(
+        "rusty-identity-succession-{}",
+        rand::random::<u64>()
+    ));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let old_root = [61; 32];
+    let old_device = [62; 32];
+    let new_root = [63; 32];
+    let new_device = [64; 32];
+    let old_key = public_key_from_seed(&old_root).unwrap();
+    let new_key = public_key_from_seed(&new_root).unwrap();
+    let old_identity = PublicIdentity {
+        person_id: public_key_id(&old_key).unwrap(),
+        public_key: old_key,
+        display_name: String::new(),
+    };
+    let new_identity = PublicIdentity {
+        person_id: public_key_id(&new_key).unwrap(),
+        public_key: new_key,
+        display_name: String::new(),
+    };
+    let old_view = test_authority_view_with_devices(&old_identity, &old_root, &[(62, true)]);
+    let new_view = test_authority_view_with_devices(&new_identity, &new_root, &[(64, false)]);
+    let service_id = public_key_id(&store.public_key().unwrap()).unwrap();
+    let origin = "https://rusty.example";
+    let now = now_ms().unwrap();
+    let old_update =
+        test_authority_update_request(old_view.clone(), &old_device, &service_id, origin, now);
+    let store_for_update = store.clone();
+    let origin_for_update = origin.to_owned();
+    tokio::task::spawn_blocking(move || {
+        store_for_update.update_identity_authority(old_update, &origin_for_update)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let new_update = test_authority_update_request(new_view, &new_device, &service_id, origin, now);
+    let store_for_update = store.clone();
+    let origin_for_update = origin.to_owned();
+    tokio::task::spawn_blocking(move || {
+        store_for_update.update_identity_authority(new_update, &origin_for_update)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let request = test_identity_root_succession_request(
+        &old_identity,
+        &old_root,
+        &old_view,
+        &new_identity,
+        &new_root,
+        &new_device,
+        &service_id,
+        origin,
+        now,
+    );
+    let transition_hash = crate::identity_authority::canonical_hash(&request.succession).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app = router(store.clone(), origin.into(), vec![]).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let response = client
+        .put(format!("{url}/v2/identity/succession"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        !store
+            .identity_succession_path(&old_identity.person_id)
+            .unwrap()
+            .exists()
+    );
+    assert!(
+        fs::read_dir(directory.join("management/records"))
+            .map(|entries| entries.count() == 0)
+            .unwrap_or(true)
+    );
+    store.enable_identity_authority_enforcement().unwrap();
+    let response = client
+        .put(format!("{url}/v2/identity/succession"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{:?}",
+        response.text().await
+    );
+    let receipt: Value = client
+        .put(format!("{url}/v2/identity/succession"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let receipt: SignedEnvelope<Value> =
+        serde_json::from_value(receipt["receipt"].clone()).unwrap();
+    assert!(verify_signed_envelope(&receipt, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(receipt.payload["retired"], true);
+    assert!(store.identity_is_retired(&old_identity.person_id).unwrap());
+
+    let request_id = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let request_hash = crate::identity_authority::identity_succession_status_request_hash(
+        &old_identity.person_id,
+        &transition_hash,
+        &request_id,
+    )
+    .unwrap();
+    let status: Value = client
+        .get(format!(
+            "{url}/v2/identity/succession/{}/{transition_hash}?requestId={request_id}&requestHash={request_hash}",
+            old_identity.person_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["status"]["payload"]["state"], "ready");
+    assert_eq!(status["status"]["payload"]["retired"], true);
+
+    let old_update = test_authority_update_request(
+        old_view,
+        &old_device,
+        &service_id,
+        origin,
+        now_ms().unwrap(),
+    );
+    let store_for_update = store.clone();
+    let origin_for_update = origin.to_owned();
+    assert!(
+        tokio::task::spawn_blocking(move || {
+            store_for_update.update_identity_authority(old_update, &origin_for_update)
+        })
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(
+        !store
+            .identity_device_active(
+                &old_identity,
+                &public_key_id(&public_key_from_seed(&old_device).unwrap()).unwrap()
+            )
+            .unwrap()
+    );
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn root_succession_refuses_retirement_while_workspace_control_stays_with_old_root() {
+    let directory = std::env::temp_dir().join(format!(
+        "rusty-identity-succession-scope-{}",
+        rand::random::<u64>()
+    ));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let (_, _, _, old_person_id) = owner_controller_fixture();
+    let policy_path = store.scope_dir("opaque-scope").unwrap().join("policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy["ownerPersonId"] = json!(old_person_id);
+    policy["scopePurpose"] = json!("workspace");
+    atomic_write(&policy_path, &serde_json::to_vec(&policy).unwrap()).unwrap();
+
+    let error = store
+        .root_succession_targets(&old_person_id, "successor_person", now_ms().unwrap())
+        .unwrap_err();
+    assert!(error.contains("no accepted controller history"));
+    assert!(!store.identity_is_retired(&old_person_id).unwrap());
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn identity_authority_mode_is_signed_and_strict_cutover_persists() {
+    let directory =
+        std::env::temp_dir().join(format!("rusty-identity-mode-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    assert_eq!(store.identity_authority_enforcement()["mode"], "additive");
+    assert_eq!(store.identity_authority_enforcement()["epoch"], 0);
+
+    let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let request_hash = crate::identity_authority::status_request_hash(&format!(
+        "/v2/identity/authority/person/status?nonce={nonce}"
+    ))
+    .unwrap();
+    let status = store
+        .signed_identity_authority_status("person", "https://rusty.example", &nonce, &request_hash)
+        .unwrap();
+    assert!(verify_signed_envelope(&status, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(status.payload["enforcement"]["mode"], "additive");
+    assert_eq!(status.payload["enforcement"]["epoch"], 0);
+
+    store.enable_identity_authority_enforcement().unwrap();
+    assert_eq!(store.identity_authority_enforcement()["mode"], "strict");
+    assert_eq!(store.identity_authority_enforcement()["epoch"], 1);
+    drop(store);
+
+    let reopened = BlindStore::open(directory.clone()).unwrap();
+    assert_eq!(reopened.identity_authority_enforcement()["mode"], "strict");
+    assert_eq!(reopened.identity_authority_enforcement()["epoch"], 1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn scope_routes_allow_legacy_only_before_strict_authority_cutover() {
+    async fn get_inventory(strict: bool) -> StatusCode {
+        let directory =
+            std::env::temp_dir().join(format!("rusty-proof-gate-{}", rand::random::<u64>()));
+        let store = BlindStore::open(directory.clone()).unwrap();
+        if strict {
+            store.enable_identity_authority_enforcement().unwrap();
+        }
+        let app = router(store, "https://rusty.example".into(), Vec::new()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v2/scopes/scope/objects",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::Client::new()
+            .get(url)
+            .header("authorization", "Bearer test-token")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(directory).unwrap();
+        status
+    }
+
+    let additive_status = get_inventory(false).await;
+    assert_ne!(additive_status, StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(get_inventory(true).await, StatusCode::PRECONDITION_REQUIRED);
+}
+
+#[test]
+fn active_app_leaf_can_use_owner_scope_then_revocation_invalidates_its_old_proof() {
+    use crate::identity_authority::{
+        test_authority_update_request, test_authority_view_with_devices,
+        test_revoke_authority_device, test_signed_identity_request_proof,
+    };
+    use meta_mesh_core::{PublicIdentity, public_key_id};
+
+    let directory =
+        std::env::temp_dir().join(format!("rusty-identity-data-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let (identity_value, _, _, owner_person_id) = owner_controller_fixture();
+    let identity: PublicIdentity = serde_json::from_value(identity_value).unwrap();
+    let mut policy: Value = serde_json::from_slice(
+        &fs::read(store.scope_dir("opaque-scope").unwrap().join("policy.json")).unwrap(),
+    )
+    .unwrap();
+    policy["ownerPersonId"] = json!(owner_person_id);
+    atomic_write(
+        &store.scope_dir("opaque-scope").unwrap().join("policy.json"),
+        &serde_json::to_vec(&policy).unwrap(),
+    )
+    .unwrap();
+
+    let origin = "https://rusty.example";
+    let service_id = public_key_id(&store.public_key().unwrap()).unwrap();
+    let view = test_authority_view_with_devices(&identity, &[31; 32], &[(32, true), (33, false)]);
+    let update = test_authority_update_request(
+        view.clone(),
+        &[33; 32],
+        &service_id,
+        origin,
+        now_ms().unwrap(),
+    );
+    store.update_identity_authority(update, origin).unwrap();
+
+    let path = "/v2/scopes/opaque-scope/objects";
+    let proof = test_signed_identity_request_proof(
+        &view,
+        &[33; 32],
+        origin,
+        &service_id,
+        "opaque-scope",
+        &"r".repeat(43),
+        "GET",
+        path,
+        b"",
+        "read",
+        1,
+        None,
+        now_ms().unwrap(),
+    );
+    store
+        .verify_identity_request_proof(
+            &proof,
+            "opaque-scope",
+            "read",
+            &"r".repeat(43),
+            "GET",
+            path,
+            b"",
+            origin,
+        )
+        .unwrap();
+
+    let revoked_device =
+        public_key_id(&meta_mesh_core::public_key_from_seed(&[33; 32]).unwrap()).unwrap();
+    let revoked_view = test_revoke_authority_device(view, &revoked_device, &[32; 32]);
+    let update = test_authority_update_request(
+        revoked_view,
+        &[32; 32],
+        &service_id,
+        origin,
+        now_ms().unwrap(),
+    );
+    store.update_identity_authority(update, origin).unwrap();
+    assert!(
+        store
+            .verify_identity_request_proof(
+                &proof,
+                "opaque-scope",
+                "read",
+                &"r".repeat(43),
+                "GET",
+                path,
+                b"",
+                origin,
+            )
+            .is_err(),
+        "Revocation must invalidate an already-issued data request proof"
+    );
+
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn transferred_workspace_controller_replaces_immutable_policy_owner_for_data_proofs() {
+    use crate::identity_authority::{
+        StoredScopeAuthority, test_authority_update_request, test_authority_view_with_devices,
+        test_signed_identity_request_proof,
+    };
+    use meta_mesh_core::{
+        PublicIdentity, ScopeAuthority, ScopeAuthoritySnapshot, ScopeControlTransferPayload,
+        ScopeGenesisPayloadInput, create_scope_genesis_payload, public_key_from_seed,
+        public_key_id, sign_scope_record,
+    };
+
+    let directory =
+        std::env::temp_dir().join(format!("rusty-transferred-owner-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let old_key = public_key_from_seed(&[31; 32]).unwrap();
+    let old_identity = PublicIdentity {
+        person_id: public_key_id(&old_key).unwrap(),
+        public_key: old_key,
+        display_name: String::new(),
+    };
+    let successor_key = public_key_from_seed(&[40; 32]).unwrap();
+    let successor_identity = PublicIdentity {
+        person_id: public_key_id(&successor_key).unwrap(),
+        public_key: successor_key,
+        display_name: String::new(),
+    };
+    let old_view = test_authority_view_with_devices(&old_identity, &[31; 32], &[(32, true)]);
+    let successor_view =
+        test_authority_view_with_devices(&successor_identity, &[40; 32], &[(41, false)]);
+    let service_id = public_key_id(&store.public_key().unwrap()).unwrap();
+    let origin = "https://rusty.example";
+    store
+        .update_identity_authority(
+            test_authority_update_request(
+                old_view.clone(),
+                &[32; 32],
+                &service_id,
+                origin,
+                now_ms().unwrap(),
+            ),
+            origin,
+        )
+        .unwrap();
+    store
+        .update_identity_authority(
+            test_authority_update_request(
+                successor_view.clone(),
+                &[41; 32],
+                &service_id,
+                origin,
+                now_ms().unwrap(),
+            ),
+            origin,
+        )
+        .unwrap();
+
+    let scope_id = "opaque-scope";
+    let old_controller = ScopeAuthority {
+        person_id: old_identity.person_id.clone(),
+        public_key: old_identity.public_key.clone(),
+        certificates: old_view.certificates.clone(),
+    };
+    let successor_controller = ScopeAuthority {
+        person_id: successor_identity.person_id.clone(),
+        public_key: successor_identity.public_key.clone(),
+        certificates: successor_view.certificates.clone(),
+    };
+    let genesis = sign_scope_record(
+        &[32; 32],
+        create_scope_genesis_payload(ScopeGenesisPayloadInput {
+            scope_id: scope_id.into(),
+            creator: old_controller.clone(),
+        })
+        .unwrap(),
+        public_key_id(&public_key_from_seed(&[32; 32]).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let transfer = sign_scope_record(
+        &[32; 32],
+        ScopeControlTransferPayload {
+            kind: "scope-control-transfer".into(),
+            version: 1,
+            scope_id: scope_id.into(),
+            from_controller_person_id: old_identity.person_id.clone(),
+            to_controller: successor_controller,
+            from_control_epoch: 1,
+            to_control_epoch: 2,
+        },
+        public_key_id(&public_key_from_seed(&[32; 32]).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let snapshot = ScopeAuthoritySnapshot {
+        genesis,
+        grants: Vec::new(),
+        grant_issuers: Vec::new(),
+        revocations: Vec::new(),
+        control_transfers: vec![transfer],
+        succession_transfers: Vec::new(),
+    };
+    let scope_dir = store.scope_dir(scope_id).unwrap();
+    let mut policy: Value =
+        serde_json::from_slice(&fs::read(scope_dir.join("policy.json")).unwrap()).unwrap();
+    policy["ownerPersonId"] = json!(old_identity.person_id);
+    policy["scopePurpose"] = json!("workspace");
+    atomic_write(
+        &scope_dir.join("policy.json"),
+        &serde_json::to_vec(&policy).unwrap(),
+    )
+    .unwrap();
+    atomic_write(
+        &store.scope_authority_path(scope_id).unwrap(),
+        &serde_json::to_vec(&StoredScopeAuthority {
+            snapshot,
+            recent_updates: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let path = "/v2/scopes/opaque-scope/objects";
+    let token = "r".repeat(43);
+    let successor_proof = test_signed_identity_request_proof(
+        &successor_view,
+        &[41; 32],
+        origin,
+        &service_id,
+        scope_id,
+        &token,
+        "GET",
+        path,
+        b"",
+        "read",
+        1,
+        None,
+        now_ms().unwrap(),
+    );
+    store
+        .verify_identity_request_proof(
+            &successor_proof,
+            scope_id,
+            "read",
+            &token,
+            "GET",
+            path,
+            b"",
+            origin,
+        )
+        .unwrap();
+
+    let old_proof = test_signed_identity_request_proof(
+        &old_view,
+        &[32; 32],
+        origin,
+        &service_id,
+        scope_id,
+        &token,
+        "GET",
+        path,
+        b"",
+        "read",
+        1,
+        None,
+        now_ms().unwrap(),
+    );
+    assert!(
+        store
+            .verify_identity_request_proof(
+                &old_proof, scope_id, "read", &token, "GET", path, b"", origin,
+            )
+            .is_err()
+    );
+
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn authority_http_contract_accepts_app_leaf_and_rejects_proof_after_revocation() {
+    use crate::identity_authority::{
+        test_authority_update_request, test_authority_view_with_devices,
+        test_revoke_authority_device, test_signed_identity_request_proof,
+    };
+    use meta_mesh_core::{PublicIdentity, public_key_id};
+
+    let directory =
+        std::env::temp_dir().join(format!("rusty-identity-http-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let (identity_value, _, _, owner_person_id) = owner_controller_fixture();
+    let identity: PublicIdentity = serde_json::from_value(identity_value).unwrap();
+    let policy_path = store.scope_dir("opaque-scope").unwrap().join("policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy["ownerPersonId"] = json!(owner_person_id);
+    atomic_write(&policy_path, &serde_json::to_vec(&policy).unwrap()).unwrap();
+    store.enable_identity_authority_enforcement().unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let service_id = public_key_id(&store.public_key().unwrap()).unwrap();
+    let app = router(store.clone(), origin.clone(), vec![]).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let view = test_authority_view_with_devices(&identity, &[31; 32], &[(32, true), (33, false)]);
+
+    let missing_nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let missing_response = client
+        .get(format!(
+            "{origin}/v2/identity/authority/{}/status?nonce={missing_nonce}",
+            identity.person_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), StatusCode::OK);
+    let missing_body: Value = missing_response.json().await.unwrap();
+    assert_eq!(missing_body.as_object().unwrap().len(), 1);
+    let missing: SignedEnvelope<Value> =
+        serde_json::from_value(missing_body["status"].clone()).unwrap();
+    assert!(verify_signed_envelope(&missing, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(missing.payload["state"], "missing");
+    assert!(missing.payload["view"].is_null());
+    assert_eq!(missing.payload["requestNonce"], missing_nonce);
+    assert_eq!(missing.payload["enforcement"]["mode"], "strict");
+
+    let update = test_authority_update_request(
+        view.clone(),
+        &[33; 32],
+        &service_id,
+        &origin,
+        now_ms().unwrap(),
+    );
+    let response = client
+        .put(format!("{origin}/v2/identity/authority"))
+        .json(&update)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: Value = response.json().await.unwrap();
+    let receipt: SignedEnvelope<Value> =
+        serde_json::from_value(receipt["receipt"].clone()).unwrap();
+    assert!(verify_signed_envelope(&receipt, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(receipt.payload["enforcement"]["mode"], "strict");
+    assert_eq!(receipt.payload["enforcement"]["epoch"], 1);
+
+    let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let status: Value = client
+        .get(format!(
+            "{origin}/v2/identity/authority/{}/status?nonce={nonce}",
+            identity.person_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let status: SignedEnvelope<Value> = serde_json::from_value(status["status"].clone()).unwrap();
+    assert!(verify_signed_envelope(&status, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(status.payload["state"], "ready");
+    assert_eq!(status.payload["enforcement"]["mode"], "strict");
+    assert_eq!(status.payload["view"]["viewDigest"], view.view_digest);
+
+    let path = "/v2/scopes/opaque-scope/objects";
+    let proof = test_signed_identity_request_proof(
+        &view,
+        &[33; 32],
+        &origin,
+        &service_id,
+        "opaque-scope",
+        &"r".repeat(43),
+        "GET",
+        path,
+        b"",
+        "read",
+        1,
+        None,
+        now_ms().unwrap(),
+    );
+    let proof_header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&proof).unwrap());
+    let response = client
+        .get(format!("{origin}{path}"))
+        .bearer_auth("r".repeat(43))
+        .header("x-rusty-identity-proof", &proof_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.unwrap();
+
+    let revoked_device =
+        public_key_id(&meta_mesh_core::public_key_from_seed(&[33; 32]).unwrap()).unwrap();
+    let revoked_view = test_revoke_authority_device(view, &revoked_device, &[32; 32]);
+    let update = test_authority_update_request(
+        revoked_view,
+        &[32; 32],
+        &service_id,
+        &origin,
+        now_ms().unwrap(),
+    );
+    assert_eq!(
+        client
+            .put(format!("{origin}/v2/identity/authority"))
+            .json(&update)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let response = client
+        .get(format!("{origin}{path}"))
+        .bearer_auth("r".repeat(43))
+        .header("x-rusty-identity-proof", proof_header)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
+
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn scope_authority_http_contract_registers_and_returns_signed_snapshot() {
+    use crate::identity_authority::{
+        ScopeAuthorityUpdateAuthorization, ScopeAuthorityUpdateRequest,
+        scope_authority_status_request_hash, test_authority_update_request,
+        test_authority_view_with_devices,
+    };
+    use meta_mesh_core::{
+        PublicIdentity, ScopeAuthority, ScopeAuthoritySnapshot, ScopeGenesisPayloadInput,
+        create_scope_genesis_payload, public_key_from_seed, public_key_id, sign_json_envelope,
+        sign_scope_record,
+    };
+
+    let directory = std::env::temp_dir().join(format!(
+        "rusty-scope-authority-http-{}",
+        rand::random::<u64>()
+    ));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let owner_seed = [70; 32];
+    let manager_seed = [71; 32];
+    let identity_key = public_key_from_seed(&owner_seed).unwrap();
+    let identity = PublicIdentity {
+        person_id: public_key_id(&identity_key).unwrap(),
+        public_key: identity_key,
+        display_name: String::new(),
+    };
+    let view = test_authority_view_with_devices(&identity, &owner_seed, &[(71, true)]);
+    let service_id = public_key_id(&store.public_key().unwrap()).unwrap();
+    let update = test_authority_update_request(
+        view.clone(),
+        &manager_seed,
+        &service_id,
+        &origin,
+        now_ms().unwrap(),
+    );
+    let authority_store = store.clone();
+    let authority_origin = origin.clone();
+    tokio::task::spawn_blocking(move || {
+        authority_store.update_identity_authority(update, &authority_origin)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let policy_path = store.scope_dir("opaque-scope").unwrap().join("policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy["ownerPersonId"] = json!(identity.person_id);
+    policy["scopePurpose"] = json!("workspace");
+    atomic_write(&policy_path, &serde_json::to_vec(&policy).unwrap()).unwrap();
+
+    let controller = ScopeAuthority {
+        person_id: identity.person_id.clone(),
+        public_key: identity.public_key.clone(),
+        certificates: view.certificates.clone(),
+    };
+    let genesis_payload = create_scope_genesis_payload(ScopeGenesisPayloadInput {
+        scope_id: "opaque-scope".into(),
+        creator: controller,
+    })
+    .unwrap();
+    let genesis = sign_scope_record(
+        &manager_seed,
+        genesis_payload,
+        public_key_id(&public_key_from_seed(&manager_seed).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let snapshot = ScopeAuthoritySnapshot {
+        genesis,
+        grants: Vec::new(),
+        grant_issuers: Vec::new(),
+        revocations: Vec::new(),
+        control_transfers: Vec::new(),
+        succession_transfers: Vec::new(),
+    };
+    let request_id = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let mut request = ScopeAuthorityUpdateRequest {
+        version: 1,
+        scope_authority: snapshot,
+        authorization: SignedEnvelope {
+            payload: json!({}),
+            signer_key_id: String::new(),
+            signature: String::new(),
+        },
+    };
+    let request_hash = request.request_hash().unwrap();
+    let issued_at = now_ms().unwrap();
+    request.authorization = sign_json_envelope(
+        &manager_seed,
+        serde_json::to_value(ScopeAuthorityUpdateAuthorization {
+            kind: "rusty-scope-authority-update".into(),
+            version: 1,
+            service_id: service_id.clone(),
+            origin: origin.clone(),
+            scope_id: "opaque-scope".into(),
+            workspace_id: "opaque-scope".into(),
+            person_id: identity.person_id.clone(),
+            device_id: public_key_id(&public_key_from_seed(&manager_seed).unwrap()).unwrap(),
+            control_epoch: 1,
+            request_id: request_id.clone(),
+            issued_at,
+            expires_at: issued_at + 60_000,
+            request_hash,
+        })
+        .unwrap(),
+        public_key_id(&public_key_from_seed(&manager_seed).unwrap()).unwrap(),
+        crate::identity_authority::SIGNATURE_DOMAIN,
+    )
+    .unwrap();
+
+    let app = router(store.clone(), origin.clone(), vec![]).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let response = client
+        .put(format!("{origin}/v2/scopes/opaque-scope/authority"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let response_status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(response_status, StatusCode::OK, "{body}");
+    let receipt: SignedEnvelope<Value> = serde_json::from_value(body["receipt"].clone()).unwrap();
+    assert!(verify_signed_envelope(&receipt, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(receipt.payload["controllerPersonId"], identity.person_id);
+    assert_eq!(receipt.payload["enforcement"]["mode"], "additive");
+
+    let request_id = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let request_hash = scope_authority_status_request_hash("opaque-scope", &request_id).unwrap();
+    let body: Value = client
+        .get(format!(
+            "{origin}/v2/scopes/opaque-scope/authority/status?requestId={request_id}&requestHash={request_hash}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let status: SignedEnvelope<Value> = serde_json::from_value(body["status"].clone()).unwrap();
+    assert!(verify_signed_envelope(&status, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(status.payload["state"], "ready");
+    assert_eq!(status.payload["requestId"], request_id);
+    assert_eq!(status.payload["requestHash"], request_hash);
+    assert_eq!(
+        status.payload["scopeAuthority"]["genesis"]["payload"]["scopeId"],
+        "opaque-scope"
+    );
+
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn otlp_log_records(payload: &Value) -> Vec<Value> {
     payload["resourceLogs"]
         .as_array()

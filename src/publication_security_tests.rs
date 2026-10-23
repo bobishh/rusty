@@ -55,6 +55,128 @@ fn given_enrolled_device_when_publishing_then_trusted_controller_delegation_is_a
     assert!(fixture.mutate(request).is_ok());
 }
 
+#[tokio::test]
+async fn root_replacement_transfers_publication_owner_to_successor_app_device() {
+    use crate::identity_authority::{
+        test_authority_update_request, test_authority_view_with_devices,
+        test_identity_root_succession_request,
+    };
+
+    let fixture = Fixture::new();
+    fixture.publish();
+    let old_view =
+        test_authority_view_with_devices(&fixture.owner.identity, &[61; 32], &[(62, true)]);
+    let new_root_seed = [73; 32];
+    let new_identity_key = public_key_from_seed(&new_root_seed).unwrap();
+    let new_identity = PublicIdentity {
+        person_id: public_key_id(&new_identity_key).unwrap(),
+        public_key: new_identity_key,
+        display_name: "Replacement root".into(),
+    };
+    let manager_seed = [74; 32];
+    let app_seed = [75; 32];
+    let new_view =
+        test_authority_view_with_devices(&new_identity, &new_root_seed, &[(74, true), (75, false)]);
+    let service_id = public_key_id(&fixture.store.public_key().unwrap()).unwrap();
+    let now = now_ms().unwrap();
+    let old_update =
+        test_authority_update_request(old_view.clone(), &[62; 32], &service_id, ORIGIN, now);
+    let new_update =
+        test_authority_update_request(new_view, &manager_seed, &service_id, ORIGIN, now);
+    let store = fixture.store.clone();
+    tokio::task::spawn_blocking(move || store.update_identity_authority(old_update, ORIGIN))
+        .await
+        .unwrap()
+        .unwrap();
+    let store = fixture.store.clone();
+    tokio::task::spawn_blocking(move || store.update_identity_authority(new_update, ORIGIN))
+        .await
+        .unwrap()
+        .unwrap();
+    let succession = test_identity_root_succession_request(
+        &fixture.owner.identity,
+        &[61; 32],
+        &old_view,
+        &new_identity,
+        &new_root_seed,
+        &manager_seed,
+        &service_id,
+        ORIGIN,
+        now_ms().unwrap(),
+    );
+    fixture
+        .store
+        .enable_identity_authority_enforcement()
+        .unwrap();
+    let store = fixture.store.clone();
+    tokio::task::spawn_blocking(move || store.update_identity_root_succession(succession, ORIGIN))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let publication = fixture.store.current_publication(BOARD).unwrap().unwrap();
+    assert_eq!(publication.controller_person_id, new_identity.person_id);
+    let owner = fixture
+        .store
+        .publication_owner(BOARD, &new_identity)
+        .expect("successor must resolve as publication owner");
+    assert_eq!(owner.identity.person_id, new_identity.person_id);
+
+    let app_public_key = public_key_from_seed(&app_seed).unwrap();
+    let app_device_id = public_key_id(&app_public_key).unwrap();
+    let app_certificate = sign_device_certificate(
+        &new_root_seed,
+        DeviceCertificatePayload {
+            kind: "device-certificate".into(),
+            version: 1,
+            person_id: new_identity.person_id.clone(),
+            device_id: app_device_id.clone(),
+            device_public_key: app_public_key,
+            issuer_certificate_hash: None,
+            can_enroll_devices: false,
+        },
+        &new_identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let challenge = fixture
+        .store
+        .create_public_challenge(
+            BOARD,
+            &new_identity.person_id,
+            &app_device_id,
+            &app_device_id,
+            ORIGIN,
+        )
+        .unwrap();
+    let value = projection();
+    let projection_hash = digest(canonicalize_json(&value).unwrap().as_bytes());
+    let payload = &challenge.payload;
+    let authorization = sign_json_envelope(
+        &app_seed,
+        json!({
+            "kind":"rusty-publication-command", "version":1,
+            "challengeId":payload["challengeId"], "nonce":payload["nonce"],
+            "serviceId":payload["serviceId"], "publicOrigin":ORIGIN,
+            "boardId":BOARD, "action":"update", "projectionHash":projection_hash,
+            "expectedRevision":payload["expectedRevision"], "expiresAt":payload["expiresAt"]
+        }),
+        &app_device_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let request: PublicMutationRequest = serde_json::from_value(json!({
+        "challenge":challenge, "identity":new_identity, "deviceId":app_device_id,
+        "certificates":[app_certificate], "action":"update", "projection":value,
+        "authorization":authorization
+    }))
+    .unwrap();
+    fixture
+        .store
+        .mutate_publication(BOARD, request, &owner, ORIGIN)
+        .expect("successor app-only device must retain public board administration");
+}
+
 #[test]
 fn given_forged_root_certificate_when_valid_certificate_is_appended_then_publication_stays_denied()
 {

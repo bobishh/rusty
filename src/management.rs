@@ -72,6 +72,21 @@ struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     person_management_capability: Option<SignedEnvelope<Value>>,
 }
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagementControllerTransfer {
+    kind: String,
+    version: u8,
+    resource_kind: String,
+    resource_id: String,
+    previous_record_hash: String,
+    previous_person_id: String,
+    successor_identity: PublicIdentity,
+    origin: String,
+    transition_hash: String,
+    capability: SignedEnvelope<Value>,
+    transferred_at: u64,
+}
 // Separate from the publication projection so existing readers retain their schema.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -80,6 +95,10 @@ struct PublicationOwner {
     version: u8,
     board_id: String,
     identity: PublicIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    succession_from_person_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    succession_transition_hash: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -215,6 +234,12 @@ impl BlindStore {
         if !allow_pending && self.management_pending("person", &identity.person_id)? {
             return Ok(false);
         }
+        // Identity revocation is deployment-wide authority, independent of the
+        // older per-person management capability. Fail closed until the current
+        // signed view has been registered with this Rusty service.
+        if !self.identity_device_active(identity, device_id)? {
+            return Ok(false);
+        }
         let Some(record) = self.management_record("person", &identity.person_id)? else {
             return Ok(true);
         };
@@ -230,15 +255,16 @@ impl BlindStore {
         id: &str,
         identity: &PublicIdentity,
     ) -> Result<bool, String> {
+        if let Some(record) = self.management_record(kind, id)? {
+            let effective = self.effective_management_identity(kind, id, &record)?;
+            return Ok(trusted_identity_matches(&effective, identity));
+        }
         if kind == "board"
             && self
                 .stored_publication_owner(id)?
                 .is_some_and(|owner| !trusted_identity_matches(&owner, identity))
         {
             return Ok(false);
-        }
-        if let Some(record) = self.management_record(kind, id)? {
-            return Ok(trusted_identity_matches(&record.identity, identity));
         }
         match kind {
             "scope" if self.policy_revision(id)? > 0 => Ok(self
@@ -350,17 +376,18 @@ impl BlindStore {
         let stored = self.stored_publication_owner(board_id)?;
         let publication = self.current_publication(board_id)?;
         if let Some(record) = self.management_record("board", board_id)? {
+            let effective = self.effective_management_identity("board", board_id, &record)?;
             if stored
                 .as_ref()
-                .is_some_and(|owner| !trusted_identity_matches(owner, &record.identity))
+                .is_some_and(|owner| !trusted_identity_matches(owner, &effective))
                 || publication.as_ref().is_some_and(|publication| {
-                    publication.controller_person_id != record.identity.person_id
+                    publication.controller_person_id != effective.person_id
                 })
             {
                 return Err("Publication owner management evidence conflict".into());
             }
             return Ok(ResourceOwner {
-                identity: record.identity,
+                identity: effective,
             });
         }
         if let Some(identity) = stored {
@@ -509,7 +536,8 @@ impl BlindStore {
             return Err("Unauthorized or revoked person management status device".into());
         }
         if let Some(record) = &record {
-            let cap = capability(&record.capability)?;
+            let effective_capability = self.effective_management_capability(kind, id, record)?;
+            let cap = capability(&effective_capability)?;
             if cap.origin != origin
                 || cap.person_id != request.identity.person_id
                 || cap.revoked_device_ids.contains(&request.device_id)
@@ -566,7 +594,10 @@ impl BlindStore {
         )?;
         sync_directory(&self.directory).map_err(|_| "Management status durability unavailable")?;
         let pending = self.management_pending(kind, id)?;
-        let confirmed_capability = record.map(|record| record.capability);
+        let confirmed_capability = record
+            .as_ref()
+            .map(|record| self.effective_management_capability(kind, id, record))
+            .transpose()?;
         let revision = confirmed_capability
             .as_ref()
             .map(|value| capability(value).map(|cap| cap.revision))
@@ -692,6 +723,375 @@ impl BlindStore {
         }
         Ok(index)
     }
+    fn management_transfer_path(&self, kind: &str, id: &str) -> Result<std::path::PathBuf, String> {
+        resource(kind, id)?;
+        Ok(self
+            .directory
+            .join("management/controller-transfers")
+            .join(kind)
+            .join(format!("{id}.json")))
+    }
+
+    fn management_controller_transfer(
+        &self,
+        kind: &str,
+        id: &str,
+        record: &Record,
+    ) -> Result<Option<ManagementControllerTransfer>, String> {
+        let path = self.management_transfer_path(kind, id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        if fs::metadata(&path)
+            .map_err(|_| "Management transfer unavailable")?
+            .len()
+            > MAX_RECORD_BYTES
+        {
+            return Err("Invalid management transfer size".into());
+        }
+        let envelope: SignedEnvelope<ManagementControllerTransfer> =
+            serde_json::from_slice(&fs::read(path).map_err(|_| "Management transfer unavailable")?)
+                .map_err(|_| "Invalid management transfer")?;
+        let transfer = envelope.payload.clone();
+        let index = self.management_index()?;
+        let key = resource(kind, id)?;
+        let Some(record_hash) = index.resources.get(&key) else {
+            return Err("Management transfer has no resource pointer".into());
+        };
+        let old_capability = capability(&record.capability)?;
+        let new_capability = capability(&transfer.capability)?;
+        let service_key = self.public_key()?;
+        let service_id = public_key_id(&service_key)?;
+        if record_hash != &transfer.previous_record_hash {
+            // A normal user-signed update replaced the projected historical record.
+            // The old sidecar is then inert and must not override the new record.
+            return Ok(None);
+        }
+        if envelope.signer_key_id != service_id
+            || !verify_signed_envelope(&envelope, &service_key, DOMAIN)?
+            || transfer.kind != "rusty-management-controller-transfer"
+            || transfer.version != 1
+            || transfer.resource_kind != kind
+            || transfer.resource_id != id
+            || transfer.previous_record_hash != *record_hash
+            || transfer.previous_person_id != record.identity.person_id
+            || public_key_id(&transfer.successor_identity.public_key)?
+                != transfer.successor_identity.person_id
+            || transfer.successor_identity.person_id == transfer.previous_person_id
+            || !valid_id(&transfer.transition_hash)
+            || transfer.origin != old_capability.origin
+            || transfer.transferred_at == 0
+            || transfer.capability.signer_key_id != service_id
+            || !verify_signed_envelope(&transfer.capability, &service_key, DOMAIN)?
+            || new_capability.service_id != service_id
+            || new_capability.origin != transfer.origin
+            || new_capability.person_id != transfer.successor_identity.person_id
+            || new_capability.resource_kind != kind
+            || new_capability.resource_id != id
+            || new_capability.revision != old_capability.revision.saturating_add(1)
+            || new_capability.operations != old_capability.operations
+            || new_capability.revoked_device_ids != old_capability.revoked_device_ids
+            || new_capability.restored_device_ids != old_capability.restored_device_ids
+        {
+            return Err("Management controller transfer integrity failure".into());
+        }
+        Ok(Some(transfer))
+    }
+
+    fn effective_management_identity(
+        &self,
+        kind: &str,
+        id: &str,
+        record: &Record,
+    ) -> Result<PublicIdentity, String> {
+        Ok(self
+            .management_controller_transfer(kind, id, record)?
+            .map(|transfer| transfer.successor_identity)
+            .unwrap_or_else(|| record.identity.clone()))
+    }
+
+    fn effective_management_capability(
+        &self,
+        kind: &str,
+        id: &str,
+        record: &Record,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        Ok(self
+            .management_controller_transfer(kind, id, record)?
+            .map(|transfer| transfer.capability)
+            .unwrap_or_else(|| record.capability.clone()))
+    }
+
+    pub(super) fn prepare_root_succession_management_transfers(
+        &self,
+        previous_person_id: &str,
+        successor_identity: &PublicIdentity,
+        transition_hash: &str,
+        origin: &str,
+    ) -> Result<Vec<crate::identity_authority::IdentityRootSuccessionTargetReceipt>, String> {
+        let service_key = self.public_key()?;
+        let service_id = public_key_id(&service_key)?;
+        if public_key_id(&successor_identity.public_key)? != successor_identity.person_id
+            || successor_identity.person_id == previous_person_id
+        {
+            return Err("Invalid Identity successor controller".into());
+        }
+        let mut targets = Vec::new();
+        let index = self.management_index()?;
+        for key in index.resources.keys() {
+            let (kind, id) = key.split_once('/').ok_or("Invalid management resource")?;
+            let Some(record) = self.management_record(kind, id)? else {
+                continue;
+            };
+            if record.identity.person_id != previous_person_id {
+                continue;
+            }
+            if kind == "person" {
+                // A person's self-management record is tied to the retired person ID.
+                // Resources created through it retain their own scoped capabilities.
+                continue;
+            }
+            let old_capability = capability(&record.capability)?;
+            if old_capability.origin != origin {
+                continue;
+            }
+            if let Some(existing) = self.management_controller_transfer(kind, id, &record)? {
+                if existing.transition_hash != transition_hash
+                    || existing.successor_identity.person_id != successor_identity.person_id
+                    || existing.successor_identity.public_key != successor_identity.public_key
+                {
+                    return Err(
+                        "Management resource already transferred to another Identity".into(),
+                    );
+                }
+                targets.push(
+                    crate::identity_authority::IdentityRootSuccessionTargetReceipt {
+                        kind: "management".into(),
+                        resource_id: key.clone(),
+                        evidence_hash: hash(&existing)?,
+                        epoch: Some(capability(&existing.capability)?.revision),
+                    },
+                );
+                continue;
+            }
+            let index_hash = index
+                .resources
+                .get(key)
+                .ok_or("Management resource pointer unavailable")?;
+            let revision = old_capability
+                .revision
+                .checked_add(1)
+                .ok_or("Management revision overflow")?;
+            let request_id = format!("succession-{}", &transition_hash[..32]);
+            let transfer_authorization_hash = hash(&json!({
+                "kind": "rusty-management-controller-transfer-authorization",
+                "version": 1,
+                "resourceKind": kind,
+                "resourceId": id,
+                "previousRecordHash": index_hash,
+                "previousPersonId": previous_person_id,
+                "successorPersonId": successor_identity.person_id,
+                "transitionHash": transition_hash,
+            }))?;
+            let capability_envelope = sign_json_envelope(
+                &self.seed,
+                serde_json::to_value(Capability {
+                    kind: old_capability.kind.clone(),
+                    version: 1,
+                    service_id: service_id.clone(),
+                    origin: origin.to_owned(),
+                    person_id: successor_identity.person_id.clone(),
+                    resource_kind: kind.to_owned(),
+                    resource_id: id.to_owned(),
+                    revision,
+                    operations: old_capability.operations.clone(),
+                    revoked_device_ids: old_capability.revoked_device_ids.clone(),
+                    restored_device_ids: old_capability.restored_device_ids.clone(),
+                    request_id,
+                    authorization_hash: transfer_authorization_hash,
+                    issued_at: now_ms()?,
+                })
+                .map_err(|_| "Management transfer capability invalid")?,
+                service_id.clone(),
+                DOMAIN,
+            )?;
+            let transfer = ManagementControllerTransfer {
+                kind: "rusty-management-controller-transfer".into(),
+                version: 1,
+                resource_kind: kind.to_owned(),
+                resource_id: id.to_owned(),
+                previous_record_hash: index_hash.clone(),
+                previous_person_id: previous_person_id.to_owned(),
+                successor_identity: successor_identity.clone(),
+                origin: origin.to_owned(),
+                transition_hash: transition_hash.to_owned(),
+                capability: capability_envelope,
+                transferred_at: now_ms()?,
+            };
+            let signed = sign_json_envelope(
+                &self.seed,
+                serde_json::to_value(&transfer).map_err(|_| "Management transfer invalid")?,
+                service_id.clone(),
+                DOMAIN,
+            )?;
+            let path = self.management_transfer_path(kind, id)?;
+            atomic_write(
+                &path,
+                &serde_json::to_vec(&signed).map_err(|_| "Management transfer invalid")?,
+            )?;
+            targets.push(
+                crate::identity_authority::IdentityRootSuccessionTargetReceipt {
+                    kind: "management".into(),
+                    resource_id: key.clone(),
+                    evidence_hash: hash(&signed)?,
+                    epoch: Some(revision),
+                },
+            );
+        }
+        self.transfer_publication_owners(
+            previous_person_id,
+            successor_identity,
+            transition_hash,
+            origin,
+            &service_id,
+            &mut targets,
+        )?;
+        Ok(targets)
+    }
+
+    fn transfer_publication_owners(
+        &self,
+        previous_person_id: &str,
+        successor_identity: &PublicIdentity,
+        transition_hash: &str,
+        origin: &str,
+        service_id: &str,
+        targets: &mut Vec<crate::identity_authority::IdentityRootSuccessionTargetReceipt>,
+    ) -> Result<(), String> {
+        let publications = self.directory.join("publications/records");
+        if !publications.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&publications).map_err(|_| "Publication storage unavailable")? {
+            let entry = entry.map_err(|_| "Publication storage unavailable")?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(board_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                return Err("Invalid publication resource path".into());
+            };
+            if !valid_id(board_id) {
+                return Err("Invalid publication resource ID".into());
+            }
+            let Some(mut publication) = self.current_publication(board_id)? else {
+                continue;
+            };
+            if publication.controller_person_id != previous_person_id
+                && publication.controller_person_id != successor_identity.person_id
+            {
+                continue;
+            }
+            let owner_path = self
+                .directory
+                .join("management/publication-owners")
+                .join(format!("{board_id}.json"));
+            if publication.controller_person_id == successor_identity.person_id
+                && !owner_path.exists()
+            {
+                // Already controlled by the successor, with no retained old owner
+                // evidence to move. Do not adopt it as a side effect of succession.
+                continue;
+            }
+            if owner_path.exists() {
+                let owner_envelope: SignedEnvelope<Value> = serde_json::from_slice(
+                    &fs::read(&owner_path).map_err(|_| "Publication owner unavailable")?,
+                )
+                .map_err(|_| "Invalid publication owner")?;
+                let owner: PublicationOwner =
+                    serde_json::from_value(owner_envelope.payload.clone())
+                        .map_err(|_| "Invalid publication owner")?;
+                if owner_envelope.signer_key_id != service_id
+                    || !verify_signed_envelope(&owner_envelope, &self.public_key()?, DOMAIN)?
+                    || owner.kind != "rusty-publication-owner"
+                    || owner.version != 1
+                    || owner.board_id != board_id
+                    || (owner.identity.person_id != previous_person_id
+                        && owner.identity.person_id != successor_identity.person_id)
+                {
+                    return Err("Publication owner succession binding conflict".into());
+                }
+                if owner.identity.person_id == successor_identity.person_id {
+                    if publication.controller_person_id != successor_identity.person_id {
+                        return Err(
+                            "Publication owner conflicts with its controller projection".into()
+                        );
+                    }
+                    if owner.succession_from_person_id.as_deref() == Some(previous_person_id)
+                        && owner.succession_transition_hash.as_deref() == Some(transition_hash)
+                    {
+                        targets.push(
+                            crate::identity_authority::IdentityRootSuccessionTargetReceipt {
+                                kind: "publication".into(),
+                                resource_id: board_id.to_owned(),
+                                evidence_hash: hash(&owner_envelope)?,
+                                epoch: Some(publication.revision),
+                            },
+                        );
+                    } else if owner.succession_from_person_id.is_some()
+                        || owner.succession_transition_hash.is_some()
+                    {
+                        return Err(
+                            "Publication was transferred by another Identity succession".into()
+                        );
+                    }
+                    // An independently successor-owned publication needs no transfer.
+                    continue;
+                }
+            }
+            let new_owner = sign_json_envelope(
+                &self.seed,
+                serde_json::to_value(PublicationOwner {
+                    kind: "rusty-publication-owner".into(),
+                    version: 1,
+                    board_id: board_id.to_owned(),
+                    identity: successor_identity.clone(),
+                    succession_from_person_id: Some(previous_person_id.to_owned()),
+                    succession_transition_hash: Some(transition_hash.to_owned()),
+                })
+                .map_err(|_| "Publication owner invalid")?,
+                service_id.to_owned(),
+                DOMAIN,
+            )?;
+            if publication.controller_person_id != successor_identity.person_id {
+                publication.controller_person_id = successor_identity.person_id.clone();
+                publication.revision = publication
+                    .revision
+                    .checked_add(1)
+                    .ok_or("Publication revision overflow")?;
+                atomic_write(
+                    &path,
+                    &serde_json::to_vec(&publication).map_err(|_| "Public publication invalid")?,
+                )?;
+            }
+            atomic_write(
+                &owner_path,
+                &serde_json::to_vec(&new_owner).map_err(|_| "Publication owner invalid")?,
+            )?;
+            targets.push(
+                crate::identity_authority::IdentityRootSuccessionTargetReceipt {
+                    kind: "publication".into(),
+                    resource_id: board_id.to_owned(),
+                    evidence_hash: hash(&new_owner)?,
+                    epoch: Some(publication.revision),
+                },
+            );
+            let _ = transition_hash;
+            let _ = origin;
+        }
+        Ok(())
+    }
+
     fn management_record(&self, kind: &str, id: &str) -> Result<Option<Record>, String> {
         let key = resource(kind, id)?;
         let index = self.management_index()?;
@@ -785,7 +1185,9 @@ impl BlindStore {
     pub(super) fn recover_management(&self) -> Result<(), String> {
         for key in self.management_index()?.resources.keys() {
             let (kind, id) = key.split_once('/').ok_or("Invalid management resource")?;
-            self.management_record(kind, id)?;
+            if let Some(record) = self.management_record(kind, id)? {
+                self.management_controller_transfer(kind, id, &record)?;
+            }
         }
         Ok(())
     }
@@ -809,6 +1211,7 @@ impl BlindStore {
             || certificates
                 .iter()
                 .any(|certificate| certificate.payload.person_id != identity.person_id)
+            || !self.identity_device_certificate_matches(identity, device_id, certificates)?
             || !verify_device_certificate_chain(identity, device_id, certificates, "MATCH/1")
                 .is_ok_and(|key| public_key_id(&key).is_ok_and(|id| id == device_id))
         {
@@ -825,15 +1228,18 @@ impl BlindStore {
                         .management_record("person", &identity.person_id)?
                         .is_none()));
         };
-        let current = capability(&record.capability)?;
-        Ok(presented.is_some_and(|value| value == &record.capability)
-            && current.origin == origin
-            && current.person_id == identity.person_id
-            && current.operations.iter().any(|value| value == operation)
-            && !current
-                .revoked_device_ids
-                .iter()
-                .any(|value| value == device_id))
+        let effective_capability = self.effective_management_capability(kind, id, &record)?;
+        let current = capability(&effective_capability)?;
+        Ok(
+            presented.is_some_and(|value| value == &effective_capability)
+                && current.origin == origin
+                && current.person_id == identity.person_id
+                && current.operations.iter().any(|value| value == operation)
+                && !current
+                    .revoked_device_ids
+                    .iter()
+                    .any(|value| value == device_id),
+        )
     }
     pub(super) fn management_revision_matches(
         &self,
@@ -843,7 +1249,10 @@ impl BlindStore {
     ) -> Result<bool, String> {
         let current_revision = self
             .management_record(kind, id)?
-            .map(|record| capability(&record.capability).map(|value| value.revision))
+            .map(|record| {
+                self.effective_management_capability(kind, id, &record)
+                    .and_then(|value| capability(&value).map(|capability| capability.revision))
+            })
             .transpose()?;
         Ok(match current_revision {
             Some(revision) => supplied_revision == Some(revision),
@@ -898,6 +1307,10 @@ impl BlindStore {
         let service_id = public_key_id(&self.public_key()?)?;
         let authorization_hash = hash(&request.authorization)?;
         let current = self.management_record(kind, id)?;
+        let effective_capability = current
+            .as_ref()
+            .map(|record| self.effective_management_capability(kind, id, record))
+            .transpose()?;
         if !self.person_device_allowed(
             &request.identity,
             &request.device_id,
@@ -906,8 +1319,12 @@ impl BlindStore {
         )? {
             return Err("Unauthorized or revoked person management device".into());
         }
-        if let Some(previous) = &current {
-            let cap = capability(&previous.capability)?;
+        if current.is_some() {
+            let cap = capability(
+                effective_capability
+                    .as_ref()
+                    .ok_or("Management capability unavailable")?,
+            )?;
             if cap.request_id == update.request_id && cap.authorization_hash == authorization_hash {
                 if cap.origin != origin
                     || cap.person_id != request.identity.person_id
@@ -916,7 +1333,10 @@ impl BlindStore {
                     return Err("Unauthorized completed management retry".into());
                 }
                 self.finish_management_pending(kind, id, &cap.request_id, &cap.authorization_hash)?;
-                return Ok(previous.capability.clone());
+                return Ok(effective_capability
+                    .as_ref()
+                    .ok_or("Management capability unavailable")?
+                    .clone());
             }
             if cap.request_id == update.request_id {
                 return Err("Management request identity conflict".into());
@@ -971,30 +1391,46 @@ impl BlindStore {
         }
         let revision = current
             .as_ref()
-            .map(|record| capability(&record.capability).map(|value| value.revision))
+            .map(|_| {
+                capability(
+                    effective_capability
+                        .as_ref()
+                        .ok_or("Management capability unavailable")?,
+                )
+                .map(|value| value.revision)
+            })
             .transpose()?
             .unwrap_or(0);
         if update.expected_revision != revision || revision >= MAX_SAFE_INTEGER {
             return Err("Management revision conflict".into());
         }
-        if let Some(previous) = &current {
-            if capability(&previous.capability)?
-                .revoked_device_ids
-                .iter()
-                .any(|id| {
-                    !update.revoked_device_ids.contains(id)
-                        && !update
-                            .restored_device_ids
-                            .as_ref()
-                            .is_some_and(|ids| ids.contains(id))
-                })
-            {
+        if current.is_some() {
+            if capability(
+                effective_capability
+                    .as_ref()
+                    .ok_or("Management capability unavailable")?,
+            )?
+            .revoked_device_ids
+            .iter()
+            .any(|id| {
+                !update.revoked_device_ids.contains(id)
+                    && !update
+                        .restored_device_ids
+                        .as_ref()
+                        .is_some_and(|ids| ids.contains(id))
+            }) {
                 return Err("Management revocation rollback conflict".into());
             }
         }
         let mut restored = current
             .as_ref()
-            .map(|record| capability(&record.capability))
+            .map(|_| {
+                capability(
+                    effective_capability
+                        .as_ref()
+                        .ok_or("Management capability unavailable")?,
+                )
+            })
             .transpose()?
             .and_then(|cap| cap.restored_device_ids)
             .unwrap_or_default();
@@ -1116,6 +1552,15 @@ impl BlindStore {
             .lock
             .lock()
             .map_err(|_| "Management storage unavailable")?;
+        if request
+            .scope_purpose
+            .as_deref()
+            .is_some_and(|purpose| !valid_scope_purpose(purpose))
+            || (self.identity_authority_enforced.load(Ordering::SeqCst)
+                && request.scope_purpose.is_none())
+        {
+            return Err("Scope purpose is required or invalid".into());
+        }
         if !self.management_authorized(
             owner,
             &request.identity,
@@ -1138,11 +1583,24 @@ impl BlindStore {
         {
             return Err("Scope owner binding conflict".into());
         }
+        if self.policy_revision(&request.scope_id)? > 0 {
+            let existing = self.policy(&request.scope_id)?;
+            if existing.scope_purpose.as_deref().is_some_and(|purpose| {
+                request
+                    .scope_purpose
+                    .as_deref()
+                    .is_some_and(|requested| requested != purpose)
+            }) || (existing.scope_purpose.is_none() && request.scope_purpose.is_some())
+            {
+                return Err("Scope purpose is immutable; use the one-time migration route".into());
+            }
+        }
         self.create_challenge_unlocked(
             &request.scope_id,
             &request.identity.person_id,
             &request.device_id,
             device_key_id,
+            request.scope_purpose.as_deref(),
             origin,
         )
     }
@@ -1191,6 +1649,13 @@ impl BlindStore {
         owner: &ResourceOwner,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
+        if !self.identity_device_certificate_matches(
+            &request.identity,
+            &request.device_id,
+            &request.certificates,
+        )? {
+            return Err("Public delivery device is revoked or not registered".into());
+        }
         let _guard = self
             .lock
             .lock()

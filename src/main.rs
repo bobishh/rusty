@@ -57,8 +57,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(error) => return Err(error.into()),
     };
     let telemetry = Telemetry::start_optional(TelemetryConfig::from_env());
-    let store = blind::BlindStore::open_with_scope_limit(directory.into(), max_scope_bytes)?
-        .with_telemetry(telemetry.clone());
+    let store = blind::BlindStore::open_with_scope_limit(directory.into(), max_scope_bytes)?;
+    match std::env::var("RUSTY_IDENTITY_AUTHORITY_ENFORCEMENT") {
+        Ok(mode) if mode == "strict" => store.enable_identity_authority_enforcement()?,
+        Ok(mode) if mode == "additive" => {}
+        Err(std::env::VarError::NotPresent) => {}
+        Ok(_) => {
+            return Err("RUSTY_IDENTITY_AUTHORITY_ENFORCEMENT must be additive or strict".into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let store = store.with_telemetry(telemetry.clone());
     println!(
         "Rusty blind storage listening on {address}; public key {}",
         store.public_key()?
@@ -70,7 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "ok",
         "",
         0.0,
-        serde_json::json!({"scope_limit_bytes": max_scope_bytes}),
+        serde_json::json!({
+            "scope_limit_bytes": max_scope_bytes,
+            "identity_authority_enforcement": store.identity_authority_enforcement(),
+        }),
     );
     let app = blind::router_with_telemetry(store, origin, origins, telemetry.clone())?;
     let server = axum::serve(listener, app)

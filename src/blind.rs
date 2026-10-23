@@ -1,10 +1,25 @@
 //! Durable opaque object replication. This module never loads application documents.
+use crate::identity_authority::{
+    AUTHORITY_REQUEST_TTL_MS, AuthorityReceiptPayload, AuthorityStatusPayload,
+    AuthorityUpdateRequest, EnforcementMarkerPayload, EnforcementState, IdentityRequestProof,
+    IdentityRootSuccessionReceiptPayload, IdentityRootSuccessionRequest,
+    IdentityRootSuccessionStatusPayload, IdentityRootSuccessionTargetReceipt,
+    RecentAuthorityUpdate, RecentScopeAuthorityUpdate, ResourcePrincipalGrantRequest,
+    SIGNATURE_DOMAIN, ScopeAuthorityReceiptPayload, ScopeAuthorityStatusPayload,
+    ScopeAuthorityUpdateAuthorization, ScopeAuthorityUpdateRequest, ScopePurposeReceiptPayload,
+    ScopePurposeUpdateAuthorization, ScopePurposeUpdateRequest, StoredIdentityAuthority,
+    StoredIdentityRootSuccession, StoredResourcePrincipalGrant, StoredScopeAuthority,
+    authority_view_hash, certificate_chain, scope_authority_snapshot_hash,
+    scope_authority_status_request_hash, status_request_hash, valid_nonce,
+};
 use crate::telemetry::{Level, Telemetry};
 use axum::{
     Json, Router,
+    body::{Body, to_bytes},
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{HeaderMap, Request, StatusCode},
+    middleware::{Next, from_fn_with_state},
+    response::{IntoResponse, Response},
     routing::{get, put},
 };
 use base64::{
@@ -25,7 +40,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tower_http::cors::CorsLayer;
@@ -63,6 +81,46 @@ fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+fn valid_scope_purpose(value: &str) -> bool {
+    matches!(value, "workspace" | "person-identity")
+}
+fn scope_snapshot_contains(
+    candidate: &meta_mesh_core::ScopeAuthoritySnapshot,
+    accepted: &meta_mesh_core::ScopeAuthoritySnapshot,
+) -> bool {
+    candidate.genesis == accepted.genesis
+        && accepted
+            .grants
+            .iter()
+            .all(|record| candidate.grants.contains(record))
+        && accepted
+            .grant_issuers
+            .iter()
+            .all(|record| candidate.grant_issuers.contains(record))
+        && accepted
+            .revocations
+            .iter()
+            .all(|record| candidate.revocations.contains(record))
+        && accepted
+            .control_transfers
+            .iter()
+            .all(|record| candidate.control_transfers.contains(record))
+        && accepted.succession_transfers.iter().all(|record| {
+            candidate
+                .succession_transfers
+                .iter()
+                .find(|current| {
+                    current.from_control_epoch == record.from_control_epoch
+                        && current.claim == record.claim
+                })
+                .is_some_and(|current| {
+                    record
+                        .revocations
+                        .iter()
+                        .all(|revocation| current.revocations.contains(revocation))
+                })
+        })
 }
 fn validate_writer_version(version: u8) -> Result<(), String> {
     if matches!(version, 1 | 2) {
@@ -1216,12 +1274,23 @@ struct ScopePolicy {
     #[serde(default)]
     owner_person_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_scope_purpose_update: Option<CompletedScopePurposeUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     completed_enrollment: Option<CompletedScopeEnrollment>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompletedScopeEnrollment {
+    request_hash: String,
+    receipt: SignedEnvelope<Value>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompletedScopePurposeUpdate {
+    request_id: String,
     request_hash: String,
     receipt: SignedEnvelope<Value>,
 }
@@ -1240,6 +1309,8 @@ struct EnrollmentChallengeRequest {
     scope_id: String,
     identity: PublicIdentity,
     device_id: String,
+    #[serde(default)]
+    scope_purpose: Option<String>,
     certificates: Vec<DeviceCertificate>,
     management_capability: Option<SignedEnvelope<Value>>,
 }
@@ -1274,6 +1345,8 @@ struct ScopeEnrollmentAuthorization {
     management_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     minimum_writer_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_purpose: Option<String>,
     read_token_hash: String,
     write_token_hash: String,
     revoked: bool,
@@ -1304,6 +1377,8 @@ struct PendingChallenge {
     scope_id: String,
     person_id: String,
     device_id: String,
+    #[serde(default)]
+    scope_purpose: Option<String>,
     expires_at: u64,
     envelope: SignedEnvelope<Value>,
 }
@@ -1333,6 +1408,9 @@ fn scope_enrollment_receipt_payload(
         || policy.minimum_writer_version > 1
     {
         receipt["minimumWriterVersion"] = json!(policy.minimum_writer_version);
+    }
+    if let Some(scope_purpose) = request.authorization.payload.scope_purpose.as_deref() {
+        receipt["scopePurpose"] = json!(scope_purpose);
     }
     Ok(receipt)
 }
@@ -1445,6 +1523,9 @@ pub struct BlindStore {
     directory: Arc<PathBuf>,
     seed: [u8; 32],
     lock: Arc<Mutex<()>>,
+    identity_authority_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
+    resource_scope_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
+    identity_authority_enforced: Arc<AtomicBool>,
     _process_lock: Arc<File>,
     inventories: Arc<Mutex<HashMap<String, Vec<ObjectMetadata>>>>,
     archive_usage: Arc<Mutex<HashMap<String, (u64, usize)>>>,
@@ -1472,6 +1553,9 @@ impl BlindStore {
                     "enrollment",
                     "publications",
                     "management",
+                    "identity-authorities",
+                    "identity-successions",
+                    "identity-authority-enforcement.json",
                 ]
                 .contains(&name)
                     && !name.starts_with(".pending-")
@@ -1481,7 +1565,12 @@ impl BlindStore {
             }
             if (directory.join("scopes").exists()
                 || directory.join("publications").exists()
-                || directory.join("management").exists())
+                || directory.join("management").exists()
+                || directory.join("identity-authorities").exists()
+                || directory
+                    .join("identity-authority-enforcement.json")
+                    .exists()
+                || directory.join("identity-successions").exists())
                 && !directory.join("service-key").exists()
             {
                 return Err(
@@ -1520,12 +1609,40 @@ impl BlindStore {
             atomic_write(&seed_path, &seed)?;
             seed
         };
-        public_key_from_seed(&seed)?;
+        let service_public_key = public_key_from_seed(&seed)?;
+        let service_id = public_key_id(&service_public_key)?;
+        let enforcement_path = directory.join("identity-authority-enforcement.json");
+        let identity_authority_enforced = if enforcement_path.exists() {
+            let marker: SignedEnvelope<Value> = serde_json::from_slice(
+                &fs::read(&enforcement_path)
+                    .map_err(|_| "Identity enforcement state unavailable")?,
+            )
+            .map_err(|_| "Invalid Identity enforcement state")?;
+            let payload: EnforcementMarkerPayload = serde_json::from_value(marker.payload.clone())
+                .map_err(|_| "Invalid Identity enforcement state")?;
+            if marker.signer_key_id != service_id
+                || !verify_signed_envelope(&marker, &service_public_key, DOMAIN)?
+                || payload.kind != "rusty-identity-authority-enforcement"
+                || payload.version != 1
+                || payload.service_id != service_id
+                || payload.mode != "strict"
+                || payload.epoch != 1
+                || payload.enabled_at == 0
+            {
+                return Err("Identity enforcement state integrity failure".into());
+            }
+            true
+        } else {
+            false
+        };
         let store = Self {
             telemetry: Telemetry::disabled(),
             directory: Arc::new(directory),
             seed,
             lock: Arc::new(Mutex::new(())),
+            identity_authority_locks: Arc::new(Mutex::new(HashMap::new())),
+            resource_scope_locks: Arc::new(Mutex::new(HashMap::new())),
+            identity_authority_enforced: Arc::new(AtomicBool::new(identity_authority_enforced)),
             _process_lock: Arc::new(process_lock),
             inventories: Arc::new(Mutex::new(HashMap::new())),
             archive_usage: Arc::new(Mutex::new(HashMap::new())),
@@ -1539,6 +1656,1331 @@ impl BlindStore {
     }
     pub fn public_key(&self) -> Result<String, String> {
         public_key_from_seed(&self.seed)
+    }
+    fn enforcement_state(&self) -> EnforcementState {
+        if self.identity_authority_enforced.load(Ordering::SeqCst) {
+            EnforcementState {
+                mode: "strict".into(),
+                epoch: 1,
+            }
+        } else {
+            EnforcementState {
+                mode: "additive".into(),
+                epoch: 0,
+            }
+        }
+    }
+    pub fn identity_authority_enforcement(&self) -> Value {
+        serde_json::to_value(self.enforcement_state()).expect("serializable enforcement state")
+    }
+    pub fn enable_identity_authority_enforcement(&self) -> Result<(), String> {
+        if self.identity_authority_enforced.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        if self.identity_authority_enforced.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let service_id = public_key_id(&self.public_key()?)?;
+        let marker = sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(EnforcementMarkerPayload {
+                kind: "rusty-identity-authority-enforcement".into(),
+                version: 1,
+                service_id,
+                mode: "strict".into(),
+                epoch: 1,
+                enabled_at: now_ms()?,
+            })
+            .map_err(|_| "Identity enforcement state invalid")?,
+            public_key_id(&self.public_key()?)?,
+            DOMAIN,
+        )?;
+        atomic_write(
+            &self.directory.join("identity-authority-enforcement.json"),
+            &serde_json::to_vec(&marker).map_err(|_| "Identity enforcement state invalid")?,
+        )?;
+        self.identity_authority_enforced
+            .store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn identity_authority_path(&self, person_id: &str) -> Result<PathBuf, String> {
+        if !valid_id(person_id) {
+            return Err("Invalid Identity person ID".into());
+        }
+        Ok(self
+            .directory
+            .join("identity-authorities")
+            .join(format!("{person_id}.json")))
+    }
+    fn identity_succession_path(&self, previous_person_id: &str) -> Result<PathBuf, String> {
+        if !valid_id(previous_person_id) {
+            return Err("Invalid Identity person ID".into());
+        }
+        Ok(self
+            .directory
+            .join("identity-successions")
+            .join(format!("{previous_person_id}.json")))
+    }
+    fn read_identity_succession(
+        &self,
+        previous_person_id: &str,
+    ) -> Result<Option<StoredIdentityRootSuccession>, String> {
+        let path = self.identity_succession_path(previous_person_id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        if fs::metadata(&path)
+            .map_err(|_| "Identity succession unavailable")?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err("Invalid Identity succession size".into());
+        }
+        let stored: StoredIdentityRootSuccession =
+            serde_json::from_slice(&fs::read(path).map_err(|_| "Identity succession unavailable")?)
+                .map_err(|_| "Invalid Identity succession")?;
+        let service_key = self.public_key()?;
+        let service_id = public_key_id(&service_key)?;
+        let transition_hash =
+            crate::identity_authority::canonical_hash(&stored.request.succession)?;
+        if stored.version != 1
+            || stored
+                .request
+                .succession
+                .authorization
+                .payload
+                .previous_person_id
+                != previous_person_id
+            || stored.transition_hash != transition_hash
+            || !matches!(stored.state.as_str(), "pending" | "ready")
+            || stored.retired != (stored.state == "ready")
+        {
+            return Err("Identity succession integrity failure".into());
+        }
+        if let Some(receipt) = &stored.receipt {
+            let payload: crate::identity_authority::IdentityRootSuccessionReceiptPayload =
+                serde_json::from_value(receipt.payload.clone())
+                    .map_err(|_| "Invalid Identity succession receipt")?;
+            if receipt.signer_key_id != service_id
+                || !verify_signed_envelope(receipt, &service_key, DOMAIN)?
+                || payload.kind != "rusty-identity-root-succession-receipt"
+                || payload.version != 1
+                || payload.service_id != service_id
+                || payload.origin != stored.request.actor_authorization.payload.origin
+                || payload.previous_person_id != previous_person_id
+                || payload.successor_person_id
+                    != stored
+                        .request
+                        .succession
+                        .authorization
+                        .payload
+                        .successor_person_id
+                || payload.transition_hash != stored.transition_hash
+                || payload.actor_device_id != stored.request.actor_device_id
+                || payload.request_id != stored.request.actor_authorization.payload.request_id
+                || payload.request_hash != stored.request.actor_authorization.payload.request_hash
+                || Some(payload.committed_at) != stored.committed_at
+                || payload.retired != stored.retired
+                || payload.transferred != stored.targets
+            {
+                return Err("Identity succession receipt integrity failure".into());
+            }
+        } else if stored.state == "ready" || stored.retired || stored.committed_at.is_some() {
+            return Err("Identity succession receipt is missing".into());
+        }
+        Ok(Some(stored))
+    }
+    fn identity_is_retired(&self, person_id: &str) -> Result<bool, String> {
+        Ok(self
+            .read_identity_succession(person_id)?
+            .is_some_and(|stored| stored.retired))
+    }
+    fn scope_authority_path(&self, scope: &str) -> Result<PathBuf, String> {
+        if !valid_id(scope) {
+            return Err("Invalid opaque scope ID".into());
+        }
+        Ok(self.scope_dir(scope)?.join("authority.json"))
+    }
+    fn read_scope_authority(&self, scope: &str) -> Result<Option<StoredScopeAuthority>, String> {
+        let path = self.scope_authority_path(scope)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let stored: StoredScopeAuthority =
+            serde_json::from_slice(&fs::read(path).map_err(|_| "Scope authority unavailable")?)
+                .map_err(|_| "Invalid stored scope authority")?;
+        let validated =
+            meta_mesh_core::validate_scope_authority_at(&stored.snapshot, now_ms()? as i128)?;
+        if validated.scope_id != scope || stored.recent_updates.len() > 256 {
+            return Err("Stored scope authority binding invalid".into());
+        }
+        Ok(Some(stored))
+    }
+    fn signed_scope_authority_status(
+        &self,
+        scope: &str,
+        origin: &str,
+        request_id: &str,
+        request_hash: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        if !valid_id(scope) || !valid_nonce(request_id) || request_hash.len() != 43 {
+            return Err("Invalid scope authority status request".into());
+        }
+        let policy = self.policy(scope)?;
+        if policy.scope_purpose.as_deref() == Some("person-identity") {
+            return Err("Person Identity scopes do not have workspace authority".into());
+        }
+        let stored = self.read_scope_authority(scope)?;
+        let validated = stored
+            .as_ref()
+            .map(|authority| {
+                meta_mesh_core::validate_scope_authority_at(&authority.snapshot, now_ms()? as i128)
+                    .map_err(|_| "Stored scope authority is invalid".to_string())
+            })
+            .transpose()?;
+        let payload = ScopeAuthorityStatusPayload {
+            kind: "rusty-scope-authority-status".into(),
+            version: 1,
+            service_id: public_key_id(&self.public_key()?)?,
+            origin: origin.to_owned(),
+            scope_id: scope.to_owned(),
+            workspace_id: validated.as_ref().map(|value| value.scope_id.clone()),
+            state: if stored.is_some() { "ready" } else { "missing" }.into(),
+            controller_person_id: validated
+                .as_ref()
+                .map(|value| value.controller.person_id.clone()),
+            control_epoch: validated.as_ref().map(|value| value.control_epoch),
+            request_id: request_id.to_owned(),
+            request_hash: request_hash.to_owned(),
+            issued_at: now_ms()?,
+            enforcement: self.enforcement_state(),
+            scope_authority: stored.map(|value| value.snapshot),
+        };
+        sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(payload).map_err(|_| "Invalid scope authority status")?,
+            public_key_id(&self.public_key()?)?,
+            DOMAIN,
+        )
+    }
+    fn update_scope_authority(
+        &self,
+        scope: &str,
+        request: ScopeAuthorityUpdateRequest,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, (String, Option<SignedEnvelope<Value>>)> {
+        if !valid_id(scope) || request.version != 1 {
+            return Err(("Invalid scope authority update".into(), None));
+        }
+        let scope_gate = self
+            .resource_scope_gate(scope)
+            .map_err(|message| (message, None))?;
+        let _scope_guard = scope_gate
+            .try_write()
+            .map_err(|_| ("Resource scope lock unavailable".to_string(), None))?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| ("Storage lock unavailable".to_string(), None))?;
+        let policy = self.policy(scope).map_err(|message| (message, None))?;
+        if policy.scope_purpose.as_deref() == Some("person-identity") {
+            return Err((
+                "Person Identity scopes do not have workspace authority".into(),
+                None,
+            ));
+        }
+        let now = now_ms().map_err(|message| (message, None))?;
+        let validated_candidate =
+            meta_mesh_core::validate_scope_authority_at(&request.scope_authority, now as i128)
+                .map_err(|message| (message, None))?;
+        let mut existing = self
+            .read_scope_authority(scope)
+            .map_err(|message| (message, None))?;
+        if let Some(stored) = &mut existing {
+            stored
+                .recent_updates
+                .retain(|update| now.saturating_sub(update.issued_at) <= AUTHORITY_REQUEST_TTL_MS);
+        }
+        let authorization: ScopeAuthorityUpdateAuthorization =
+            serde_json::from_value(request.authorization.payload.clone())
+                .map_err(|_| ("Invalid scope authority authorization".into(), None))?;
+        let request_id = authorization.request_id.clone();
+        let request_hash = request.request_hash().map_err(|message| (message, None))?;
+        if let Some(stored) = &existing {
+            if let Some(prior) = stored
+                .recent_updates
+                .iter()
+                .find(|update| update.request_id == request_id)
+            {
+                if prior.request_hash == request_hash {
+                    return Ok(prior.receipt.clone());
+                }
+                return Err(("Scope authority request ID was already used".into(), None));
+            }
+        }
+
+        if let Some(stored) = &existing {
+            let current =
+                meta_mesh_core::validate_scope_authority_at(&stored.snapshot, now as i128)
+                    .map_err(|message| (message, None))?;
+            if request.scope_authority.genesis != stored.snapshot.genesis
+                || !scope_snapshot_contains(&request.scope_authority, &stored.snapshot)
+                || validated_candidate.control_epoch < current.control_epoch
+                || (validated_candidate.control_epoch == current.control_epoch
+                    && validated_candidate.controller.person_id != current.controller.person_id)
+            {
+                let status = self
+                    .signed_scope_authority_status(scope, origin, &request_id, &request_hash)
+                    .map_err(|message| (message, None))?;
+                return Err((
+                    "Scope authority snapshot is stale or omits accepted history".into(),
+                    Some(status),
+                ));
+            }
+        }
+
+        let owner_person_id = policy
+            .owner_person_id
+            .as_deref()
+            .ok_or_else(|| ("Storage resource owner is unavailable".into(), None))?;
+        if existing.is_none() && validated_candidate.controller.person_id != owner_person_id {
+            return Err((
+                "Initial workspace authority controller does not match the enrolled owner".into(),
+                None,
+            ));
+        }
+        let expected_genesis = if let Some(stored) = &existing {
+            Some(stored.snapshot.genesis.payload.creator.person_id.as_str())
+        } else if policy.scope_purpose.as_deref() == Some("workspace") {
+            None
+        } else {
+            Some(owner_person_id)
+        };
+        let person_id = validated_candidate.controller.person_id.clone();
+        if self
+            .identity_is_retired(&person_id)
+            .map_err(|message| (message, None))?
+        {
+            return Err((
+                "Scope controller Identity root has been retired".into(),
+                None,
+            ));
+        }
+        let identity = self
+            .read_identity_authority(&person_id)
+            .map_err(|message| (message, None))?
+            .ok_or_else(|| {
+                (
+                    "Workspace controller Identity authority is not registered".into(),
+                    None,
+                )
+            })?;
+        let service_id = public_key_id(&self.public_key().map_err(|message| (message, None))?)
+            .map_err(|message| (message, None))?;
+        request
+            .verify(
+                scope,
+                expected_genesis,
+                &service_id,
+                origin,
+                &identity.view,
+                now,
+            )
+            .map_err(|message| (message, None))?;
+
+        let accepted = existing.as_ref().map(|stored| &stored.snapshot);
+        let merged = match request.verify_new_controller_signers(
+            accepted,
+            |signer_person_id| {
+                Ok(self
+                    .read_identity_authority(signer_person_id)?
+                    .map(|stored| stored.view))
+            },
+            now,
+        ) {
+            Ok(merged) => merged,
+            Err(message) => return Err((message, None)),
+        };
+        if existing
+            .as_ref()
+            .is_some_and(|stored| stored.recent_updates.len() >= 256)
+        {
+            return Err(("Scope authority update rate limit reached".into(), None));
+        }
+        let validated = meta_mesh_core::validate_scope_authority_at(&merged, now as i128)
+            .map_err(|message| (message, None))?;
+        if validated.controller.person_id != authorization.person_id
+            || validated.control_epoch != authorization.control_epoch
+        {
+            return Err((
+                "Scope authority update signer is not the current controller".into(),
+                None,
+            ));
+        }
+        let receipt_payload = ScopeAuthorityReceiptPayload {
+            kind: "rusty-scope-authority-receipt".into(),
+            version: 1,
+            service_id: service_id.clone(),
+            origin: origin.to_owned(),
+            scope_id: scope.to_owned(),
+            workspace_id: validated.scope_id.clone(),
+            controller_person_id: validated.controller.person_id.clone(),
+            control_epoch: validated.control_epoch,
+            request_id: request_id.clone(),
+            request_hash: request_hash.clone(),
+            merged_snapshot_hash: scope_authority_snapshot_hash(&merged)
+                .map_err(|message| (message, None))?,
+            committed_at: now,
+            enforcement: self.enforcement_state(),
+        };
+        let receipt = sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(receipt_payload)
+                .map_err(|_| ("Invalid scope authority receipt".into(), None))?,
+            service_id,
+            DOMAIN,
+        )
+        .map_err(|message| (message, None))?;
+        let mut recent_updates = existing.map_or_else(Vec::new, |stored| stored.recent_updates);
+        recent_updates.push(RecentScopeAuthorityUpdate {
+            request_id,
+            request_hash,
+            issued_at: now,
+            receipt: receipt.clone(),
+        });
+        if recent_updates.len() > 256 {
+            recent_updates.drain(..recent_updates.len() - 256);
+        }
+        let stored = StoredScopeAuthority {
+            snapshot: merged,
+            recent_updates,
+        };
+        atomic_write(
+            &self
+                .scope_authority_path(scope)
+                .map_err(|message| (message, None))?,
+            &serde_json::to_vec(&stored)
+                .map_err(|_| ("Scope authority state is invalid".into(), None))?,
+        )
+        .map_err(|message| (message, None))?;
+        Ok(receipt)
+    }
+    fn identity_authority_gate(
+        &self,
+        person_id: &str,
+    ) -> Result<Arc<tokio::sync::RwLock<()>>, String> {
+        if !valid_id(person_id) {
+            return Err("Invalid Identity person ID".into());
+        }
+        let mut gates = self
+            .identity_authority_locks
+            .lock()
+            .map_err(|_| "Identity authority lock unavailable")?;
+        Ok(gates
+            .entry(person_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone())
+    }
+    fn resource_scope_gate(&self, scope_id: &str) -> Result<Arc<tokio::sync::RwLock<()>>, String> {
+        if !valid_id(scope_id) {
+            return Err("Invalid opaque scope ID".into());
+        }
+        let mut gates = self
+            .resource_scope_locks
+            .lock()
+            .map_err(|_| "Resource scope lock unavailable")?;
+        Ok(gates
+            .entry(scope_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone())
+    }
+    fn read_identity_authority(
+        &self,
+        person_id: &str,
+    ) -> Result<Option<StoredIdentityAuthority>, String> {
+        let path = self.identity_authority_path(person_id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let stored: StoredIdentityAuthority =
+            serde_json::from_slice(&fs::read(path).map_err(|_| "Identity authority unavailable")?)
+                .map_err(|_| "Invalid stored Identity authority")?;
+        if stored.view.person_id != person_id {
+            return Err("Stored Identity authority person mismatch".into());
+        }
+        stored.view.verify()?;
+        Ok(Some(stored))
+    }
+    fn identity_device_active(
+        &self,
+        identity: &PublicIdentity,
+        device_id: &str,
+    ) -> Result<bool, String> {
+        if self.identity_is_retired(&identity.person_id)? {
+            return Ok(false);
+        }
+        let Some(authority) = self.read_identity_authority(&identity.person_id)? else {
+            return Ok(!self.identity_authority_enforced.load(Ordering::SeqCst));
+        };
+        if authority.view.identity_public_key != identity.public_key {
+            return Ok(false);
+        }
+        authority.view.verify()?.is_active_device(device_id)
+    }
+    fn identity_device_certificate_matches(
+        &self,
+        identity: &PublicIdentity,
+        device_id: &str,
+        certificates: &[DeviceCertificate],
+    ) -> Result<bool, String> {
+        if self.identity_is_retired(&identity.person_id)? {
+            return Ok(false);
+        }
+        let Some(authority) = self.read_identity_authority(&identity.person_id)? else {
+            return Ok(!self.identity_authority_enforced.load(Ordering::SeqCst));
+        };
+        if authority.view.identity_public_key != identity.public_key {
+            return Ok(false);
+        }
+        let verified = authority.view.verify()?;
+        Ok(verified.is_active_device(device_id)?
+            && verified.has_exact_certificate_chain(device_id, certificates)?)
+    }
+    fn signed_identity_authority_status(
+        &self,
+        person_id: &str,
+        origin: &str,
+        request_nonce: &str,
+        request_hash: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        if !valid_nonce(request_nonce) || request_hash.len() != 43 {
+            return Err("Invalid Identity authority status request".into());
+        }
+        let retired = self.identity_is_retired(person_id)?;
+        let current = self.read_identity_authority(person_id)?;
+        let payload = AuthorityStatusPayload {
+            kind: "rusty-identity-authority-status".into(),
+            version: 1,
+            service_id: public_key_id(&self.public_key()?)?,
+            origin: origin.to_owned(),
+            person_id: person_id.to_owned(),
+            state: if retired {
+                "retired"
+            } else if current.is_some() {
+                "ready"
+            } else {
+                "missing"
+            }
+            .into(),
+            request_nonce: request_nonce.to_owned(),
+            request_hash: request_hash.to_owned(),
+            issued_at: now_ms()?,
+            enforcement: self.enforcement_state(),
+            view: if retired {
+                None
+            } else {
+                current.map(|stored| stored.view)
+            },
+        };
+        sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(payload).map_err(|_| "Invalid Identity authority status")?,
+            public_key_id(&self.public_key()?)?,
+            DOMAIN,
+        )
+    }
+    fn signed_identity_succession_status(
+        &self,
+        previous_person_id: &str,
+        transition_hash: &str,
+        request_id: &str,
+        request_hash: &str,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        let expected_hash = crate::identity_authority::identity_succession_status_request_hash(
+            previous_person_id,
+            transition_hash,
+            request_id,
+        )?;
+        if expected_hash != request_hash {
+            return Err("Invalid Identity succession status request hash".into());
+        }
+        let stored = self.read_identity_succession(previous_person_id)?;
+        let matching = stored.filter(|value| value.transition_hash == transition_hash);
+        let (state, successor_person_id, actor_device_id, retired, transferred, receipt) =
+            match matching {
+                Some(value) => (
+                    value.state,
+                    Some(
+                        value
+                            .request
+                            .succession
+                            .authorization
+                            .payload
+                            .successor_person_id,
+                    ),
+                    Some(value.request.actor_device_id),
+                    value.retired,
+                    value.targets,
+                    value.receipt,
+                ),
+                None => ("missing".into(), None, None, false, Vec::new(), None),
+            };
+        let service_id = public_key_id(&self.public_key()?)?;
+        let payload = IdentityRootSuccessionStatusPayload {
+            kind: "rusty-identity-root-succession-status".into(),
+            version: 1,
+            service_id: service_id.clone(),
+            origin: origin.to_owned(),
+            previous_person_id: previous_person_id.to_owned(),
+            transition_hash: transition_hash.to_owned(),
+            state,
+            request_id: request_id.to_owned(),
+            request_hash: request_hash.to_owned(),
+            issued_at: now_ms()?,
+            successor_person_id,
+            actor_device_id,
+            retired,
+            enforcement: self.enforcement_state(),
+            transferred,
+            receipt,
+        };
+        sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(payload).map_err(|_| "Invalid Identity succession status")?,
+            service_id,
+            DOMAIN,
+        )
+    }
+    fn root_succession_targets(
+        &self,
+        previous_person_id: &str,
+        successor_person_id: &str,
+        now: u64,
+    ) -> Result<Vec<IdentityRootSuccessionTargetReceipt>, String> {
+        let scopes_dir = self.directory.join("scopes");
+        let mut had_identity_scope = false;
+        let mut has_successor_identity_scope = false;
+        let mut targets = Vec::new();
+        if scopes_dir.exists() {
+            for entry in fs::read_dir(&scopes_dir).map_err(|_| "Storage scopes unavailable")? {
+                let entry = entry.map_err(|_| "Storage scopes unavailable")?;
+                let scope = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| "Invalid storage scope name")?;
+                if !valid_id(&scope) || !entry.path().is_dir() {
+                    continue;
+                }
+                let policy = self.policy(&scope)?;
+                let Some(owner) = policy.owner_person_id.as_deref() else {
+                    continue;
+                };
+                if policy.scope_purpose.as_deref() == Some("person-identity") {
+                    if owner == previous_person_id {
+                        had_identity_scope = true;
+                    }
+                    if owner == successor_person_id
+                        && !policy.revoked
+                        && policy.scope_purpose.as_deref() == Some("person-identity")
+                    {
+                        has_successor_identity_scope = true;
+                    }
+                    continue;
+                }
+                if owner != previous_person_id {
+                    continue;
+                }
+                if policy.scope_purpose.as_deref() != Some("workspace") {
+                    return Err(
+                        "Classify each previous-root-owned scope before retiring its Identity root"
+                            .into(),
+                    );
+                }
+                let Some(stored) = self.read_scope_authority(&scope)? else {
+                    return Err("Owned workspace scope has no accepted controller history".into());
+                };
+                let validated =
+                    meta_mesh_core::validate_scope_authority_at(&stored.snapshot, now as i128)
+                        .map_err(|_| "Owned workspace scope authority is invalid")?;
+                if validated.controller.person_id == previous_person_id {
+                    return Err("Transfer each currently controlled workspace before retiring its Identity root".into());
+                }
+                if validated.controller.person_id == successor_person_id {
+                    targets.push(IdentityRootSuccessionTargetReceipt {
+                        kind: "scope-authority".into(),
+                        resource_id: scope,
+                        evidence_hash: crate::identity_authority::scope_authority_snapshot_hash(
+                            &stored.snapshot,
+                        )?,
+                        epoch: Some(validated.control_epoch),
+                    });
+                }
+            }
+        }
+        if had_identity_scope && !has_successor_identity_scope {
+            return Err("Register and verify the successor Identity scope before retiring the previous root".into());
+        }
+        Ok(targets)
+    }
+    fn update_identity_root_succession(
+        &self,
+        request: IdentityRootSuccessionRequest,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, (String, Option<SignedEnvelope<Value>>)> {
+        let previous_person_id = request
+            .succession
+            .authorization
+            .payload
+            .previous_person_id
+            .clone();
+        let successor_person_id = request
+            .succession
+            .authorization
+            .payload
+            .successor_person_id
+            .clone();
+        if !valid_id(&previous_person_id)
+            || !valid_id(&successor_person_id)
+            || previous_person_id == successor_person_id
+        {
+            return Err(("Invalid Identity root succession principals".into(), None));
+        }
+        let mut people = [previous_person_id.as_str(), successor_person_id.as_str()];
+        people.sort_unstable();
+        let first_gate = self
+            .identity_authority_gate(people[0])
+            .map_err(|e| (e, None))?;
+        let second_gate = self
+            .identity_authority_gate(people[1])
+            .map_err(|e| (e, None))?;
+        let _first_guard = first_gate
+            .try_write()
+            .map_err(|_| ("Identity authority lock unavailable".to_string(), None))?;
+        let _second_guard = second_gate
+            .try_write()
+            .map_err(|_| ("Identity authority lock unavailable".to_string(), None))?;
+        // Identity gates precede the shared storage lock everywhere. Holding both
+        // gates through durable retirement prevents an old-device request from
+        // committing after this response.
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| ("Storage lock unavailable".into(), None))?;
+        let now = now_ms().map_err(|e| (e, None))?;
+        let service_id =
+            public_key_id(&self.public_key().map_err(|e| (e, None))?).map_err(|e| (e, None))?;
+        let previous = self
+            .read_identity_authority(&previous_person_id)
+            .map_err(|e| (e, None))?
+            .ok_or_else(|| ("Previous Identity authority is not registered".into(), None))?;
+        let successor = self
+            .read_identity_authority(&successor_person_id)
+            .map_err(|e| (e, None))?
+            .ok_or_else(|| {
+                (
+                    "Successor Identity authority is not registered".into(),
+                    None,
+                )
+            })?;
+        if self
+            .identity_is_retired(&successor_person_id)
+            .map_err(|e| (e, None))?
+        {
+            return Err(("Successor Identity root is already retired".into(), None));
+        }
+        let verified = request
+            .verify(&previous.view, &successor.view, &service_id, origin, now)
+            .map_err(|e| (e, None))?;
+        if previous.view.revocation_head != verified.authority_head
+            || previous.view.view_digest != verified.authority_view_digest
+            || previous.view.identity_public_key != verified.previous_identity_public_key
+            || successor.view.identity_public_key != verified.successor_identity_public_key
+        {
+            return Err((
+                "Identity root succession does not match committed authority views".into(),
+                None,
+            ));
+        }
+        let path = self
+            .identity_succession_path(&previous_person_id)
+            .map_err(|e| (e, None))?;
+        if let Some(existing) = self
+            .read_identity_succession(&previous_person_id)
+            .map_err(|e| (e, None))?
+        {
+            if existing.transition_hash != verified.transition_hash {
+                return Err((
+                    "Previous Identity root already has a different successor".into(),
+                    None,
+                ));
+            }
+            if existing.retired {
+                return existing
+                    .receipt
+                    .ok_or_else(|| ("Completed root succession receipt is missing".into(), None));
+            }
+        }
+        let scope_targets = self
+            .root_succession_targets(&previous_person_id, &successor_person_id, now)
+            .map_err(|e| (e, None))?;
+        if self.enforcement_state().mode != "strict" || self.enforcement_state().epoch != 1 {
+            return Err((
+                "Identity root succession requires strict authority enforcement".into(),
+                None,
+            ));
+        }
+        let pending = StoredIdentityRootSuccession {
+            version: 1,
+            request: request.clone(),
+            transition_hash: verified.transition_hash.clone(),
+            state: "pending".into(),
+            targets: scope_targets.clone(),
+            retired: false,
+            committed_at: None,
+            receipt: None,
+        };
+        atomic_write(
+            &path,
+            &serde_json::to_vec(&pending)
+                .map_err(|_| ("Invalid Identity succession state".into(), None))?,
+        )
+        .map_err(|e| (e, None))?;
+        let mut targets = scope_targets;
+        targets.extend(
+            self.prepare_root_succession_management_transfers(
+                &previous_person_id,
+                &successor.view.identity(),
+                &verified.transition_hash,
+                origin,
+            )
+            .map_err(|e| (e, None))?,
+        );
+        targets.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then(left.resource_id.cmp(&right.resource_id))
+        });
+        let request_id = request.actor_authorization.payload.request_id.clone();
+        let request_hash = request.actor_authorization.payload.request_hash.clone();
+        let committed_at = now;
+        let receipt_payload = IdentityRootSuccessionReceiptPayload {
+            kind: "rusty-identity-root-succession-receipt".into(),
+            version: 1,
+            service_id: service_id.clone(),
+            origin: origin.to_owned(),
+            previous_person_id: previous_person_id.clone(),
+            successor_person_id: successor_person_id.clone(),
+            transition_hash: verified.transition_hash.clone(),
+            actor_device_id: request.actor_device_id.clone(),
+            request_id,
+            request_hash,
+            committed_at,
+            retired: true,
+            transferred: targets.clone(),
+            enforcement: self.enforcement_state(),
+        };
+        let receipt = sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(receipt_payload)
+                .map_err(|_| ("Invalid Identity succession receipt".into(), None))?,
+            service_id,
+            DOMAIN,
+        )
+        .map_err(|e| (e, None))?;
+        let stored = StoredIdentityRootSuccession {
+            version: 1,
+            request,
+            transition_hash: verified.transition_hash,
+            state: "ready".into(),
+            targets,
+            retired: true,
+            committed_at: Some(committed_at),
+            receipt: Some(receipt.clone()),
+        };
+        atomic_write(
+            &path,
+            &serde_json::to_vec(&stored)
+                .map_err(|_| ("Invalid Identity succession state".into(), None))?,
+        )
+        .map_err(|e| (e, None))?;
+        Ok(receipt)
+    }
+    fn update_identity_authority(
+        &self,
+        request: AuthorityUpdateRequest,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, (String, Option<SignedEnvelope<Value>>)> {
+        let person_id = request.view.person_id.clone();
+        let authority_gate = self
+            .identity_authority_gate(&person_id)
+            .map_err(|message| (message, None))?;
+        let _authority_guard = authority_gate
+            .try_write()
+            .map_err(|_| ("Identity authority lock unavailable".to_string(), None))?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| ("Storage lock unavailable".to_string(), None))?;
+        if self
+            .identity_is_retired(&person_id)
+            .map_err(|message| (message, None))?
+        {
+            return Err(("Identity root has been retired".into(), None));
+        }
+        let nonce = request.authorization.payload.nonce.clone();
+        let request_hash = authority_view_hash(&request.view).map_err(|message| (message, None))?;
+        let service_public_key = self.public_key().map_err(|message| (message, None))?;
+        let service_id = public_key_id(&service_public_key).map_err(|message| (message, None))?;
+        let now = now_ms().map_err(|message| (message, None))?;
+        request
+            .verify(&service_id, origin, now)
+            .map_err(|message| (message, None))?;
+
+        let mut existing = self
+            .read_identity_authority(&person_id)
+            .map_err(|message| (message, None))?;
+        if let Some(stored) = &mut existing {
+            stored
+                .recent_updates
+                .retain(|update| now.saturating_sub(update.issued_at) <= AUTHORITY_REQUEST_TTL_MS);
+        }
+        if let Some(stored) = &existing {
+            if let Some(prior) = stored
+                .recent_updates
+                .iter()
+                .find(|update| update.nonce == nonce)
+            {
+                if prior.request_hash == request_hash {
+                    return Ok(prior.receipt.clone());
+                }
+                return Err(("Identity authority nonce was already used".into(), None));
+            }
+            let current = &stored.view;
+            let incoming = &request.view;
+            let stale = incoming.revocation_head.revision < current.revocation_head.revision
+                || (incoming.revocation_head.revision == current.revocation_head.revision
+                    && incoming.revocation_head.record_hash != current.revocation_head.record_hash)
+                || current.revocations.len() > incoming.revocations.len()
+                || !current
+                    .revocations
+                    .iter()
+                    .zip(incoming.revocations.iter())
+                    .all(|(old, new)| old == new)
+                || current.certificates.iter().any(|old| {
+                    !incoming
+                        .certificates
+                        .iter()
+                        .any(|new| new.payload.device_id == old.payload.device_id && new == old)
+                });
+            if stale {
+                let status = self
+                    .signed_identity_authority_status(&person_id, origin, &nonce, &request_hash)
+                    .map_err(|message| (message, None))?;
+                return Err((
+                    "Identity authority is stale or forks the committed head".into(),
+                    Some(status),
+                ));
+            }
+        }
+
+        if existing
+            .as_ref()
+            .is_some_and(|stored| stored.recent_updates.len() >= 256)
+        {
+            return Err(("Identity authority update rate limit reached".into(), None));
+        }
+        let committed_at = now;
+        let receipt_payload = AuthorityReceiptPayload {
+            kind: "rusty-identity-authority-receipt".into(),
+            version: 1,
+            service_id: service_id.clone(),
+            origin: origin.to_owned(),
+            person_id: person_id.clone(),
+            authority_head: request.view.revocation_head.clone(),
+            view_digest: request.view.view_digest.clone(),
+            request_hash: request_hash.clone(),
+            committed_at,
+            enforcement: self.enforcement_state(),
+        };
+        let receipt = sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(receipt_payload)
+                .map_err(|_| ("Invalid Identity authority receipt".into(), None))?,
+            service_id,
+            DOMAIN,
+        )
+        .map_err(|message| (message, None))?;
+        let mut recent_updates = existing.map_or_else(Vec::new, |stored| stored.recent_updates);
+        recent_updates.push(RecentAuthorityUpdate {
+            nonce,
+            request_hash,
+            issued_at: request.authorization.payload.issued_at,
+            receipt: receipt.clone(),
+        });
+        if recent_updates.len() > crate::identity_authority::MAX_RECENT_AUTHORITY_UPDATES {
+            recent_updates.drain(
+                ..recent_updates.len() - crate::identity_authority::MAX_RECENT_AUTHORITY_UPDATES,
+            );
+        }
+        let stored = StoredIdentityAuthority {
+            view: request.view,
+            recent_updates,
+        };
+        let bytes = serde_json::to_vec(&stored)
+            .map_err(|_| ("Invalid Identity authority state".into(), None))?;
+        let path = self
+            .identity_authority_path(&person_id)
+            .map_err(|message| (message, None))?;
+        atomic_write(&path, &bytes).map_err(|message| (message, None))?;
+        Ok(receipt)
+    }
+    fn update_scope_purpose(
+        &self,
+        scope: &str,
+        request: ScopePurposeUpdateRequest,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        if request.version != 1 || !valid_id(scope) || request.scope_purpose != "person-identity" {
+            return Err("Invalid one-time Identity scope classification".into());
+        }
+        let authorization: ScopePurposeUpdateAuthorization =
+            serde_json::from_value(request.authorization.payload.clone())
+                .map_err(|_| "Invalid scope purpose authorization")?;
+        let request_hash = digest(
+            canonicalize_json(&json!({
+                "version": 1,
+                "scopePurpose": request.scope_purpose,
+            }))?
+            .as_bytes(),
+        );
+        let now = now_ms()?;
+        let service_id = public_key_id(&self.public_key()?)?;
+        if authorization.kind != "rusty-scope-purpose-update"
+            || authorization.version != 1
+            || authorization.service_id != service_id
+            || authorization.origin != origin
+            || authorization.scope_id != scope
+            || authorization.scope_purpose != request.scope_purpose
+            || authorization.request_hash != request_hash
+            || !valid_nonce(&authorization.request_id)
+            || authorization.issued_at.abs_diff(now) > AUTHORITY_REQUEST_TTL_MS
+            || authorization.expires_at <= now
+            || authorization.expires_at <= authorization.issued_at
+            || authorization
+                .expires_at
+                .saturating_sub(authorization.issued_at)
+                > AUTHORITY_REQUEST_TTL_MS
+            || request.authorization.signer_key_id != authorization.device_id
+        {
+            return Err("Scope purpose authorization binding or expiry is invalid".into());
+        }
+        let scope_gate = self.resource_scope_gate(scope)?;
+        let _scope_guard = scope_gate
+            .try_write()
+            .map_err(|_| "Resource scope lock unavailable")?;
+        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        let mut policy = self.policy(scope)?;
+        if let Some(completed) = &policy.completed_scope_purpose_update {
+            if completed.request_id == authorization.request_id
+                && completed.request_hash == request_hash
+                && policy.scope_purpose.as_deref() == Some("person-identity")
+            {
+                return Ok(completed.receipt.clone());
+            }
+            if policy.scope_purpose.as_deref() != Some("person-identity") {
+                return Err("Scope purpose is immutable".into());
+            }
+        }
+        if policy
+            .scope_purpose
+            .as_deref()
+            .is_some_and(|purpose| purpose != "person-identity")
+            || policy.owner_person_id.as_deref() != Some(authorization.person_id.as_str())
+            || policy.revision != authorization.policy_revision
+            || self.scope_authority_path(scope)?.exists()
+            || self.scope_has_principal_grants(scope)?
+        {
+            return Err("Scope is not eligible for one-time Identity classification".into());
+        }
+        let identity = self
+            .read_identity_authority(&authorization.person_id)?
+            .ok_or("Scope owner Identity authority is not registered")?;
+        if self.identity_is_retired(&authorization.person_id)? {
+            return Err("Scope owner Identity root has been retired".into());
+        }
+        let verified = identity.view.verify()?;
+        if !verified.is_active_device(&authorization.device_id)? {
+            return Err("Scope purpose signer is not an active Identity device".into());
+        }
+        let device_key = verify_device_certificate_chain(
+            &identity.view.identity(),
+            &authorization.device_id,
+            &certificate_chain(
+                &identity.view.identity(),
+                &authorization.device_id,
+                &verified.certificates_by_device,
+            )?,
+            SIGNATURE_DOMAIN,
+        )?;
+        if !verify_signed_envelope(&request.authorization, &device_key, SIGNATURE_DOMAIN)? {
+            return Err("Invalid scope purpose owner signature".into());
+        }
+        let receipt = sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(ScopePurposeReceiptPayload {
+                kind: "rusty-scope-purpose-receipt".into(),
+                version: 1,
+                service_id,
+                origin: origin.to_owned(),
+                scope_id: scope.to_owned(),
+                scope_purpose: "person-identity".into(),
+                person_id: authorization.person_id,
+                policy_revision: policy.revision,
+                request_id: authorization.request_id.clone(),
+                request_hash: request_hash.clone(),
+                committed_at: now,
+                enforcement: self.enforcement_state(),
+            })
+            .map_err(|_| "Invalid scope purpose receipt")?,
+            public_key_id(&self.public_key()?)?,
+            DOMAIN,
+        )?;
+        policy.scope_purpose = Some("person-identity".into());
+        policy.completed_scope_purpose_update = Some(CompletedScopePurposeUpdate {
+            request_id: authorization.request_id,
+            request_hash,
+            receipt: receipt.clone(),
+        });
+        atomic_write(
+            &self.scope_dir(scope)?.join("policy.json"),
+            &serde_json::to_vec(&policy).map_err(|_| "Scope purpose state invalid")?,
+        )?;
+        Ok(receipt)
+    }
+    fn verify_identity_request_proof(
+        &self,
+        envelope: &SignedEnvelope<Value>,
+        scope: &str,
+        action: &str,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        origin: &str,
+    ) -> Result<(), String> {
+        let proof: IdentityRequestProof = serde_json::from_value(envelope.payload.clone())
+            .map_err(|_| "Invalid Identity request proof")?;
+        let service_id = public_key_id(&self.public_key()?)?;
+        let stored = self
+            .read_identity_authority(&proof.person_id)?
+            .ok_or("Identity authority is not registered")?;
+        if self.identity_is_retired(&proof.person_id)? {
+            return Err("Identity root has been retired".into());
+        }
+        proof.verify(
+            envelope,
+            &stored.view,
+            &service_id,
+            origin,
+            scope,
+            action,
+            token,
+            method,
+            path,
+            body,
+            now_ms()?,
+        )?;
+        let policy = self.policy(scope)?;
+        let fixed_owner_person_id = policy
+            .owner_person_id
+            .as_deref()
+            .ok_or("Storage resource owner is unavailable")?;
+        let current_scope_authority = if policy.scope_purpose.as_deref() == Some("workspace") {
+            Some(
+                self.read_scope_authority(scope)?
+                    .ok_or("Workspace scope authority is unavailable")?,
+            )
+        } else {
+            None
+        };
+        let effective_owner_person_id = if let Some(stored) = &current_scope_authority {
+            meta_mesh_core::validate_scope_authority_at(&stored.snapshot, now_ms()? as i128)
+                .map_err(|_| "Workspace scope authority is invalid")?
+                .controller
+                .person_id
+        } else {
+            fixed_owner_person_id.to_owned()
+        };
+        if effective_owner_person_id == proof.person_id {
+            if proof.grant_id.is_some() || proof.policy_epoch != policy.revision {
+                return Err("Invalid owner storage request epoch".into());
+            }
+            return Ok(());
+        }
+        let grant_id = proof
+            .grant_id
+            .as_deref()
+            .ok_or("Storage principal grant is unavailable")?;
+        let stored_grant = self.read_resource_principal_grant(scope, &proof.person_id, origin)?;
+        let grant = &stored_grant.grant;
+        if let Some(current) = &current_scope_authority
+            && !scope_snapshot_contains(&current.snapshot, &grant.payload.scope_authority)
+        {
+            return Err("Storage principal grant is outside accepted scope history".into());
+        }
+        if grant.payload.grant_id != grant_id
+            || grant.payload.subject_person_id != proof.person_id
+            || grant.payload.policy_epoch != proof.policy_epoch
+            || grant.payload.subject_public_key != stored.view.identity_public_key
+            || !grant
+                .payload
+                .actions
+                .iter()
+                .any(|candidate| candidate == action)
+            || (action == "read" && grant.payload.read_token_hash != proof.token_hash)
+            || (action == "write" && grant.payload.write_token_hash != proof.token_hash)
+        {
+            return Err("Storage principal grant does not authorize request".into());
+        }
+        Ok(())
+    }
+    fn resource_principal_path(&self, scope: &str, person_id: &str) -> Result<PathBuf, String> {
+        if !valid_id(scope) || !valid_id(person_id) {
+            return Err("Invalid storage principal".into());
+        }
+        Ok(self
+            .scope_dir(scope)?
+            .join("principals")
+            .join(format!("{person_id}.json")))
+    }
+    fn scope_has_principal_grants(&self, scope: &str) -> Result<bool, String> {
+        let path = self.scope_dir(scope)?.join("principals");
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut entries =
+            fs::read_dir(path).map_err(|_| "Storage principal directory unavailable")?;
+        Ok(entries
+            .next()
+            .transpose()
+            .map_err(|_| "Storage principal directory unavailable")?
+            .is_some())
+    }
+    fn read_resource_principal_grant(
+        &self,
+        scope: &str,
+        subject_person_id: &str,
+        origin: &str,
+    ) -> Result<StoredResourcePrincipalGrant, String> {
+        let path = self.resource_principal_path(scope, subject_person_id)?;
+        let stored: StoredResourcePrincipalGrant = serde_json::from_slice(
+            &fs::read(path).map_err(|_| "Storage principal grant is unavailable")?,
+        )
+        .map_err(|_| "Invalid stored storage principal grant")?;
+        let grant = &stored.grant;
+        let payload = &grant.payload;
+        let owner = self
+            .read_identity_authority(&payload.owner_person_id)?
+            .ok_or("Storage owner Identity authority is unavailable")?
+            .view
+            .verify()?;
+        payload.verify(
+            grant,
+            &owner,
+            &public_key_id(&self.public_key()?)?,
+            origin,
+            scope,
+            false,
+            now_ms()?,
+        )?;
+        if payload.subject_person_id != subject_person_id {
+            return Err("Storage principal grant subject mismatch".into());
+        }
+        Ok(stored)
+    }
+    fn register_resource_principal_grant(
+        &self,
+        scope: &str,
+        grant_id: &str,
+        request: ResourcePrincipalGrantRequest,
+        origin: &str,
+    ) -> Result<(), String> {
+        if request.version != 1 || !valid_id(scope) || !valid_id(grant_id) {
+            return Err("Invalid storage principal grant request".into());
+        }
+        let payload = &request.grant.payload;
+        let owner_gate = self.identity_authority_gate(&payload.owner_person_id)?;
+        let _owner_guard = owner_gate
+            .try_write()
+            .map_err(|_| "Identity authority lock unavailable")?;
+        let scope_gate = self.resource_scope_gate(scope)?;
+        let _scope_guard = scope_gate
+            .try_write()
+            .map_err(|_| "Resource scope lock unavailable")?;
+        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        if self.identity_is_retired(&payload.owner_person_id)? {
+            return Err("Storage owner Identity root has been retired".into());
+        }
+        let policy = self.policy(scope)?;
+        if policy.owner_person_id.is_none() {
+            return Err("Storage resource owner is unavailable".into());
+        }
+        let accepted_scope_authority = self
+            .read_scope_authority(scope)?
+            .ok_or("Storage scope authority is not registered")?;
+        if payload.scope_authority != accepted_scope_authority.snapshot {
+            return Err("Storage principal grant does not use the accepted scope authority".into());
+        }
+        let owner = self
+            .read_identity_authority(&payload.owner_person_id)?
+            .ok_or("Storage owner Identity authority is not registered")?
+            .view
+            .verify()?;
+        payload.verify(
+            &request.grant,
+            &owner,
+            &public_key_id(&self.public_key()?)?,
+            origin,
+            scope,
+            true,
+            now_ms()?,
+        )?;
+        if payload.grant_id != grant_id {
+            return Err("Storage principal grant ID mismatch".into());
+        }
+        let path = self.resource_principal_path(scope, &payload.subject_person_id)?;
+        if path.exists() {
+            let previous: StoredResourcePrincipalGrant = serde_json::from_slice(
+                &fs::read(&path).map_err(|_| "Storage principal grant unavailable")?,
+            )
+            .map_err(|_| "Invalid stored storage principal grant")?;
+            let previous_payload = &previous.grant.payload;
+            if previous_payload.policy_epoch > payload.policy_epoch {
+                return Err("Storage principal grant epoch is stale".into());
+            }
+            if previous_payload.policy_epoch == payload.policy_epoch {
+                if previous.grant == request.grant {
+                    return Ok(());
+                }
+                return Err("Storage principal grant epoch conflicts".into());
+            }
+            if previous_payload.owner_person_id != payload.owner_person_id
+                || previous_payload.subject_person_id != payload.subject_person_id
+                || previous_payload.subject_public_key != payload.subject_public_key
+                || previous_payload.workspace_id != payload.workspace_id
+            {
+                return Err("Storage principal grant binding changed".into());
+            }
+        }
+        let stored = StoredResourcePrincipalGrant {
+            grant: request.grant,
+        };
+        atomic_write(
+            &path,
+            &serde_json::to_vec(&stored).map_err(|_| "Invalid storage principal grant")?,
+        )
     }
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
@@ -1813,6 +3255,13 @@ impl BlindStore {
             if request.management_capability.is_some() {
                 return Err("Public delivery writers cannot manage publication".into());
             }
+            if !self.identity_device_certificate_matches(
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+            )? {
+                return Err("Public delivery device is revoked or not registered".into());
+            }
             let publication = current.as_ref().ok_or("Public publication unavailable")?;
             let grant = request
                 .delivery_grant
@@ -2049,6 +3498,13 @@ impl BlindStore {
                 || request.delivery_policy.is_some()
             {
                 return Err("Public delivery writers may only update content".into());
+            }
+            if !self.identity_device_certificate_matches(
+                &request.identity,
+                &request.device_id,
+                &request.certificates,
+            )? {
+                return Err("Public delivery device is revoked or not registered".into());
             }
             let publication = current.as_ref().ok_or("Public publication unavailable")?;
             let grant = request
@@ -2454,6 +3910,8 @@ impl BlindStore {
             write_mac: self.token_mac(scope, &approval.write_token)?,
             revoked: approval.revoked,
             owner_person_id: None,
+            scope_purpose: None,
+            completed_scope_purpose_update: None,
             completed_enrollment: None,
         };
         fs::create_dir_all(directory.join("objects")).map_err(|e| e.to_string())?;
@@ -2485,6 +3943,7 @@ impl BlindStore {
         person_id: &str,
         device_id: &str,
         device_key_id: &str,
+        scope_purpose: Option<&str>,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
         let now = now_ms()?;
@@ -2532,22 +3991,22 @@ impl BlindStore {
         let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
         let service_public_key = self.public_key()?;
         let service_id = public_key_id(&service_public_key)?;
-        let envelope = sign_json_envelope(
-            &self.seed,
-            json!({
-                "kind": "rusty-enrollment-challenge", "version": 1,
-                "challengeId": challenge_id, "nonce": nonce, "serviceId": service_id,
-                "publicOrigin": origin, "scopeId": scope, "personId": person_id,
-                "deviceId": device_id, "deviceKeyId": device_key_id,
-                "expectedRevision": revision, "issuedAt": issued_at, "expiresAt": expires_at
-            }),
-            service_id,
-            DOMAIN,
-        )?;
+        let mut challenge_payload = json!({
+            "kind": "rusty-enrollment-challenge", "version": 1,
+            "challengeId": challenge_id, "nonce": nonce, "serviceId": service_id,
+            "publicOrigin": origin, "scopeId": scope, "personId": person_id,
+            "deviceId": device_id, "deviceKeyId": device_key_id,
+            "expectedRevision": revision, "issuedAt": issued_at, "expiresAt": expires_at
+        });
+        if let Some(scope_purpose) = scope_purpose {
+            challenge_payload["scopePurpose"] = json!(scope_purpose);
+        }
+        let envelope = sign_json_envelope(&self.seed, challenge_payload, service_id, DOMAIN)?;
         let pending = PendingChallenge {
             scope_id: scope.into(),
             person_id: person_id.into(),
             device_id: device_id.into(),
+            scope_purpose: scope_purpose.map(str::to_owned),
             expires_at,
             envelope: envelope.clone(),
         };
@@ -2564,6 +4023,10 @@ impl BlindStore {
         owner: &ResourceOwner,
         origin: &str,
     ) -> Result<SignedEnvelope<Value>, String> {
+        let scope_gate = self.resource_scope_gate(scope)?;
+        let _scope_guard = scope_gate
+            .try_write()
+            .map_err(|_| "Resource scope lock unavailable")?;
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
         if !trusted_identity_matches(&request.identity, &owner.identity)
             || request.certificates.is_empty()
@@ -2619,6 +4082,14 @@ impl BlindStore {
         }
         if proof.kind != "rusty-scope-enrollment"
             || proof.version != 1
+            || proof.scope_purpose.as_deref()
+                != challenge_payload
+                    .get("scopePurpose")
+                    .and_then(Value::as_str)
+            || proof
+                .scope_purpose
+                .as_deref()
+                .is_some_and(|purpose| !valid_scope_purpose(purpose))
             || payload_challenge_id != challenge_id
             || Some(proof.nonce.as_str()) != challenge_payload.get("nonce").and_then(Value::as_str)
             || Some(proof.service_id.as_str())
@@ -2653,9 +4124,26 @@ impl BlindStore {
                 write_mac: String::new(),
                 revoked: false,
                 owner_person_id: None,
+                scope_purpose: None,
+                completed_scope_purpose_update: None,
                 completed_enrollment: None,
             }
         };
+        if self.identity_authority_enforced.load(Ordering::SeqCst) && proof.scope_purpose.is_none()
+        {
+            return Err("Strict Identity enforcement requires a scope purpose".into());
+        }
+        if current.scope_purpose.as_deref().is_some_and(|purpose| {
+            proof
+                .scope_purpose
+                .as_deref()
+                .is_some_and(|requested| requested != purpose)
+        }) || (current.revision > 0
+            && current.scope_purpose.is_none()
+            && proof.scope_purpose.is_some())
+        {
+            return Err("Scope purpose is immutable; use the one-time migration route".into());
+        }
         let normalized_request =
             serde_json::to_value(&request).map_err(|_| "Enrollment request invalid")?;
         let request_hash = digest(canonicalize_json(&normalized_request)?.as_bytes());
@@ -2687,6 +4175,7 @@ impl BlindStore {
             || pending.scope_id != scope
             || pending.person_id != request.identity.person_id
             || pending.device_id != request.device_id
+            || pending.scope_purpose.as_deref() != proof.scope_purpose.as_deref()
             || pending.expires_at <= now_ms()?
         {
             return Err("Enrollment challenge binding or expiry invalid".into());
@@ -2743,6 +4232,11 @@ impl BlindStore {
             write_mac: self.token_mac(scope, &request.write_token)?,
             revoked: request.revoked,
             owner_person_id: Some(request.identity.person_id.clone()),
+            scope_purpose: current
+                .scope_purpose
+                .clone()
+                .or_else(|| proof.scope_purpose.clone()),
+            completed_scope_purpose_update: current.completed_scope_purpose_update,
             completed_enrollment: None,
         };
         let receipt = sign_json_envelope(
@@ -3074,8 +4568,9 @@ pub fn router_with_telemetry(
         .route("/assets/{name}", get(crate::service_ui::asset))
         .route(
             "/health",
-            get(|| async { Json(json!({"status": "ok", "mode": "blind", "buildSha": crate::build_identity::build_sha(),
+            get(|State(state): State<HttpState>| async move { Json(json!({"status": "ok", "mode": "blind", "buildSha": crate::build_identity::build_sha(),
                 "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
+                "identityAuthorityEnforcement": state.store.identity_authority_enforcement(),
                 "readers": {"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1, "publicBoardPublication": 1}})) }),
         )
         .route("/.well-known/mesh-lighthouse", get(discovery))
@@ -3088,10 +4583,43 @@ pub fn router_with_telemetry(
             "/v2/management/{kind}/{id}/status",
             axum::routing::post(management::status),
         )
+        .route(
+            "/v2/identity/authority/{person_id}/status",
+            get(identity_authority_status),
+        )
+        .route(
+            "/v2/identity/authority",
+            put(identity_authority_update).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
+        .route(
+            "/v2/identity/succession/{previous_person_id}/{transition_hash}",
+            get(identity_root_succession_status),
+        )
+        .route(
+            "/v2/identity/succession",
+            put(identity_root_succession_update)
+                .layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
+        .route(
+            "/v2/scopes/{scope}/purpose",
+            put(scope_purpose_update).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
+        .route(
+            "/v2/scopes/{scope}/authority/status",
+            get(scope_authority_status),
+        )
+        .route(
+            "/v2/scopes/{scope}/authority",
+            put(scope_authority_update).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         .route("/v2/scopes/{scope}", put(approve_scope))
         .route(
             "/v2/scopes/{scope}/checkpoint",
             axum::routing::post(checkpoint::checkpoint),
+        )
+        .route(
+            "/v2/scopes/{scope}/principals/{grant_id}",
+            put(storage_principal_grant).layer(DefaultBodyLimit::max(512 * 1024)),
         )
         .route("/v2/scopes/{scope}/objects", get(inventory))
         .route(
@@ -3134,6 +4662,7 @@ pub fn router_with_telemetry(
             get(public_file),
         )
         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES * 2))
+        .layer(from_fn_with_state(state.clone(), identity_request_gate))
         .layer(
             CorsLayer::new()
                 .allow_origin(cors_origins)
@@ -3146,6 +4675,7 @@ pub fn router_with_telemetry(
                     axum::http::header::AUTHORIZATION,
                     axum::http::header::CONTENT_TYPE,
                     axum::http::HeaderName::from_static("x-rusty-request-id"),
+                    axum::http::HeaderName::from_static("x-rusty-identity-proof"),
                     axum::http::HeaderName::from_static("x-rusty-client"),
                     axum::http::HeaderName::from_static("x-rusty-build"),
                     axum::http::HeaderName::from_static("traceparent"),
@@ -3157,6 +4687,149 @@ pub fn router_with_telemetry(
             observe_request,
         ))
         .with_state(state))
+}
+async fn identity_request_gate(
+    State(state): State<HttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path_and_query().map_or_else(
+        || request.uri().path().to_owned(),
+        |value| value.as_str().to_owned(),
+    );
+    let path_only = request.uri().path().to_owned();
+    if !path_only.starts_with("/v2/scopes/") || !path_only.contains('/') {
+        return next.run(request).await;
+    }
+    let segments = path_only.split('/').collect::<Vec<_>>();
+    if segments.len() < 5 || segments[1] != "v2" || segments[2] != "scopes" {
+        return next.run(request).await;
+    }
+    let scope = segments[3];
+    if !valid_id(scope) || segments[4] == "principals" {
+        return next.run(request).await;
+    }
+    if matches!(segments.get(4), Some(&"purpose") | Some(&"authority")) {
+        return next.run(request).await;
+    }
+    if request.headers().get("x-rusty-identity-proof").is_none() {
+        if !state
+            .store
+            .identity_authority_enforced
+            .load(Ordering::SeqCst)
+        {
+            return next.run(request).await;
+        }
+        return failure(
+            StatusCode::PRECONDITION_REQUIRED,
+            "Signed Identity request proof required",
+        )
+        .into_response();
+    }
+    let method = request.method().as_str().to_owned();
+    let action = match (method.as_str(), path_only.as_str()) {
+        ("GET", _) => "read",
+        ("PUT", _) => "write",
+        ("POST", route) if route.ends_with("/checkpoint") => "write",
+        ("POST", _) => "read",
+        _ => {
+            return failure(StatusCode::METHOD_NOT_ALLOWED, "Unsupported storage method")
+                .into_response();
+        }
+    };
+    let token = match request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+    {
+        Some(token) => token.to_owned(),
+        None => {
+            return failure(StatusCode::UNAUTHORIZED, "Storage authentication required")
+                .into_response();
+        }
+    };
+    let proof_bytes = match request
+        .headers()
+        .get("x-rusty-identity-proof")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 48 * 1024)
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+    {
+        Some(proof) => proof,
+        None => {
+            return failure(
+                StatusCode::PRECONDITION_REQUIRED,
+                "Signed Identity request proof required",
+            )
+            .into_response();
+        }
+    };
+    let proof: SignedEnvelope<Value> = match serde_json::from_slice(&proof_bytes) {
+        Ok(proof) => proof,
+        Err(_) => {
+            return failure(StatusCode::BAD_REQUEST, "Invalid Identity request proof")
+                .into_response();
+        }
+    };
+    let person_id = match proof.payload.get("personId").and_then(Value::as_str) {
+        Some(person_id) if valid_id(person_id) => person_id.to_owned(),
+        _ => {
+            return failure(StatusCode::BAD_REQUEST, "Invalid Identity request proof")
+                .into_response();
+        }
+    };
+    let authority_gate = match state.store.identity_authority_gate(&person_id) {
+        Ok(gate) => gate,
+        Err(_) => {
+            return failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Identity authority unavailable",
+            )
+            .into_response();
+        }
+    };
+    let _authority_guard = authority_gate.read_owned().await;
+    let scope_gate = match state.store.resource_scope_gate(scope) {
+        Ok(gate) => gate,
+        Err(_) => {
+            return failure(StatusCode::SERVICE_UNAVAILABLE, "Storage scope unavailable")
+                .into_response();
+        }
+    };
+    let _scope_guard = scope_gate.read_owned().await;
+    let (parts, request_body) = request.into_parts();
+    let body = match to_bytes(request_body, (MAX_OBJECT_BYTES * 2) as usize).await {
+        Ok(body) => body,
+        Err(_) => {
+            return failure(StatusCode::BAD_REQUEST, "Storage request body unavailable")
+                .into_response();
+        }
+    };
+    let verified = state.store.verify_identity_request_proof(
+        &proof,
+        scope,
+        action,
+        &token,
+        &method,
+        &path,
+        &body,
+        &state.origin,
+    );
+    if let Err(message) = verified {
+        let status = if message.contains("not registered") {
+            StatusCode::PRECONDITION_REQUIRED
+        } else if message.contains("head") || message.contains("digest") {
+            StatusCode::CONFLICT
+        } else if message.contains("signature") || message.contains("revoked") {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        return failure(status, &message).into_response();
+    }
+    next.run(Request::from_parts(parts, Body::from(body))).await
 }
 async fn observe_request(
     State(telemetry): State<Telemetry>,
@@ -3280,6 +4953,7 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
             "artifactSha256": crate::build_identity::artifact_sha256(), "sdkSha": crate::build_identity::sdk_sha(),
             "readers": {"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1, "publicBoardPublication": 1},
         "service": {"serviceId": service_id, "publicKey": public_key},
+        "identityAuthorityEnforcement": state.store.identity_authority_enforcement(),
         "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1,"fieldConfigurationVersion":1,"deliveryVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"deviceAccessRestoration":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
     ))
 }
@@ -3732,6 +5406,344 @@ async fn approve_scope(
     })?;
     Ok(Json(json!({"receipt": receipt})))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentityAuthorityStatusQuery {
+    nonce: String,
+}
+
+async fn identity_authority_status(
+    State(state): State<HttpState>,
+    RoutePath(person_id): RoutePath<String>,
+    Query(query): Query<IdentityAuthorityStatusQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !valid_id(&person_id) || !valid_nonce(&query.nonce) {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Identity authority status nonce required",
+        ));
+    }
+    let path_and_query = format!(
+        "/v2/identity/authority/{person_id}/status?nonce={}",
+        query.nonce
+    );
+    let request_hash = status_request_hash(&path_and_query).map_err(|_| {
+        failure(
+            StatusCode::BAD_REQUEST,
+            "Invalid Identity authority status request",
+        )
+    })?;
+    let status = tokio::task::spawn_blocking(move || {
+        state.store.signed_identity_authority_status(
+            &person_id,
+            &state.origin,
+            &query.nonce,
+            &request_hash,
+        )
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Identity authority unavailable",
+        )
+    })?
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Identity authority unavailable",
+        )
+    })?;
+    Ok(Json(json!({"status": status})))
+}
+
+async fn identity_authority_update(
+    State(state): State<HttpState>,
+    Json(request): Json<AuthorityUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let origin = state.origin.clone();
+    match tokio::task::spawn_blocking(move || {
+        state.store.update_identity_authority(request, &origin)
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Identity authority unavailable",
+        )
+    })? {
+        Ok(receipt) => Ok(Json(json!({"receipt": receipt}))),
+        Err((message, Some(authority_status))) => Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": "identity_authority_stale",
+                "message": message,
+                "authorityStatus": authority_status,
+            })),
+        )),
+        Err((message, None)) => {
+            let status = if message.contains("signature")
+                || message.contains("revoked")
+                || message.contains("active")
+                || message.contains("authority")
+            {
+                StatusCode::FORBIDDEN
+            } else if message.contains("nonce") || message.contains("expiry") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            Err(failure(status, &message))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentityRootSuccessionStatusQuery {
+    request_id: String,
+    request_hash: String,
+}
+
+async fn identity_root_succession_status(
+    State(state): State<HttpState>,
+    RoutePath((previous_person_id, transition_hash)): RoutePath<(String, String)>,
+    Query(query): Query<IdentityRootSuccessionStatusQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let valid_transition_hash = URL_SAFE_NO_PAD
+        .decode(&transition_hash)
+        .is_ok_and(|bytes| bytes.len() == 32);
+    if !valid_id(&previous_person_id) || !valid_transition_hash || !valid_nonce(&query.request_id) {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Identity succession status request is invalid",
+        ));
+    }
+    let origin = state.origin.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        state.store.signed_identity_succession_status(
+            &previous_person_id,
+            &transition_hash,
+            &query.request_id,
+            &query.request_hash,
+            &origin,
+        )
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Identity succession unavailable",
+        )
+    })?
+    .map_err(|_| {
+        failure(
+            StatusCode::BAD_REQUEST,
+            "Identity succession status binding is invalid",
+        )
+    })?;
+    Ok(Json(json!({"status": status})))
+}
+
+async fn identity_root_succession_update(
+    State(state): State<HttpState>,
+    Json(request): Json<IdentityRootSuccessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let origin = state.origin.clone();
+    match tokio::task::spawn_blocking(move || {
+        state
+            .store
+            .update_identity_root_succession(request, &origin)
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Identity succession unavailable",
+        )
+    })? {
+        Ok(receipt) => Ok(Json(json!({"receipt": receipt}))),
+        Err((message, _status)) => {
+            let code = if message.contains("signature")
+                || message.contains("active")
+                || message.contains("revoked")
+                || message.contains("root has been retired")
+            {
+                StatusCode::FORBIDDEN
+            } else if message.contains("stale")
+                || message.contains("already")
+                || message.contains("requires strict")
+            {
+                StatusCode::CONFLICT
+            } else if message.contains("unavailable") || message.contains("Storage lock") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            Err(failure(code, &message))
+        }
+    }
+}
+
+async fn scope_purpose_update(
+    State(state): State<HttpState>,
+    RoutePath(scope): RoutePath<String>,
+    Json(request): Json<ScopePurposeUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    match tokio::task::spawn_blocking({
+        let store = state.store.clone();
+        let origin = state.origin.clone();
+        move || store.update_scope_purpose(&scope, request, &origin)
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Scope classification unavailable",
+        )
+    })? {
+        Ok(receipt) => Ok(Json(json!({"receipt": receipt}))),
+        Err(message) => {
+            let status = if message.contains("signature")
+                || message.contains("active")
+                || message.contains("owner")
+                || message.contains("Identity authority")
+            {
+                StatusCode::FORBIDDEN
+            } else if message.contains("immutable") || message.contains("eligible") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            Err(failure(status, &message))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScopeAuthorityStatusQuery {
+    request_id: String,
+    request_hash: String,
+}
+
+async fn scope_authority_status(
+    State(state): State<HttpState>,
+    RoutePath(scope): RoutePath<String>,
+    Query(query): Query<ScopeAuthorityStatusQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !valid_id(&scope)
+        || !valid_nonce(&query.request_id)
+        || query.request_hash.len() != 43
+        || scope_authority_status_request_hash(&scope, &query.request_id).map_err(|_| {
+            failure(
+                StatusCode::BAD_REQUEST,
+                "Invalid scope authority status request",
+            )
+        })? != query.request_hash
+    {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Invalid scope authority status request",
+        ));
+    }
+    let status = tokio::task::spawn_blocking(move || {
+        state.store.signed_scope_authority_status(
+            &scope,
+            &state.origin,
+            &query.request_id,
+            &query.request_hash,
+        )
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Scope authority unavailable",
+        )
+    })?
+    .map_err(|message| {
+        let status = if message.contains("Person Identity") {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        failure(status, &message)
+    })?;
+    Ok(Json(json!({"status": status})))
+}
+
+async fn scope_authority_update(
+    State(state): State<HttpState>,
+    RoutePath(scope): RoutePath<String>,
+    Json(request): Json<ScopeAuthorityUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let origin = state.origin.clone();
+    match tokio::task::spawn_blocking(move || {
+        state.store.update_scope_authority(&scope, request, &origin)
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Scope authority unavailable",
+        )
+    })? {
+        Ok(receipt) => Ok(Json(json!({"receipt": receipt}))),
+        Err((message, Some(authority_status))) => Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": "scope_authority_stale",
+                "message": message,
+                "authorityStatus": authority_status,
+            })),
+        )),
+        Err((message, None)) => {
+            let status = if message.contains("signature")
+                || message.contains("active")
+                || message.contains("revoked")
+                || message.contains("Identity authority")
+            {
+                StatusCode::FORBIDDEN
+            } else if message.contains("immutable") || message.contains("already used") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            Err(failure(status, &message))
+        }
+    }
+}
+
+async fn storage_principal_grant(
+    State(state): State<HttpState>,
+    RoutePath((scope, grant_id)): RoutePath<(String, String)>,
+    Json(request): Json<ResourcePrincipalGrantRequest>,
+) -> Result<StatusCode, ApiError> {
+    let origin = state.origin.clone();
+    tokio::task::spawn_blocking(move || {
+        state
+            .store
+            .register_resource_principal_grant(&scope, &grant_id, request, &origin)
+    })
+    .await
+    .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "Storage grant unavailable"))?
+    .map_err(|message| {
+        let status = if message.contains("not registered") {
+            StatusCode::PRECONDITION_REQUIRED
+        } else if message.contains("stale") || message.contains("conflict") {
+            StatusCode::CONFLICT
+        } else if message.contains("signature") || message.contains("active") {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        failure(status, &message)
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn upload(
     State(state): State<HttpState>,
     RoutePath((scope, object_id)): RoutePath<(String, String)>,

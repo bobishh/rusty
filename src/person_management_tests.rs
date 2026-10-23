@@ -62,12 +62,17 @@ async fn given_person_policy_when_other_certified_devices_create_resources_after
     for (seed, scope) in [(41, "new-scope-a"), (42, "new-scope-b")] {
         let request = creation(&f, "scope", scope, seed, &parent);
         let response = f.put_resource("scope", scope, &request).await;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .unwrap_or_else(|error| json!({"error":error.to_string()}));
         assert_eq!(
-            response.status(),
+            status,
             StatusCode::OK,
-            "unrelated certified owner device must create scope"
+            "unrelated certified owner device must create scope: {body}"
         );
-        let cap = response.json::<Value>().await.unwrap()["capability"].clone();
+        let cap = body["capability"].clone();
         assert_eq!(cap["payload"]["kind"], "rusty-scope-management-capability");
         assert_eq!(
             f.challenge(seed, Some(cap), scope).await.status(),

@@ -45,6 +45,19 @@ impl Fixture {
         let owner = ResourceOwner {
             identity: serde_json::from_value(identity).unwrap(),
         };
+        let authority = crate::identity_authority::StoredIdentityAuthority {
+            view: crate::identity_authority::test_authority_view(
+                &owner.identity,
+                &[31; 32],
+                &[32, 33, 41, 42, 43],
+            ),
+            recent_updates: Vec::new(),
+        };
+        let authority_path = store
+            .identity_authority_path(&owner.identity.person_id)
+            .unwrap();
+        std::fs::create_dir_all(authority_path.parent().unwrap()).unwrap();
+        std::fs::write(authority_path, serde_json::to_vec(&authority).unwrap()).unwrap();
         let mut fixture = Self {
             directory,
             store: Some(store),
@@ -343,6 +356,208 @@ async fn given_confirmed_person_capability_when_unrelated_owner_device_connects_
             .await
             .status(),
         StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn root_replacement_preserves_board_management_and_allows_successor_app_update() {
+    use crate::identity_authority::{
+        test_authority_update_request, test_authority_view, test_authority_view_with_devices,
+        test_identity_root_succession_request,
+    };
+    use meta_mesh_core::{
+        DeviceCertificatePayload, PublicIdentity, public_key_from_seed, public_key_id,
+        sign_device_certificate,
+    };
+
+    let fixture = Fixture::new().await;
+    let resource_id = "succession-board";
+    let first = fixture
+        .put_resource(
+            "board",
+            resource_id,
+            &fixture.update_resource(
+                "board",
+                resource_id,
+                0,
+                vec![],
+                None,
+                32,
+                vec![
+                    "management.update",
+                    "publication.publish",
+                    "publication.status",
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let index_path = fixture.directory.join("management/policy.json");
+    let index: Value = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    let record_hash = index["resources"]["board/succession-board"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let original_path = fixture
+        .directory
+        .join("management/records")
+        .join(format!("{record_hash}.json"));
+    let original_bytes = fs::read(&original_path).unwrap();
+
+    let old_view = test_authority_view(&fixture.owner.identity, &[31; 32], &[32, 33, 41, 42, 43]);
+    let new_root_seed = [73; 32];
+    let new_root_key = public_key_from_seed(&new_root_seed).unwrap();
+    let new_identity = PublicIdentity {
+        person_id: public_key_id(&new_root_key).unwrap(),
+        public_key: new_root_key,
+        display_name: "Successor".into(),
+    };
+    let manager_seed = [74; 32];
+    let app_seed = [75; 32];
+    let new_view =
+        test_authority_view_with_devices(&new_identity, &new_root_seed, &[(74, true), (75, false)]);
+    let service_id = public_key_id(&fixture.store().public_key().unwrap()).unwrap();
+    let new_update = test_authority_update_request(
+        new_view.clone(),
+        &manager_seed,
+        &service_id,
+        ORIGIN,
+        now_ms().unwrap(),
+    );
+    let store = fixture.store().clone();
+    tokio::task::spawn_blocking(move || store.update_identity_authority(new_update, ORIGIN))
+        .await
+        .unwrap()
+        .unwrap();
+    let succession = test_identity_root_succession_request(
+        &fixture.owner.identity,
+        &[31; 32],
+        &old_view,
+        &new_identity,
+        &new_root_seed,
+        &manager_seed,
+        &service_id,
+        ORIGIN,
+        now_ms().unwrap(),
+    );
+    fixture
+        .store()
+        .enable_identity_authority_enforcement()
+        .unwrap();
+    let root_response = fixture
+        .client
+        .put(format!("{}/v2/identity/succession", fixture.url))
+        .json(&succession)
+        .send()
+        .await
+        .unwrap();
+    let root_status = root_response.status();
+    let root_body = root_response.text().await.unwrap();
+    assert_eq!(root_status, StatusCode::OK, "{root_body}");
+    assert_eq!(fs::read(&original_path).unwrap(), original_bytes);
+
+    let device_public_key = public_key_from_seed(&app_seed).unwrap();
+    let device_id = public_key_id(&device_public_key).unwrap();
+    let app_certificate = sign_device_certificate(
+        &new_root_seed,
+        DeviceCertificatePayload {
+            kind: "device-certificate".into(),
+            version: 1,
+            person_id: new_identity.person_id.clone(),
+            device_id: device_id.clone(),
+            device_public_key,
+            issuer_certificate_hash: None,
+            can_enroll_devices: false,
+        },
+        &new_identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let status_now = now_ms().unwrap();
+    let status_authorization = sign_json_envelope(
+        &app_seed,
+        json!({
+            "kind":"rusty-management-policy-status", "version":1,
+            "serviceId":service_id, "origin":ORIGIN, "personId":new_identity.person_id,
+            "deviceId":device_id, "resourceKind":"board", "resourceId":resource_id,
+            "requestId":URL_SAFE_NO_PAD.encode(rand::random::<[u8;32]>()),
+            "issuedAt":status_now, "expiresAt":status_now+60000
+        }),
+        &device_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let status_response = fixture
+        .client
+        .post(format!(
+            "{}/v2/management/board/{resource_id}/status",
+            fixture.url
+        ))
+        .json(&json!({
+            "version":1, "identity":new_identity, "deviceId":device_id,
+            "certificates":[app_certificate], "authorization":status_authorization
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status_code = status_response.status();
+    let status_body: Value = status_response.json().await.unwrap();
+    assert_eq!(
+        status_code,
+        StatusCode::OK,
+        "successor app-only device must retain board administration: {status_body}"
+    );
+    let status = status_body;
+    let projected_capability = status["capability"].clone();
+    assert_eq!(
+        projected_capability["payload"]["personId"],
+        new_identity.person_id
+    );
+    assert_eq!(
+        projected_capability["payload"]["operations"],
+        json!([
+            "management.update",
+            "publication.publish",
+            "publication.status"
+        ])
+    );
+    let now = now_ms().unwrap();
+    let authorization = sign_json_envelope(
+        &app_seed,
+        json!({
+            "kind":"rusty-management-policy-update", "version":1,
+            "serviceId":service_id, "origin":ORIGIN, "personId":new_identity.person_id,
+            "deviceId":device_id, "resourceKind":"board", "resourceId":resource_id,
+            "expectedRevision":projected_capability["payload"]["revision"],
+            "operations":["management.update", "publication.publish", "publication.status"],
+            "revokedDeviceIds":[], "requestId":URL_SAFE_NO_PAD.encode(rand::random::<[u8;32]>()),
+            "issuedAt":now, "expiresAt":now+60000
+        }),
+        &device_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let update = json!({
+        "version":1, "identity":new_identity, "deviceId":device_id,
+        "certificates":[app_certificate], "managementCapability":projected_capability,
+        "authorization":authorization
+    });
+    let response = fixture.put_resource("board", resource_id, &update).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{:?}",
+        response.text().await
+    );
+    let new_index: Value = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    assert_ne!(
+        new_index["resources"]["board/succession-board"],
+        record_hash
+    );
+    assert_eq!(
+        fs::read(&original_path).unwrap(),
+        original_bytes,
+        "successor update must append a new record and preserve the historical signature"
     );
 }
 
