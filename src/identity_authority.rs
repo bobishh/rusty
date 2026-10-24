@@ -1797,6 +1797,35 @@ mod tests {
         (authority, view)
     }
 
+    #[test]
+    fn scope_authority_request_hash_uses_serde_default_arrays() {
+        let device_seed = [81; 32];
+        let (creator, _) = scope_identity(81, &[(81, true)]);
+        let genesis = scope_genesis("workspace-defaults", &creator, &device_seed);
+        let wire_snapshot = json!({"genesis": genesis, "controlTransfers": []});
+        let authorization = sign_json_envelope(
+            &device_seed,
+            json!({"kind": "fixture", "version": 1}),
+            creator.person_id.clone(),
+            SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let request: ScopeAuthorityUpdateRequest = serde_json::from_value(json!({
+            "version": 1,
+            "scopeAuthority": wire_snapshot,
+            "authorization": authorization,
+        }))
+        .unwrap();
+
+        let typed_hash = request.request_hash().unwrap();
+        let typed_snapshot = serde_json::to_value(&request.scope_authority).unwrap();
+        let expected = canonical_hash(&json!({"version": 1, "scopeAuthority": typed_snapshot})).unwrap();
+        let raw_hash = canonical_hash(&json!({"version": 1, "scopeAuthority": wire_snapshot})).unwrap();
+
+        assert_eq!(typed_hash, expected);
+        assert_ne!(typed_hash, raw_hash);
+    }
+
     fn scope_genesis(
         scope_id: &str,
         creator: &ScopeAuthority,
