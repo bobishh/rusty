@@ -2872,7 +2872,8 @@ impl BlindStore {
                 .iter()
                 .any(|candidate| candidate == action)
             || (action == "read" && grant.payload.read_token_hash != proof.token_hash)
-            || (action == "write" && grant.payload.write_token_hash != proof.token_hash)
+            || (action == "write"
+                && grant.payload.write_token_hash.as_deref() != Some(proof.token_hash.as_str()))
         {
             return Err("Storage principal grant does not authorize request".into());
         }
@@ -2926,6 +2927,15 @@ impl BlindStore {
         .map_err(|_| "Invalid stored storage principal grant")?;
         let grant = &stored.grant;
         let payload = &grant.payload;
+        let accepted_scope_authority = self
+            .read_scope_authority(scope)?
+            .ok_or("Storage scope authority is not registered")?;
+        let workspace_id = meta_mesh_core::validate_scope_authority_at(
+            &accepted_scope_authority.snapshot,
+            now_ms()? as i128,
+        )
+        .map_err(|_| "Workspace scope authority is invalid")?
+        .scope_id;
         let owner = self
             .read_identity_authority(&payload.owner_person_id)?
             .ok_or("Storage owner Identity authority is unavailable")?
@@ -2937,6 +2947,7 @@ impl BlindStore {
             &public_key_id(&self.public_key()?)?,
             origin,
             scope,
+            &workspace_id,
             false,
             now_ms()?,
         )?;
@@ -3021,6 +3032,14 @@ impl BlindStore {
         if payload.scope_authority != accepted_scope_authority.snapshot {
             return Err("Storage principal grant does not use the accepted scope authority".into());
         }
+        let validated_scope_authority = meta_mesh_core::validate_scope_authority_at(
+            &accepted_scope_authority.snapshot,
+            now_ms()? as i128,
+        )
+        .map_err(|_| "Workspace scope authority is invalid")?;
+        if payload.workspace_id != validated_scope_authority.scope_id {
+            return Err("Storage principal grant workspace mismatch".into());
+        }
         let owner = self
             .read_identity_authority(&payload.owner_person_id)?
             .ok_or("Storage owner Identity authority is not registered")?
@@ -3032,6 +3051,7 @@ impl BlindStore {
             &public_key_id(&self.public_key()?)?,
             origin,
             scope,
+            &validated_scope_authority.scope_id,
             true,
             now_ms()?,
         )?;

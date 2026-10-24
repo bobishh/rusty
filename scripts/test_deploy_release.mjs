@@ -3,6 +3,31 @@ import assert from 'node:assert/strict';
 import { parseRustyDeploySpec } from './deploy_release.mjs';
 import { deployRustyArtifact } from './deploy_release.mjs';
 import { fetchRustyDeployConfig } from './fetch_deploy_config.mjs';
+import { verifyLiveRelease } from './deploy_release.mjs';
+
+test('live release accepts configured browser discovery and signed-request preflight', async () => {
+  const artifact = { sourceSha: 'a'.repeat(40), binarySha256: 'b'.repeat(64), readers: {} };
+  const origin = 'https://identity.example';
+  const calls = [];
+  const fetcher = async (url, init) => {
+    calls.push([url, init]);
+    if (url.endsWith('/health')) return Response.json({ status: 'ok', buildSha: artifact.sourceSha, artifactSha256: artifact.binarySha256 });
+    return new Response(null, { headers: { 'access-control-allow-origin': origin,
+      'access-control-allow-methods': 'GET,POST,PUT', 'access-control-allow-headers': 'authorization,content-type,x-rusty-identity-proof' } });
+  };
+  await verifyLiveRelease('https://rusty.example', artifact, fetcher, [origin]);
+  assert.ok(calls.some(([url, init]) => url.endsWith('/.well-known/mesh-lighthouse') && init.headers.Origin === origin));
+  assert.ok(calls.some(([, init]) => init.method === 'OPTIONS' && init.headers['Access-Control-Request-Method'] === 'PUT'));
+  await assert.rejects(verifyLiveRelease('https://rusty.example', artifact, async (url, init) => {
+    if (url.endsWith('/health')) return fetcher(url, init);
+    return new Response(null);
+  }, [origin]), /Browser origin unavailable/);
+  await assert.rejects(verifyLiveRelease('https://rusty.example', artifact, async (url, init) => {
+    if (init.method !== 'OPTIONS') return fetcher(url, init);
+    return new Response(null, { headers: { 'access-control-allow-origin': origin,
+      'access-control-allow-methods': 'GET,POST,PUT', 'access-control-allow-headers': 'content-type' } });
+  }, [origin]), /Browser proof headers unavailable/);
+});
 
 test('deployment config parser is exported from the release adapter', () => {
   const spec = {

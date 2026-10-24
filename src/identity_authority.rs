@@ -310,7 +310,8 @@ pub(super) struct ResourcePrincipalGrant {
     pub grant_id: String,
     pub policy_epoch: u64,
     pub read_token_hash: String,
-    pub write_token_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_token_hash: Option<String>,
     pub actions: Vec<String>,
     pub workspace_grant: WorkspaceGrant,
     pub scope_authority: ScopeAuthoritySnapshot,
@@ -1116,7 +1117,8 @@ impl ResourcePrincipalGrant {
         owner: &VerifiedIdentityAuthorityView,
         service_id: &str,
         origin: &str,
-        scope_id: &str,
+        storage_scope_id: &str,
+        workspace_id: &str,
         require_active_issuer: bool,
         now: u64,
     ) -> Result<(), String> {
@@ -1134,11 +1136,12 @@ impl ResourcePrincipalGrant {
             || self.service_id != service_id
             || self.origin != origin
             || self.resource_kind != "scope"
-            || self.resource_id != scope_id
-            || self.scope_id != scope_id
+            || self.resource_id != storage_scope_id
+            || self.scope_id != storage_scope_id
             || self.owner_person_id != scope_authority.controller.person_id
             || self.owner_person_id != owner.view.person_id
-            || scope_authority.scope_id != scope_id
+            || workspace_id != scope_authority.scope_id
+            || self.workspace_id != workspace_id
             || self.subject_person_id == self.owner_person_id
             || self.grant_id != workspace_grant.payload.grant_id
             || self.workspace_id != workspace_grant.payload.workspace_id
@@ -1146,7 +1149,11 @@ impl ResourcePrincipalGrant {
             || self.policy_epoch != workspace_grant.payload.effective_access_epoch()
             || self.actions.iter().map(String::as_str).collect::<Vec<_>>() != expected_actions
             || !valid_digest(&self.read_token_hash)
-            || !valid_digest(&self.write_token_hash)
+            || match (&self.write_token_hash, expected_actions.contains(&"write")) {
+                (Some(hash), true) => !valid_digest(hash),
+                (None, false) => false,
+                _ => true,
+            }
             || public_key_id(&self.subject_public_key)? != self.subject_person_id
         {
             return Err("Invalid Rusty resource principal grant".into());
@@ -2337,7 +2344,7 @@ mod tests {
             grant_id: "member-grant".into(),
             policy_epoch: 1,
             read_token_hash: URL_SAFE_NO_PAD.encode([7; 32]),
-            write_token_hash: URL_SAFE_NO_PAD.encode([8; 32]),
+            write_token_hash: Some(URL_SAFE_NO_PAD.encode([8; 32])),
             actions: vec!["read".into(), "write".into()],
             workspace_grant,
             scope_authority: snapshot,
@@ -2361,6 +2368,7 @@ mod tests {
             &successor_view.verify().unwrap(),
             "rusty-service",
             "https://rusty.test",
+            scope_id,
             scope_id,
             true,
             1_800_000_000_000,
@@ -2411,6 +2419,7 @@ mod tests {
                     &successor_view.verify().unwrap(),
                     "rusty-service",
                     "https://rusty.test",
+                    scope_id,
                     scope_id,
                     true,
                     1_800_000_000_000,
@@ -2465,6 +2474,7 @@ mod tests {
                     &successor_view.verify().unwrap(),
                     "rusty-service",
                     "https://rusty.test",
+                    scope_id,
                     scope_id,
                     true,
                     1_800_000_000_000,

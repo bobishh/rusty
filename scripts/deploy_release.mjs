@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 
 const digestPattern = /^sha256:[a-f0-9]{64}$/;
 const sourceImagePattern = /^ghcr\.io\/bobishh\/rusty@sha256:[a-f0-9]{64}$/;
+const deploymentConfig = JSON.parse(readFileSync(new URL('../release/deployment-config.json', import.meta.url), 'utf8'));
 
 export function parseRustyDeploySpec(raw) {
   const spec = JSON.parse(raw ?? 'null');
@@ -137,7 +138,7 @@ function verifyOnHost(run, spec, version, artifact) {
   return assertRustyRuntimeImageReceipt(receipt, artifact);
 }
 
-async function verifyLiveRelease(origin, artifact, fetcher = fetch) {
+export async function verifyLiveRelease(origin, artifact, fetcher = fetch, browserOrigins = deploymentConfig.browserOrigins ?? []) {
   const response = await fetcher(`${origin}/health`, { redirect: 'error', signal: AbortSignal.timeout(20000) });
   if (!response.ok) throw new Error(`Rusty health returned ${response.status}`);
   const health = await response.json();
@@ -147,6 +148,33 @@ async function verifyLiveRelease(origin, artifact, fetcher = fetch) {
   for (const [schema, floor] of Object.entries(artifact.readers)) {
     if ((health.readers?.[schema] ?? 0) < floor) throw new Error(`Rusty reader floor missing: ${schema}`);
   }
+  for (const browserOrigin of browserOrigins) await verifyBrowserAccess(origin, browserOrigin, fetcher);
+}
+
+async function verifyBrowserAccess(origin, browserOrigin, fetcher) {
+  const browser = new URL(browserOrigin);
+  if (browser.protocol !== 'https:' || browser.origin !== browserOrigin) throw new Error('Invalid deployment browser origin');
+  const discovery = await fetcher(`${origin}/.well-known/mesh-lighthouse`, {
+    headers: { Origin: browserOrigin }, redirect: 'error', signal: AbortSignal.timeout(10000),
+  });
+  try {
+    if (!discovery.ok || discovery.headers.get('access-control-allow-origin') !== browserOrigin) {
+      throw new Error(`Browser origin unavailable: ${browserOrigin}`);
+    }
+  } finally { await discovery.body?.cancel(); }
+  const preflight = await fetcher(`${origin}/v2/scopes/deployment-browser-check/objects/check`, {
+    method: 'OPTIONS', headers: { Origin: browserOrigin, 'Access-Control-Request-Method': 'PUT',
+      'Access-Control-Request-Headers': 'authorization,content-type,x-rusty-identity-proof' },
+    redirect: 'error', signal: AbortSignal.timeout(10000),
+  });
+  try {
+    const methods = (preflight.headers.get('access-control-allow-methods') ?? '').split(',').map(value => value.trim().toUpperCase());
+    const headers = (preflight.headers.get('access-control-allow-headers') ?? '').split(',').map(value => value.trim().toLowerCase());
+    if (!preflight.ok || preflight.headers.get('access-control-allow-origin') !== browserOrigin || !methods.includes('PUT') ||
+      !['authorization', 'content-type', 'x-rusty-identity-proof'].every(header => headers.includes(header))) {
+      throw new Error(`Browser proof headers unavailable: ${browserOrigin}`);
+    }
+  } finally { await preflight.body?.cancel(); }
 }
 
 async function waitForRestoredHealth(origin, fetcher = fetch) {

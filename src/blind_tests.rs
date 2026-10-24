@@ -223,7 +223,9 @@ fn owner_revocation_survives_restart_and_only_new_grant_id_can_restore_access() 
                 grant_id: grant_id.into(),
                 policy_epoch,
                 read_token_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(b"editor-read-token")),
-                write_token_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(b"editor-write-token")),
+                write_token_hash: Some(
+                    URL_SAFE_NO_PAD.encode(Sha256::digest(b"editor-write-token")),
+                ),
                 actions: vec!["read".into(), "write".into()],
                 workspace_grant: workspace_grant(
                     root_seed,
@@ -263,7 +265,7 @@ fn owner_revocation_survives_restart_and_only_new_grant_id_can_restore_access() 
     approve_fixture(&store);
     let origin = "https://rusty.example";
     let storage_scope_id = "opaque-scope";
-    let workspace_id = storage_scope_id;
+    let workspace_id = "logical-workspace";
 
     let owner_key = public_key_from_seed(&[31; 32]).unwrap();
     let owner = PublicIdentity {
