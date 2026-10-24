@@ -331,6 +331,67 @@ pub(super) struct StoredResourcePrincipalGrant {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ResourcePrincipalRevocationAuthorization {
+    pub kind: String,
+    pub version: u8,
+    pub service_id: String,
+    pub origin: String,
+    pub storage_scope_id: String,
+    pub workspace_id: String,
+    pub grant_id: String,
+    pub subject_person_id: String,
+    pub policy_epoch: u64,
+    pub request_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ResourcePrincipalRevocationRequest {
+    pub version: u8,
+    pub authorization: SignedEnvelope<ResourcePrincipalRevocationAuthorization>,
+}
+
+impl ResourcePrincipalRevocationRequest {
+    pub fn request_hash(&self) -> Result<String, String> {
+        let payload = &self.authorization.payload;
+        canonical_hash(&json!({
+            "kind": payload.kind,
+            "version": payload.version,
+            "serviceId": payload.service_id,
+            "origin": payload.origin,
+            "storageScopeId": payload.storage_scope_id,
+            "workspaceId": payload.workspace_id,
+            "grantId": payload.grant_id,
+            "subjectPersonId": payload.subject_person_id,
+            "policyEpoch": payload.policy_epoch,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ResourcePrincipalRevocationReceiptPayload {
+    pub kind: String,
+    pub version: u8,
+    pub service_id: String,
+    pub origin: String,
+    pub storage_scope_id: String,
+    pub workspace_id: String,
+    pub grant_id: String,
+    pub subject_person_id: String,
+    pub policy_epoch: u64,
+    pub request_hash: String,
+    pub committed_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct StoredResourcePrincipalRevocation {
+    pub receipt: SignedEnvelope<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ScopeAuthorityUpdateAuthorization {
     pub kind: String,
     pub version: u8,
@@ -1121,6 +1182,73 @@ impl ResourcePrincipalGrant {
         )?;
         if !verify_signed_envelope(envelope, &issuer_key, SIGNATURE_DOMAIN)? {
             return Err("Invalid Rusty resource principal grant signature".into());
+        }
+        Ok(())
+    }
+}
+
+impl ResourcePrincipalRevocationAuthorization {
+    pub fn verify(
+        &self,
+        envelope: &SignedEnvelope<Self>,
+        identity: &IdentityAuthorityView,
+        authority: &ValidatedScopeAuthority,
+        service_id: &str,
+        origin: &str,
+        storage_scope_id: &str,
+    ) -> Result<(), String> {
+        let expected_hash = canonical_hash(&json!({
+            "kind": self.kind,
+            "version": self.version,
+            "serviceId": self.service_id,
+            "origin": self.origin,
+            "storageScopeId": self.storage_scope_id,
+            "workspaceId": self.workspace_id,
+            "grantId": self.grant_id,
+            "subjectPersonId": self.subject_person_id,
+            "policyEpoch": self.policy_epoch,
+        }))?;
+        if self.kind != "rusty-resource-principal-revocation"
+            || self.version != 1
+            || self.service_id != service_id
+            || self.origin != origin
+            || self.storage_scope_id != storage_scope_id
+            || self.workspace_id != authority.scope_id
+            || self.grant_id.is_empty()
+            || self.grant_id.len() > 256
+            || self.subject_person_id.is_empty()
+            || self.subject_person_id.len() > 128
+            || self.policy_epoch == 0
+            || self.request_hash != expected_hash
+            || authority.controller.person_id != identity.person_id
+            || authority.controller.public_key != identity.identity_public_key
+        {
+            return Err("Invalid Rusty resource principal revocation binding".into());
+        }
+        let verified = identity.verify()?;
+        if !verified.is_active_device(&envelope.signer_key_id)?
+            || !scope_authority_chain_matches(
+                &verified,
+                &authority.controller,
+                &envelope.signer_key_id,
+            )?
+        {
+            return Err(
+                "Resource principal revocation signer is not an active scope controller".into(),
+            );
+        }
+        let issuer_key = verify_device_certificate_chain(
+            &identity.identity(),
+            &envelope.signer_key_id,
+            &certificate_chain(
+                &identity.identity(),
+                &envelope.signer_key_id,
+                &verified.certificates_by_device,
+            )?,
+            SIGNATURE_DOMAIN,
+        )?;
+        if !verify_signed_envelope(envelope, &issuer_key, SIGNATURE_DOMAIN)? {
+            return Err("Invalid Rusty resource principal revocation signature".into());
         }
         Ok(())
     }

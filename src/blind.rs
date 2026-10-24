@@ -5,11 +5,12 @@ use crate::identity_authority::{
     IdentityRootSuccessionReceiptPayload, IdentityRootSuccessionRequest,
     IdentityRootSuccessionStatusPayload, IdentityRootSuccessionTargetReceipt,
     RecentAuthorityUpdate, RecentScopeAuthorityUpdate, ResourcePrincipalGrantRequest,
+    ResourcePrincipalRevocationReceiptPayload, ResourcePrincipalRevocationRequest,
     SIGNATURE_DOMAIN, ScopeAuthorityReceiptPayload, ScopeAuthorityStatusPayload,
     ScopeAuthorityUpdateAuthorization, ScopeAuthorityUpdateRequest, ScopePurposeReceiptPayload,
     ScopePurposeUpdateAuthorization, ScopePurposeUpdateRequest, StoredIdentityAuthority,
-    StoredIdentityRootSuccession, StoredResourcePrincipalGrant, StoredScopeAuthority,
-    authority_view_hash, certificate_chain, scope_authority_snapshot_hash,
+    StoredIdentityRootSuccession, StoredResourcePrincipalGrant, StoredResourcePrincipalRevocation,
+    StoredScopeAuthority, authority_view_hash, certificate_chain, scope_authority_snapshot_hash,
     scope_authority_status_request_hash, status_request_hash, valid_nonce,
 };
 use crate::telemetry::{Level, Telemetry};
@@ -2848,6 +2849,12 @@ impl BlindStore {
             .grant_id
             .as_deref()
             .ok_or("Storage principal grant is unavailable")?;
+        if self
+            .read_resource_principal_revocation(scope, grant_id, origin)?
+            .is_some()
+        {
+            return Err("Storage principal grant has been revoked".into());
+        }
         let stored_grant = self.read_resource_principal_grant(scope, &proof.person_id, origin)?;
         let grant = &stored_grant.grant;
         if let Some(current) = &current_scope_authority
@@ -2879,6 +2886,19 @@ impl BlindStore {
             .scope_dir(scope)?
             .join("principals")
             .join(format!("{person_id}.json")))
+    }
+    fn resource_principal_revocation_path(
+        &self,
+        scope: &str,
+        grant_id: &str,
+    ) -> Result<PathBuf, String> {
+        if !valid_id(scope) || !valid_id(grant_id) {
+            return Err("Invalid storage principal revocation".into());
+        }
+        Ok(self
+            .scope_dir(scope)?
+            .join("principal-revocations")
+            .join(format!("{grant_id}.json")))
     }
     fn scope_has_principal_grants(&self, scope: &str) -> Result<bool, String> {
         let path = self.scope_dir(scope)?.join("principals");
@@ -2925,6 +2945,43 @@ impl BlindStore {
         }
         Ok(stored)
     }
+    fn read_resource_principal_revocation(
+        &self,
+        scope: &str,
+        grant_id: &str,
+        origin: &str,
+    ) -> Result<Option<StoredResourcePrincipalRevocation>, String> {
+        let path = self.resource_principal_revocation_path(scope, grant_id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let stored: StoredResourcePrincipalRevocation = serde_json::from_slice(
+            &fs::read(path).map_err(|_| "Storage principal revocation unavailable")?,
+        )
+        .map_err(|_| "Invalid stored storage principal revocation")?;
+        let receipt = &stored.receipt;
+        let payload: ResourcePrincipalRevocationReceiptPayload =
+            serde_json::from_value(receipt.payload.clone())
+                .map_err(|_| "Invalid stored storage principal revocation")?;
+        let service_key = self.public_key()?;
+        let service_id = public_key_id(&service_key)?;
+        if receipt.signer_key_id != service_id
+            || !verify_signed_envelope(receipt, &service_key, DOMAIN)?
+            || payload.kind != "rusty-resource-principal-revocation-receipt"
+            || payload.version != 1
+            || payload.service_id != service_id
+            || payload.origin != origin
+            || payload.storage_scope_id != scope
+            || payload.grant_id != grant_id
+            || payload.workspace_id.is_empty()
+            || payload.subject_person_id.is_empty()
+            || payload.policy_epoch == 0
+            || payload.request_hash.len() != 43
+        {
+            return Err("Stored storage principal revocation integrity failure".into());
+        }
+        Ok(Some(stored))
+    }
     fn register_resource_principal_grant(
         &self,
         scope: &str,
@@ -2945,6 +3002,12 @@ impl BlindStore {
             .try_write()
             .map_err(|_| "Resource scope lock unavailable")?;
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+        if self
+            .read_resource_principal_revocation(scope, grant_id, origin)?
+            .is_some()
+        {
+            return Err("Storage principal grant ID has been revoked".into());
+        }
         if self.identity_is_retired(&payload.owner_person_id)? {
             return Err("Storage owner Identity root has been retired".into());
         }
@@ -2982,21 +3045,30 @@ impl BlindStore {
             )
             .map_err(|_| "Invalid stored storage principal grant")?;
             let previous_payload = &previous.grant.payload;
-            if previous_payload.policy_epoch > payload.policy_epoch {
-                return Err("Storage principal grant epoch is stale".into());
-            }
-            if previous_payload.policy_epoch == payload.policy_epoch {
-                if previous.grant == request.grant {
-                    return Ok(());
-                }
-                return Err("Storage principal grant epoch conflicts".into());
-            }
-            if previous_payload.owner_person_id != payload.owner_person_id
+            if previous_payload.workspace_id != payload.workspace_id
                 || previous_payload.subject_person_id != payload.subject_person_id
                 || previous_payload.subject_public_key != payload.subject_public_key
-                || previous_payload.workspace_id != payload.workspace_id
             {
                 return Err("Storage principal grant binding changed".into());
+            }
+            if previous_payload.grant_id == payload.grant_id {
+                if previous_payload.owner_person_id != payload.owner_person_id {
+                    return Err("Storage principal grant binding changed".into());
+                }
+                if previous_payload.policy_epoch > payload.policy_epoch {
+                    return Err("Storage principal grant epoch is stale".into());
+                }
+                if previous_payload.policy_epoch == payload.policy_epoch {
+                    if previous.grant == request.grant {
+                        return Ok(());
+                    }
+                    return Err("Storage principal grant epoch conflicts".into());
+                }
+            } else if self
+                .read_resource_principal_revocation(scope, &previous_payload.grant_id, origin)?
+                .is_none()
+            {
+                return Err("Storage principal grant replacement requires prior revocation".into());
             }
         }
         let stored = StoredResourcePrincipalGrant {
@@ -3006,6 +3078,123 @@ impl BlindStore {
             &path,
             &serde_json::to_vec(&stored).map_err(|_| "Invalid storage principal grant")?,
         )
+    }
+    fn revoke_resource_principal(
+        &self,
+        scope: &str,
+        grant_id: &str,
+        request: ResourcePrincipalRevocationRequest,
+        origin: &str,
+    ) -> Result<SignedEnvelope<Value>, String> {
+        if request.version != 1 || !valid_id(scope) || !valid_id(grant_id) {
+            return Err("Invalid storage principal revocation request".into());
+        }
+        let payload = &request.authorization.payload;
+        if payload.storage_scope_id != scope || payload.grant_id != grant_id {
+            return Err("Storage principal revocation route binding mismatch".into());
+        }
+        let request_hash = request.request_hash()?;
+        if payload.request_hash != request_hash {
+            return Err("Storage principal revocation request hash mismatch".into());
+        }
+
+        // The scope gate serializes this decision against scope controller and grant changes.
+        let observed = self
+            .read_scope_authority(scope)?
+            .ok_or("Storage scope authority is not registered")?;
+        let observed_authority =
+            meta_mesh_core::validate_scope_authority_at(&observed.snapshot, now_ms()? as i128)
+                .map_err(|_| "Workspace scope authority is invalid")?;
+        let controller_person_id = observed_authority.controller.person_id.clone();
+        let owner_gate = self.identity_authority_gate(&controller_person_id)?;
+        let _owner_guard = owner_gate
+            .try_write()
+            .map_err(|_| "Identity authority lock unavailable")?;
+        let scope_gate = self.resource_scope_gate(scope)?;
+        let _scope_guard = scope_gate
+            .try_write()
+            .map_err(|_| "Resource scope lock unavailable")?;
+        let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
+
+        if let Some(stored) = self.read_resource_principal_revocation(scope, grant_id, origin)? {
+            if stored.receipt.payload["requestHash"] == request_hash {
+                return Ok(stored.receipt);
+            }
+            return Err("Storage principal grant ID has a conflicting revocation".into());
+        }
+
+        let accepted = self
+            .read_scope_authority(scope)?
+            .ok_or("Storage scope authority is not registered")?;
+        let authority =
+            meta_mesh_core::validate_scope_authority_at(&accepted.snapshot, now_ms()? as i128)
+                .map_err(|_| "Workspace scope authority is invalid")?;
+        if authority.controller.person_id != controller_person_id {
+            return Err("Storage scope controller changed during principal revocation".into());
+        }
+        if payload.workspace_id != authority.scope_id {
+            return Err("Storage principal revocation workspace mismatch".into());
+        }
+        if self.identity_is_retired(&controller_person_id)? {
+            return Err("Storage owner Identity root has been retired".into());
+        }
+        let owner = self
+            .read_identity_authority(&controller_person_id)?
+            .ok_or("Storage owner Identity authority is not registered")?;
+        payload.verify(
+            &request.authorization,
+            &owner.view,
+            &authority,
+            &public_key_id(&self.public_key()?)?,
+            origin,
+            scope,
+        )?;
+
+        // If this principal is still registered, revoke only its exact workspace grant epoch.
+        let principal_path = self.resource_principal_path(scope, &payload.subject_person_id)?;
+        if principal_path.exists() {
+            let stored: StoredResourcePrincipalGrant = serde_json::from_slice(
+                &fs::read(principal_path).map_err(|_| "Storage principal grant unavailable")?,
+            )
+            .map_err(|_| "Invalid stored storage principal grant")?;
+            let principal = &stored.grant.payload;
+            if principal.workspace_id != payload.workspace_id
+                || principal.grant_id != grant_id
+                || principal.subject_person_id != payload.subject_person_id
+                || principal.policy_epoch != payload.policy_epoch
+            {
+                return Err("Storage principal revocation target is stale".into());
+            }
+        }
+
+        let service_id = public_key_id(&self.public_key()?)?;
+        let receipt = sign_json_envelope(
+            &self.seed,
+            serde_json::to_value(ResourcePrincipalRevocationReceiptPayload {
+                kind: "rusty-resource-principal-revocation-receipt".into(),
+                version: 1,
+                service_id: service_id.clone(),
+                origin: origin.to_owned(),
+                storage_scope_id: scope.to_owned(),
+                workspace_id: payload.workspace_id.clone(),
+                grant_id: payload.grant_id.clone(),
+                subject_person_id: payload.subject_person_id.clone(),
+                policy_epoch: payload.policy_epoch,
+                request_hash,
+                committed_at: now_ms()?,
+            })
+            .map_err(|_| "Invalid storage principal revocation receipt")?,
+            service_id,
+            DOMAIN,
+        )?;
+        atomic_write(
+            &self.resource_principal_revocation_path(scope, grant_id)?,
+            &serde_json::to_vec(&StoredResourcePrincipalRevocation {
+                receipt: receipt.clone(),
+            })
+            .map_err(|_| "Invalid storage principal revocation")?,
+        )?;
+        Ok(receipt)
     }
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
@@ -4646,6 +4835,10 @@ pub fn router_with_telemetry(
             "/v2/scopes/{scope}/principals/{grant_id}",
             put(storage_principal_grant).layer(DefaultBodyLimit::max(512 * 1024)),
         )
+        .route(
+            "/v2/scopes/{scope}/principals/{grant_id}/revocation",
+            put(storage_principal_revocation).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/v2/scopes/{scope}/objects", get(inventory))
         .route(
             "/v2/scopes/{scope}/objects/{object_id}",
@@ -5769,6 +5962,45 @@ async fn storage_principal_grant(
         failure(status, &message)
     })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn storage_principal_revocation(
+    State(state): State<HttpState>,
+    RoutePath((scope, grant_id)): RoutePath<(String, String)>,
+    Json(request): Json<ResourcePrincipalRevocationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let origin = state.origin.clone();
+    let receipt = tokio::task::spawn_blocking(move || {
+        state
+            .store
+            .revoke_resource_principal(&scope, &grant_id, request, &origin)
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Storage revocation unavailable",
+        )
+    })?
+    .map_err(|message| {
+        let status = if message.contains("not registered") {
+            StatusCode::PRECONDITION_REQUIRED
+        } else if message.contains("stale")
+            || message.contains("conflict")
+            || message.contains("changed")
+        {
+            StatusCode::CONFLICT
+        } else if message.contains("signature")
+            || message.contains("active")
+            || message.contains("retired")
+        {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        failure(status, &message)
+    })?;
+    Ok(Json(json!({ "receipt": receipt })))
 }
 
 async fn upload(

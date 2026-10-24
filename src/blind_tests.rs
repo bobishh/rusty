@@ -86,6 +86,501 @@ async fn browser_cors_preflight_allows_configured_clients_and_identity_proof_hea
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn owner_revocation_survives_restart_and_only_new_grant_id_can_restore_access() {
+    use crate::identity_authority::{
+        ResourcePrincipalGrant, ResourcePrincipalGrantRequest,
+        ResourcePrincipalRevocationAuthorization, ResourcePrincipalRevocationRequest,
+        StoredScopeAuthority, test_authority_update_request, test_authority_view_with_devices,
+        test_signed_identity_request_proof,
+    };
+    use meta_mesh_core::{
+        PublicIdentity, ScopeAuthority, ScopeAuthoritySnapshot, ScopeControlTransferPayload,
+        WorkspaceGrant, WorkspaceGrantPayload, WorkspaceRole, create_scope_genesis_payload,
+        public_key_from_seed, public_key_id, sign_json_envelope, sign_scope_record,
+    };
+
+    fn revocation_request(
+        device_seed: &[u8; 32],
+        device_id: &str,
+        service_id: &str,
+        origin: &str,
+        scope_id: &str,
+        workspace_id: &str,
+        grant_id: &str,
+        subject_person_id: &str,
+        policy_epoch: u64,
+    ) -> ResourcePrincipalRevocationRequest {
+        let mut authorization: SignedEnvelope<ResourcePrincipalRevocationAuthorization> =
+            serde_json::from_value(
+                serde_json::to_value(
+                    sign_json_envelope(
+                        device_seed,
+                        serde_json::to_value(ResourcePrincipalRevocationAuthorization {
+                            kind: "rusty-resource-principal-revocation".into(),
+                            version: 1,
+                            service_id: service_id.into(),
+                            origin: origin.into(),
+                            storage_scope_id: scope_id.into(),
+                            workspace_id: workspace_id.into(),
+                            grant_id: grant_id.into(),
+                            subject_person_id: subject_person_id.into(),
+                            policy_epoch,
+                            request_hash: String::new(),
+                        })
+                        .unwrap(),
+                        device_id,
+                        "MATCH/1",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut request = ResourcePrincipalRevocationRequest {
+            version: 1,
+            authorization,
+        };
+        request.authorization.payload.request_hash = request.request_hash().unwrap();
+        authorization = serde_json::from_value(
+            serde_json::to_value(
+                sign_json_envelope(
+                    device_seed,
+                    serde_json::to_value(request.authorization.payload).unwrap(),
+                    device_id,
+                    "MATCH/1",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        request.authorization = authorization;
+        request
+    }
+
+    fn workspace_grant(
+        root_seed: &[u8; 32],
+        signer_id: &str,
+        workspace_id: &str,
+        person_id: &str,
+        grant_id: &str,
+        policy_epoch: u64,
+    ) -> WorkspaceGrant {
+        serde_json::from_value(
+            serde_json::to_value(
+                sign_json_envelope(
+                    root_seed,
+                    serde_json::to_value(WorkspaceGrantPayload {
+                        kind: "workspace-grant".into(),
+                        version: 1,
+                        grant_id: grant_id.into(),
+                        workspace_id: workspace_id.into(),
+                        person_id: person_id.into(),
+                        role: WorkspaceRole::Editor,
+                        access_epoch: Some(policy_epoch),
+                        automation: None,
+                    })
+                    .unwrap(),
+                    signer_id,
+                    "MATCH/1",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn resource_grant(
+        root_seed: &[u8; 32],
+        device_seed: &[u8; 32],
+        owner: &PublicIdentity,
+        subject: &PublicIdentity,
+        service_id: &str,
+        origin: &str,
+        storage_scope_id: &str,
+        workspace_id: &str,
+        grant_id: &str,
+        policy_epoch: u64,
+        snapshot: &ScopeAuthoritySnapshot,
+    ) -> ResourcePrincipalGrantRequest {
+        let device_id = public_key_id(&public_key_from_seed(device_seed).unwrap()).unwrap();
+        let signed = sign_json_envelope(
+            device_seed,
+            serde_json::to_value(ResourcePrincipalGrant {
+                kind: "rusty-resource-principal-grant".into(),
+                version: 1,
+                service_id: service_id.into(),
+                origin: origin.into(),
+                workspace_id: workspace_id.into(),
+                resource_kind: "scope".into(),
+                resource_id: storage_scope_id.into(),
+                scope_id: storage_scope_id.into(),
+                owner_person_id: owner.person_id.clone(),
+                subject_person_id: subject.person_id.clone(),
+                subject_public_key: subject.public_key.clone(),
+                grant_id: grant_id.into(),
+                policy_epoch,
+                read_token_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(b"editor-read-token")),
+                write_token_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(b"editor-write-token")),
+                actions: vec!["read".into(), "write".into()],
+                workspace_grant: workspace_grant(
+                    root_seed,
+                    &owner.person_id,
+                    workspace_id,
+                    &subject.person_id,
+                    grant_id,
+                    policy_epoch,
+                ),
+                scope_authority: snapshot.clone(),
+            })
+            .unwrap(),
+            &device_id,
+            "MATCH/1",
+        )
+        .unwrap();
+        ResourcePrincipalGrantRequest {
+            version: 1,
+            grant: serde_json::from_value(serde_json::to_value(signed).unwrap()).unwrap(),
+        }
+    }
+
+    fn controller(
+        person: &PublicIdentity,
+        view: &crate::identity_authority::IdentityAuthorityView,
+    ) -> ScopeAuthority {
+        ScopeAuthority {
+            person_id: person.person_id.clone(),
+            public_key: person.public_key.clone(),
+            certificates: view.certificates.clone(),
+        }
+    }
+
+    let directory =
+        std::env::temp_dir().join(format!("rusty-principal-revoke-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    approve_fixture(&store);
+    let origin = "https://rusty.example";
+    let storage_scope_id = "opaque-scope";
+    let workspace_id = storage_scope_id;
+
+    let owner_key = public_key_from_seed(&[31; 32]).unwrap();
+    let owner = PublicIdentity {
+        person_id: public_key_id(&owner_key).unwrap(),
+        public_key: owner_key,
+        display_name: "Owner".into(),
+    };
+    let owner_view = test_authority_view_with_devices(&owner, &[31; 32], &[(32, true)]);
+    let old_device_id = public_key_id(&public_key_from_seed(&[32; 32]).unwrap()).unwrap();
+    let successor_key = public_key_from_seed(&[50; 32]).unwrap();
+    let successor = PublicIdentity {
+        person_id: public_key_id(&successor_key).unwrap(),
+        public_key: successor_key,
+        display_name: "Successor".into(),
+    };
+    let successor_view = test_authority_view_with_devices(&successor, &[50; 32], &[(51, true)]);
+    let successor_device_id = public_key_id(&public_key_from_seed(&[51; 32]).unwrap()).unwrap();
+    let subject_key = public_key_from_seed(&[40; 32]).unwrap();
+    let subject = PublicIdentity {
+        person_id: public_key_id(&subject_key).unwrap(),
+        public_key: subject_key,
+        display_name: "Editor".into(),
+    };
+    let subject_view = test_authority_view_with_devices(&subject, &[40; 32], &[(41, true)]);
+    let service_id = public_key_id(&store.public_key().unwrap()).unwrap();
+
+    for (view, seed) in [
+        (&owner_view, &[32; 32]),
+        (&successor_view, &[51; 32]),
+        (&subject_view, &[41; 32]),
+    ] {
+        store
+            .update_identity_authority(
+                test_authority_update_request(
+                    view.clone(),
+                    seed,
+                    &service_id,
+                    origin,
+                    now_ms().unwrap(),
+                ),
+                origin,
+            )
+            .unwrap();
+    }
+
+    let genesis = sign_scope_record(
+        &[32; 32],
+        create_scope_genesis_payload(meta_mesh_core::ScopeGenesisPayloadInput {
+            scope_id: workspace_id.into(),
+            creator: controller(&owner, &owner_view),
+        })
+        .unwrap(),
+        old_device_id.clone(),
+    )
+    .unwrap();
+    let initial_snapshot = ScopeAuthoritySnapshot {
+        genesis,
+        grants: Vec::new(),
+        grant_issuers: Vec::new(),
+        revocations: Vec::new(),
+        control_transfers: Vec::new(),
+        succession_transfers: Vec::new(),
+    };
+    let policy_path = store
+        .scope_dir(storage_scope_id)
+        .unwrap()
+        .join("policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy["ownerPersonId"] = json!(owner.person_id.clone());
+    policy["scopePurpose"] = json!("workspace");
+    atomic_write(&policy_path, &serde_json::to_vec(&policy).unwrap()).unwrap();
+    atomic_write(
+        &store.scope_authority_path(storage_scope_id).unwrap(),
+        &serde_json::to_vec(&StoredScopeAuthority {
+            snapshot: initial_snapshot.clone(),
+            recent_updates: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let old_grant_id = "editor-grant-old";
+    let access = resource_grant(
+        &[31; 32],
+        &[32; 32],
+        &owner,
+        &subject,
+        &service_id,
+        origin,
+        storage_scope_id,
+        workspace_id,
+        old_grant_id,
+        1,
+        &initial_snapshot,
+    );
+    store
+        .register_resource_principal_grant(storage_scope_id, old_grant_id, access.clone(), origin)
+        .unwrap();
+
+    let transfer = sign_scope_record(
+        &[32; 32],
+        ScopeControlTransferPayload {
+            kind: "scope-control-transfer".into(),
+            version: 1,
+            scope_id: workspace_id.into(),
+            from_controller_person_id: owner.person_id.clone(),
+            to_controller: controller(&successor, &successor_view),
+            from_control_epoch: 1,
+            to_control_epoch: 2,
+        },
+        old_device_id.clone(),
+    )
+    .unwrap();
+    let mut current_snapshot = initial_snapshot.clone();
+    current_snapshot.control_transfers.push(transfer);
+    atomic_write(
+        &store.scope_authority_path(storage_scope_id).unwrap(),
+        &serde_json::to_vec(&StoredScopeAuthority {
+            snapshot: current_snapshot.clone(),
+            recent_updates: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let read_token = "editor-read-token";
+    let read_path = "/v2/scopes/opaque-scope/objects";
+    let old_proof = test_signed_identity_request_proof(
+        &subject_view,
+        &[41; 32],
+        origin,
+        &service_id,
+        storage_scope_id,
+        read_token,
+        "GET",
+        read_path,
+        b"",
+        "read",
+        1,
+        Some(old_grant_id.into()),
+        now_ms().unwrap(),
+    );
+    store
+        .verify_identity_request_proof(
+            &old_proof,
+            storage_scope_id,
+            "read",
+            read_token,
+            "GET",
+            read_path,
+            b"",
+            origin,
+        )
+        .unwrap();
+
+    let old_owner_request = revocation_request(
+        &[32; 32],
+        &old_device_id,
+        &service_id,
+        origin,
+        storage_scope_id,
+        workspace_id,
+        old_grant_id,
+        &subject.person_id,
+        1,
+    );
+    assert!(
+        store
+            .revoke_resource_principal(storage_scope_id, old_grant_id, old_owner_request, origin)
+            .is_err(),
+        "previous controller must not revoke after scope handoff"
+    );
+
+    let subject_device_id = public_key_id(&public_key_from_seed(&[41; 32]).unwrap()).unwrap();
+    let forged_request = revocation_request(
+        &[41; 32],
+        &subject_device_id,
+        &service_id,
+        origin,
+        storage_scope_id,
+        workspace_id,
+        old_grant_id,
+        &subject.person_id,
+        1,
+    );
+    assert!(
+        store
+            .revoke_resource_principal(storage_scope_id, old_grant_id, forged_request, origin)
+            .is_err(),
+        "subject device must not act as scope controller"
+    );
+
+    let stale_request = revocation_request(
+        &[51; 32],
+        &successor_device_id,
+        &service_id,
+        origin,
+        storage_scope_id,
+        workspace_id,
+        old_grant_id,
+        &subject.person_id,
+        2,
+    );
+    assert!(
+        store
+            .revoke_resource_principal(storage_scope_id, old_grant_id, stale_request, origin)
+            .is_err(),
+        "stale grant epoch must be rejected"
+    );
+
+    let request = revocation_request(
+        &[51; 32],
+        &successor_device_id,
+        &service_id,
+        origin,
+        storage_scope_id,
+        workspace_id,
+        old_grant_id,
+        &subject.person_id,
+        1,
+    );
+    let receipt = store
+        .revoke_resource_principal(storage_scope_id, old_grant_id, request.clone(), origin)
+        .unwrap();
+    assert!(
+        store
+            .verify_identity_request_proof(
+                &old_proof,
+                storage_scope_id,
+                "read",
+                read_token,
+                "GET",
+                read_path,
+                b"",
+                origin
+            )
+            .is_err(),
+        "revoked principal data request must fail"
+    );
+    assert!(
+        store
+            .register_resource_principal_grant(
+                storage_scope_id,
+                old_grant_id,
+                access.clone(),
+                origin
+            )
+            .is_err(),
+        "old grant PUT must not resurrect a revoked ID"
+    );
+
+    drop(store);
+    let restarted = BlindStore::open(directory.clone()).unwrap();
+    let replay = restarted
+        .revoke_resource_principal(storage_scope_id, old_grant_id, request, origin)
+        .unwrap();
+    assert_eq!(
+        replay, receipt,
+        "exact retry must return stored service receipt after restart"
+    );
+    let persisted_subject = restarted
+        .read_identity_authority(&subject.person_id)
+        .unwrap()
+        .unwrap()
+        .view
+        .verify()
+        .unwrap();
+    assert!(
+        persisted_subject
+            .is_active_device(&subject_device_id)
+            .unwrap(),
+        "workspace storage revocation must not revoke the subject Identity"
+    );
+    assert!(
+        restarted
+            .verify_identity_request_proof(
+                &old_proof,
+                storage_scope_id,
+                "read",
+                read_token,
+                "GET",
+                read_path,
+                b"",
+                origin
+            )
+            .is_err(),
+        "restart must retain the principal tombstone"
+    );
+
+    let new_grant_id = "editor-grant-new";
+    let new_access = resource_grant(
+        &[50; 32],
+        &[51; 32],
+        &successor,
+        &subject,
+        &service_id,
+        origin,
+        storage_scope_id,
+        workspace_id,
+        new_grant_id,
+        1,
+        &current_snapshot,
+    );
+    restarted
+        .register_resource_principal_grant(storage_scope_id, new_grant_id, new_access, origin)
+        .unwrap();
+    assert!(
+        restarted
+            .register_resource_principal_grant(storage_scope_id, old_grant_id, access, origin)
+            .is_err(),
+        "new grant ID must not make the old grant ID usable again"
+    );
+
+    drop(restarted);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn identity_succession_status_http_returns_signed_bound_missing_state() {
     let directory = std::env::temp_dir().join(format!(
