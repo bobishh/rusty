@@ -1812,8 +1812,33 @@ impl BlindStore {
                 .map_err(|_| "Invalid stored scope authority")?;
         let validated =
             meta_mesh_core::validate_scope_authority_at(&stored.snapshot, now_ms()? as i128)?;
-        if validated.scope_id != scope || stored.recent_updates.len() > 256 {
+        if stored.recent_updates.len() > 256 {
             return Err("Stored scope authority binding invalid".into());
+        }
+        // `scope` names this storage directory. The signed ledger's scope ID
+        // names the workspace, and those identifiers are intentionally distinct.
+        // Bind their durable association through the latest service-signed receipt.
+        if let Some(update) = stored.recent_updates.last() {
+            let receipt: ScopeAuthorityReceiptPayload =
+                serde_json::from_value(update.receipt.payload.clone())
+                    .map_err(|_| "Stored scope authority binding invalid")?;
+            let service_key = self.public_key()?;
+            let service_id = public_key_id(&service_key)?;
+            if update.receipt.signer_key_id != service_id
+                || !verify_signed_envelope(&update.receipt, &service_key, DOMAIN)?
+                || receipt.kind != "rusty-scope-authority-receipt"
+                || receipt.version != 1
+                || receipt.service_id != service_id
+                || receipt.scope_id != scope
+                || receipt.workspace_id != validated.scope_id
+                || receipt.controller_person_id != validated.controller.person_id
+                || receipt.control_epoch != validated.control_epoch
+                || receipt.request_id != update.request_id
+                || receipt.request_hash != update.request_hash
+                || receipt.merged_snapshot_hash != scope_authority_snapshot_hash(&stored.snapshot)?
+            {
+                return Err("Stored scope authority binding invalid".into());
+            }
         }
         Ok(Some(stored))
     }

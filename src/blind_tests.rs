@@ -893,8 +893,9 @@ async fn scope_authority_http_contract_registers_and_returns_signed_snapshot() {
         public_key: identity.public_key.clone(),
         certificates: view.certificates.clone(),
     };
+    let workspace_id = "workspace-uuid";
     let genesis_payload = create_scope_genesis_payload(ScopeGenesisPayloadInput {
-        scope_id: "opaque-scope".into(),
+        scope_id: workspace_id.into(),
         creator: controller,
     })
     .unwrap();
@@ -932,7 +933,7 @@ async fn scope_authority_http_contract_registers_and_returns_signed_snapshot() {
             service_id: service_id.clone(),
             origin: origin.clone(),
             scope_id: "opaque-scope".into(),
-            workspace_id: "opaque-scope".into(),
+            workspace_id: workspace_id.into(),
             person_id: identity.person_id.clone(),
             device_id: public_key_id(&public_key_from_seed(&manager_seed).unwrap()).unwrap(),
             control_epoch: 1,
@@ -979,11 +980,13 @@ async fn scope_authority_http_contract_registers_and_returns_signed_snapshot() {
     let status: SignedEnvelope<Value> = serde_json::from_value(body["status"].clone()).unwrap();
     assert!(verify_signed_envelope(&status, &store.public_key().unwrap(), DOMAIN).unwrap());
     assert_eq!(status.payload["state"], "ready");
+    assert_eq!(status.payload["scopeId"], "opaque-scope");
+    assert_eq!(status.payload["workspaceId"], workspace_id);
     assert_eq!(status.payload["requestId"], request_id);
     assert_eq!(status.payload["requestHash"], request_hash);
     assert_eq!(
         status.payload["scopeAuthority"]["genesis"]["payload"]["scopeId"],
-        "opaque-scope"
+        workspace_id
     );
 
     server.abort();
