@@ -3079,10 +3079,12 @@ impl BlindStore {
                     return Err("Storage principal grant epoch is stale".into());
                 }
                 if previous_payload.policy_epoch == payload.policy_epoch {
+                    if previous_payload != payload {
+                        return Err("Storage principal grant epoch conflicts".into());
+                    }
                     if previous.grant == request.grant {
                         return Ok(());
                     }
-                    return Err("Storage principal grant epoch conflicts".into());
                 }
             } else if self
                 .read_resource_principal_revocation(scope, &previous_payload.grant_id, origin)?

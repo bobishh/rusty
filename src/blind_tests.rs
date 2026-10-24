@@ -92,7 +92,7 @@ fn owner_revocation_survives_restart_and_only_new_grant_id_can_restore_access() 
         ResourcePrincipalGrant, ResourcePrincipalGrantRequest,
         ResourcePrincipalRevocationAuthorization, ResourcePrincipalRevocationRequest,
         StoredScopeAuthority, test_authority_update_request, test_authority_view_with_devices,
-        test_signed_identity_request_proof,
+        test_revoke_authority_device, test_signed_identity_request_proof,
     };
     use meta_mesh_core::{
         PublicIdentity, ScopeAuthority, ScopeAuthoritySnapshot, ScopeControlTransferPayload,
@@ -273,7 +273,7 @@ fn owner_revocation_survives_restart_and_only_new_grant_id_can_restore_access() 
         public_key: owner_key,
         display_name: "Owner".into(),
     };
-    let owner_view = test_authority_view_with_devices(&owner, &[31; 32], &[(32, true)]);
+    let owner_view = test_authority_view_with_devices(&owner, &[31; 32], &[(32, true), (33, true)]);
     let old_device_id = public_key_id(&public_key_from_seed(&[32; 32]).unwrap()).unwrap();
     let successor_key = public_key_from_seed(&[50; 32]).unwrap();
     let successor = PublicIdentity {
@@ -364,6 +364,158 @@ fn owner_revocation_survives_restart_and_only_new_grant_id_can_restore_access() 
     store
         .register_resource_principal_grant(storage_scope_id, old_grant_id, access.clone(), origin)
         .unwrap();
+    store
+        .register_resource_principal_grant(storage_scope_id, old_grant_id, access.clone(), origin)
+        .unwrap();
+
+    let alternate_signer_id = public_key_id(&public_key_from_seed(&[33; 32]).unwrap()).unwrap();
+    let semantically_identical_retry = ResourcePrincipalGrantRequest {
+        version: 1,
+        grant: serde_json::from_value(
+            serde_json::to_value(
+                sign_json_envelope(
+                    &[33; 32],
+                    serde_json::to_value(access.grant.payload.clone()).unwrap(),
+                    &alternate_signer_id,
+                    "MATCH/1",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    };
+    assert_eq!(
+        access.grant.payload,
+        semantically_identical_retry.grant.payload
+    );
+    assert_ne!(
+        access.grant.signature,
+        semantically_identical_retry.grant.signature
+    );
+    store
+        .register_resource_principal_grant(
+            storage_scope_id,
+            old_grant_id,
+            semantically_identical_retry.clone(),
+            origin,
+        )
+        .unwrap();
+
+    let mut changed_token_payload = access.grant.payload.clone();
+    changed_token_payload.read_token_hash =
+        URL_SAFE_NO_PAD.encode(Sha256::digest(b"different-read-token"));
+    let changed_token = ResourcePrincipalGrantRequest {
+        version: 1,
+        grant: serde_json::from_value(
+            serde_json::to_value(
+                sign_json_envelope(
+                    &[32; 32],
+                    serde_json::to_value(changed_token_payload).unwrap(),
+                    &old_device_id,
+                    "MATCH/1",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    };
+    assert_eq!(
+        store
+            .register_resource_principal_grant(
+                storage_scope_id,
+                old_grant_id,
+                changed_token,
+                origin,
+            )
+            .unwrap_err(),
+        "Storage principal grant epoch conflicts"
+    );
+
+    let mut changed_member_payload = access.grant.payload.clone();
+    let mut changed_workspace_grant = changed_member_payload.workspace_grant.payload.clone();
+    changed_workspace_grant.role = WorkspaceRole::Visitor;
+    changed_member_payload.workspace_grant = serde_json::from_value(
+        serde_json::to_value(
+            sign_json_envelope(
+                &[31; 32],
+                serde_json::to_value(changed_workspace_grant).unwrap(),
+                &old_device_id,
+                "MATCH/1",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    changed_member_payload.actions = vec!["read".into()];
+    changed_member_payload.write_token_hash = None;
+    let changed_member_grant = ResourcePrincipalGrantRequest {
+        version: 1,
+        grant: serde_json::from_value(
+            serde_json::to_value(
+                sign_json_envelope(
+                    &[32; 32],
+                    serde_json::to_value(changed_member_payload).unwrap(),
+                    &old_device_id,
+                    "MATCH/1",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    };
+    assert_eq!(
+        store
+            .register_resource_principal_grant(
+                storage_scope_id,
+                old_grant_id,
+                changed_member_grant,
+                origin,
+            )
+            .unwrap_err(),
+        "Storage principal grant epoch conflicts"
+    );
+
+    let revoked_owner_view =
+        test_revoke_authority_device(owner_view.clone(), &alternate_signer_id, &[32; 32]);
+    store
+        .update_identity_authority(
+            test_authority_update_request(
+                revoked_owner_view,
+                &[32; 32],
+                &service_id,
+                origin,
+                now_ms().unwrap(),
+            ),
+            origin,
+        )
+        .unwrap();
+    assert!(
+        store
+            .register_resource_principal_grant(
+                storage_scope_id,
+                old_grant_id,
+                semantically_identical_retry,
+                origin,
+            )
+            .is_err(),
+        "a valid signature from a now-revoked issuer must still be rejected"
+    );
+    store
+        .register_resource_principal_grant(storage_scope_id, old_grant_id, access.clone(), origin)
+        .unwrap();
+    assert_eq!(
+        store
+            .read_resource_principal_grant(storage_scope_id, &subject.person_id, origin)
+            .unwrap()
+            .grant
+            .signer_key_id,
+        old_device_id,
+        "same-payload retry from an active signer must replace a stored revoked-signer envelope"
+    );
 
     let transfer = sign_scope_record(
         &[32; 32],
