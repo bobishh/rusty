@@ -1819,8 +1819,10 @@ mod tests {
 
         let typed_hash = request.request_hash().unwrap();
         let typed_snapshot = serde_json::to_value(&request.scope_authority).unwrap();
-        let expected = canonical_hash(&json!({"version": 1, "scopeAuthority": typed_snapshot})).unwrap();
-        let raw_hash = canonical_hash(&json!({"version": 1, "scopeAuthority": wire_snapshot})).unwrap();
+        let expected =
+            canonical_hash(&json!({"version": 1, "scopeAuthority": typed_snapshot})).unwrap();
+        let raw_hash =
+            canonical_hash(&json!({"version": 1, "scopeAuthority": wire_snapshot})).unwrap();
 
         assert_eq!(typed_hash, expected);
         assert_ne!(typed_hash, raw_hash);
