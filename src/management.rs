@@ -224,7 +224,7 @@ fn capability(value: &SignedEnvelope<Value>) -> Result<Capability, String> {
 }
 
 impl BlindStore {
-    fn person_device_allowed(
+    pub(super) fn person_device_allowed(
         &self,
         identity: &PublicIdentity,
         device_id: &str,

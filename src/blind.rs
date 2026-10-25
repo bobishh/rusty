@@ -57,6 +57,8 @@ mod archives;
 mod blobs;
 #[path = "checkpoint.rs"]
 mod checkpoint;
+#[path = "identity_catalog_access.rs"]
+mod identity_catalog_access;
 #[path = "management.rs"]
 mod management;
 
@@ -1556,6 +1558,7 @@ impl BlindStore {
                     "management",
                     "identity-authorities",
                     "identity-successions",
+                    "identity-catalog-access",
                     "identity-authority-enforcement.json",
                 ]
                 .contains(&name)
@@ -1571,7 +1574,8 @@ impl BlindStore {
                 || directory
                     .join("identity-authority-enforcement.json")
                     .exists()
-                || directory.join("identity-successions").exists())
+                || directory.join("identity-successions").exists()
+                || directory.join("identity-catalog-access").exists())
                 && !directory.join("service-key").exists()
             {
                 return Err(
@@ -4828,6 +4832,15 @@ pub fn router_with_telemetry(
             put(identity_authority_update).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
         .route(
+            "/v2/identity/catalog-access",
+            put(identity_catalog_access::publish).layer(DefaultBodyLimit::max(identity_catalog_access::PUBLISH_MAX_BYTES)),
+        )
+        .route(
+            "/v2/identity/catalog-access/request",
+            axum::routing::post(identity_catalog_access::request_list)
+                .layer(DefaultBodyLimit::max(identity_catalog_access::LIST_REQUEST_MAX_BYTES)),
+        )
+        .route(
             "/v2/identity/succession/{previous_person_id}/{transition_hash}",
             get(identity_root_succession_status),
         )
@@ -5194,7 +5207,7 @@ async fn discovery(State(state): State<HttpState>) -> Result<Json<Value>, ApiErr
             "readers": {"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1, "publicBoardPublication": 1},
         "service": {"serviceId": service_id, "publicKey": public_key},
         "identityAuthorityEnforcement": state.store.identity_authority_enforcement(),
-        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1,"fieldConfigurationVersion":1,"deliveryVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"deviceAccessRestoration":{"version":1},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
+        "capabilities": {"modes": ["blind"], "encryptedObjectReplication": true, "applicationWrites": false, "classification": false, "publicBoardPublication":{"version":1,"presentationVersion":1,"fieldConfigurationVersion":1,"deliveryVersion":1},"snapshotCheckpoints":{"version":1,"observedSequence":true},"scopeManagement":{"version":1},"personManagement":{"version":1},"scopeEnrollmentRetry":{"version":1},"deviceAccessRestoration":{"version":1},"identityCatalogAccess":{"version":1,"maximumEntries":8,"maximumResponseBytes":393216,"maximumCiphertextBytes":49152},"encryptedBlobs":{"version":1,"maximumCiphertextBytes":1048592},"blobCoverage":{"version":1,"maximumObjects":33},"encryptedArchives":{"version":1,"maximumCiphertextBytes":262160},"archiveCoverageBatches":{"version":1,"maximumObjects":64},"archiveCoverageAggregates":{"version":1,"maximumChildren":8,"maximumHeight":31},"writerPolicy":{"version":1,"maximumWriterVersion":2}}}),
     ))
 }
 
@@ -6164,6 +6177,9 @@ async fn download(
     Ok(Json(object))
 }
 
+#[cfg(test)]
+#[path = "catalog_access_tests.rs"]
+mod catalog_access_tests;
 #[cfg(test)]
 #[path = "checkpoint_tests.rs"]
 mod checkpoint_tests;

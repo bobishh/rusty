@@ -119,6 +119,28 @@ The client retains the exact enrollment request and signed receipt in a durable
 transition journal; a lost confirmation is retried without generating another key
 or silently adopting an unrelated policy revision.
 
+### Opaque Identity catalog access
+
+Discovery advertises `capabilities.identityCatalogAccess` with version `1`, at
+most eight entries, a 384 KiB response limit, and a 48 KiB ciphertext limit.
+`PUT /v2/identity/catalog-access` accepts an application-origin-bound signed
+publication from a current, active application device. The publication carries
+the request-v3/approval-v5 proof and its public service-pin list needed to
+establish that origin; the publishing application device does not need
+device-enrollment authority. Rusty validates the publisher and recipient against
+current Identity authority, then stores only the signed envelope and
+Rusty-signed receipt. Ciphertext remains opaque to Rusty.
+
+`POST /v2/identity/catalog-access/request` accepts a short-lived, challenge-bound
+request signed by the recipient's current active manager device. Rusty returns
+the recipient's bounded catalog list, sorted by catalog ID, and a signed receipt
+binding the request and list hash. This read rechecks current Identity authority
+and writes no control-plane state. Repeating the same valid request is safe.
+Publication retries with the identical signed envelope return the original
+receipt, including after restart. A changed envelope at the same or an older
+revision conflicts; a higher revision may replace only the same recipient,
+application origin, and catalog tuple.
+
 ### Resource management policy
 
 Discovery advertises `capabilities.personManagement.version: 1` separately from
