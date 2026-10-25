@@ -1,6 +1,128 @@
 use super::*;
 
 #[tokio::test]
+async fn purpose_update_waits_for_scope_readers_before_committing() {
+    use crate::identity_authority::{
+        ScopePurposeUpdateAuthorization, test_authority_update_request,
+        test_authority_view_with_devices,
+    };
+    use meta_mesh_core::{PublicIdentity, public_key_from_seed, public_key_id, sign_json_envelope};
+
+    let directory =
+        std::env::temp_dir().join(format!("rusty-purpose-lock-{}", rand::random::<u64>()));
+    let store = BlindStore::open(directory.clone()).unwrap();
+    let scope = "purpose-lock-scope";
+    let origin = "https://rusty.example";
+    store
+        .approve(
+            scope,
+            ScopeApproval {
+                expected_revision: 0,
+                read_token: "r".repeat(43),
+                write_token: "w".repeat(43),
+                revoked: false,
+            },
+        )
+        .unwrap();
+
+    let root_seed = [31; 32];
+    let device_seed = [32; 32];
+    let identity_public_key = public_key_from_seed(&root_seed).unwrap();
+    let identity = PublicIdentity {
+        person_id: public_key_id(&identity_public_key).unwrap(),
+        public_key: identity_public_key,
+        display_name: "Purpose lock owner".into(),
+    };
+    let policy_path = store.scope_dir(scope).unwrap().join("policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy["ownerPersonId"] = json!(identity.person_id);
+    atomic_write(&policy_path, &serde_json::to_vec(&policy).unwrap()).unwrap();
+
+    let view = test_authority_view_with_devices(&identity, &root_seed, &[(32, true)]);
+    let service_id = public_key_id(&store.public_key().unwrap()).unwrap();
+    store
+        .update_identity_authority(
+            test_authority_update_request(
+                view,
+                &device_seed,
+                &service_id,
+                origin,
+                now_ms().unwrap(),
+            ),
+            origin,
+        )
+        .unwrap();
+
+    let request_hash = digest(
+        canonicalize_json(&json!({
+            "version": 1,
+            "scopePurpose": "person-identity",
+        }))
+        .unwrap()
+        .as_bytes(),
+    );
+    let device_id = public_key_id(&public_key_from_seed(&device_seed).unwrap()).unwrap();
+    let issued_at = now_ms().unwrap();
+    let authorization = sign_json_envelope(
+        &device_seed,
+        serde_json::to_value(ScopePurposeUpdateAuthorization {
+            kind: "rusty-scope-purpose-update".into(),
+            version: 1,
+            service_id,
+            origin: origin.into(),
+            scope_id: scope.into(),
+            scope_purpose: "person-identity".into(),
+            person_id: identity.person_id,
+            device_id: device_id.clone(),
+            policy_revision: 1,
+            request_id: URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+            issued_at,
+            expires_at: issued_at + 60_000,
+            request_hash,
+        })
+        .unwrap(),
+        device_id,
+        SIGNATURE_DOMAIN,
+    )
+    .unwrap();
+    let request = ScopePurposeUpdateRequest {
+        version: 1,
+        scope_purpose: "person-identity".into(),
+        authorization: serde_json::from_value(serde_json::to_value(authorization).unwrap())
+            .unwrap(),
+    };
+
+    let scope_gate = store.resource_scope_gate(scope).unwrap();
+    let read_guard = scope_gate.clone().read_owned().await;
+    let mut update = Box::pin(scope_purpose_update(
+        State(HttpState {
+            store: store.clone(),
+            origin: origin.into(),
+        }),
+        RoutePath(scope.into()),
+        Json(request),
+    ));
+    let first_poll = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(update.as_mut(), context))
+    })
+    .await;
+    assert!(
+        first_poll.is_pending(),
+        "purpose update should wait on the read gate"
+    );
+    drop(read_guard);
+    let response = update
+        .await
+        .expect("purpose update should commit after reader exits");
+    assert_eq!(
+        response.0["receipt"]["payload"]["scopePurpose"],
+        "person-identity"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn browser_cors_preflight_allows_configured_clients_and_identity_proof_headers() {
     let directory =
         std::env::temp_dir().join(format!("rusty-identity-cors-{}", rand::random::<u64>()));

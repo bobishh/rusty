@@ -2666,11 +2666,12 @@ impl BlindStore {
         atomic_write(&path, &bytes).map_err(|message| (message, None))?;
         Ok(receipt)
     }
-    fn update_scope_purpose(
+    fn update_scope_purpose_with_guard(
         &self,
         scope: &str,
         request: ScopePurposeUpdateRequest,
         origin: &str,
+        _scope_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
     ) -> Result<SignedEnvelope<Value>, String> {
         if request.version != 1 || !valid_id(scope) || request.scope_purpose != "person-identity" {
             return Err("Invalid one-time Identity scope classification".into());
@@ -2706,10 +2707,6 @@ impl BlindStore {
         {
             return Err("Scope purpose authorization binding or expiry is invalid".into());
         }
-        let scope_gate = self.resource_scope_gate(scope)?;
-        let _scope_guard = scope_gate
-            .try_write()
-            .map_err(|_| "Resource scope lock unavailable")?;
         let _guard = self.lock.lock().map_err(|_| "Storage lock unavailable")?;
         let mut policy = self.policy(scope)?;
         if let Some(completed) = &policy.completed_scope_purpose_update {
@@ -5846,10 +5843,15 @@ async fn scope_purpose_update(
     RoutePath(scope): RoutePath<String>,
     Json(request): Json<ScopePurposeUpdateRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let scope_gate = state
+        .store
+        .resource_scope_gate(&scope)
+        .map_err(|message| failure(StatusCode::BAD_REQUEST, &message))?;
+    let scope_guard = scope_gate.write_owned().await;
     match tokio::task::spawn_blocking({
         let store = state.store.clone();
         let origin = state.origin.clone();
-        move || store.update_scope_purpose(&scope, request, &origin)
+        move || store.update_scope_purpose_with_guard(&scope, request, &origin, scope_guard)
     })
     .await
     .map_err(|_| {
