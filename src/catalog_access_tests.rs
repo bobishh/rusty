@@ -215,6 +215,15 @@ impl Fixture {
     }
 
     fn list_request(&self, signer_seed: u8, challenge: &str) -> Value {
+        self.list_request_for_origin(signer_seed, challenge, APPLICATION_ORIGIN)
+    }
+
+    fn list_request_for_origin(
+        &self,
+        signer_seed: u8,
+        challenge: &str,
+        application_origin: &str,
+    ) -> Value {
         let device_public_key = public_key_from_seed(&[signer_seed; 32]).unwrap();
         let device_id = public_key_id(&device_public_key).unwrap();
         let now = now_ms().unwrap();
@@ -224,7 +233,7 @@ impl Fixture {
                 json!({
                     "kind": "mesh-identity-catalog-access-list-request", "version": 1,
                     "serviceId": public_key_id(&self.store().public_key().unwrap()).unwrap(),
-                    "personId": self.identity.person_id, "applicationOrigin": APPLICATION_ORIGIN,
+                    "personId": self.identity.person_id, "applicationOrigin": application_origin,
                     "recipientDeviceId": device_id, "recipientPublicKeyId": device_id,
                     "recipientPublicKey": device_public_key, "challenge": challenge,
                     "issuedAt": now, "expiresAt": now + 60_000,
@@ -236,6 +245,83 @@ impl Fixture {
         )
         .unwrap()
     }
+}
+
+#[tokio::test]
+async fn given_catalog_exists_for_another_manager_then_only_same_origin_empty_recipient_is_pending()
+{
+    let fixture = Fixture::new().await;
+    let url = format!("{}/v2/identity/catalog-access/request", fixture.url);
+    let initial_request =
+        fixture.list_request(32, &URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()));
+    let initial = fixture
+        .client
+        .post(&url)
+        .json(&initial_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial_body: Value = initial.json().await.unwrap();
+    assert_eq!(initial_body["envelopes"], json!([]));
+    let initial_receipt: SignedEnvelope<Value> =
+        serde_json::from_value(initial_body["receipt"].clone()).unwrap();
+    assert!(
+        verify_signed_envelope(
+            &initial_receipt,
+            &fixture.store().public_key().unwrap(),
+            DOMAIN
+        )
+        .unwrap()
+    );
+
+    let publication = fixture.publisher_envelope(
+        "catalog_for_manager_34",
+        1,
+        &URL_SAFE_NO_PAD.encode([99_u8; 32]),
+    );
+    let published = fixture
+        .client
+        .put(format!("{}/v2/identity/catalog-access", fixture.url))
+        .json(&publication)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::OK);
+
+    let pending_request =
+        fixture.list_request(32, &URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()));
+    let pending = fixture
+        .client
+        .post(&url)
+        .json(&pending_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let pending_body: Value = pending.json().await.unwrap();
+    assert_eq!(pending_body["code"], "catalog_access_pending");
+
+    let other_origin_request = fixture.list_request_for_origin(
+        32,
+        &URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+        "https://another-app.example",
+    );
+    let other_origin = fixture
+        .client
+        .post(&url)
+        .json(&other_origin_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_origin.status(), StatusCode::OK);
+    let other_origin_body: Value = other_origin.json().await.unwrap();
+    assert_eq!(other_origin_body["envelopes"], json!([]));
+    let receipt: SignedEnvelope<Value> =
+        serde_json::from_value(other_origin_body["receipt"].clone()).unwrap();
+    assert!(
+        verify_signed_envelope(&receipt, &fixture.store().public_key().unwrap(), DOMAIN).unwrap()
+    );
 }
 
 #[tokio::test]

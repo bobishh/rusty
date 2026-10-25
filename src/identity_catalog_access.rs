@@ -1,5 +1,6 @@
 //! Opaque encrypted Identity catalog access, independent of workspace storage tokens.
 use super::*;
+use crate::identity_authority::VerifiedIdentityAuthorityView;
 
 pub(super) const PUBLISH_MAX_BYTES: usize = 128 * 1024;
 const CIPHERTEXT_MAX_BYTES: usize = 48 * 1024;
@@ -10,6 +11,8 @@ const MAX_ORIGIN_BYTES: usize = 512;
 const MAX_PIN_COUNT: usize = 64;
 const LIST_TTL_MS: u64 = 120_000;
 const REQUEST_DOMAIN: &str = "MESH-IDENTITY-CATALOG-ACCESS-REQUEST/1";
+const CATALOG_ACCESS_PENDING_MESSAGE: &str =
+    "Identity catalog publication is pending for this manager";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1389,6 +1392,21 @@ impl BlindStore {
                 }
             }
         }
+        if rows.is_empty()
+            && other_active_manager_has_catalog(
+                self,
+                &verified,
+                person_id,
+                application_origin,
+                recipient_device_id,
+                service_id.as_str(),
+            )?
+        {
+            return Err(CatalogAccessError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                CATALOG_ACCESS_PENDING_MESSAGE,
+            ));
+        }
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         let envelopes = rows
             .into_iter()
@@ -1478,6 +1496,111 @@ impl BlindStore {
     }
 }
 
+fn other_active_manager_has_catalog(
+    store: &BlindStore,
+    authority: &VerifiedIdentityAuthorityView,
+    person_id: &str,
+    application_origin: &str,
+    recipient_device_id: &str,
+    service_id: &str,
+) -> CatalogResult<bool> {
+    let identity = authority.view.identity();
+    for manager_id in authority.certificates_by_device.keys() {
+        if manager_id == recipient_device_id
+            || !authority.is_active_manager(manager_id).map_err(|_| {
+                CatalogAccessError(StatusCode::FORBIDDEN, "Identity manager is invalid")
+            })?
+        {
+            continue;
+        }
+        let chain = certificate_chain(&identity, manager_id, &authority.certificates_by_device)
+            .map_err(|_| {
+                CatalogAccessError(
+                    StatusCode::FORBIDDEN,
+                    "Identity manager certificate chain is invalid",
+                )
+            })?;
+        let manager_public_key =
+            verify_device_certificate_chain(&identity, manager_id, &chain, SIGNATURE_DOMAIN)
+                .map_err(|_| {
+                    CatalogAccessError(
+                        StatusCode::FORBIDDEN,
+                        "Identity manager certificate chain is invalid",
+                    )
+                })?;
+        let manager_key_id = public_key_id(&manager_public_key).map_err(|_| {
+            CatalogAccessError(StatusCode::FORBIDDEN, "Identity manager key is invalid")
+        })?;
+        let directory = catalog_directory(store, person_id, application_origin, manager_id);
+        if !directory.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&directory).map_err(|_| {
+            CatalogAccessError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Catalog storage unavailable",
+            )
+        })? {
+            let entry = entry.map_err(|_| {
+                CatalogAccessError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Catalog storage unavailable",
+                )
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|_| {
+                    CatalogAccessError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Catalog storage unavailable",
+                    )
+                })?
+                .is_file()
+            {
+                return reject(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Catalog storage index is invalid",
+                );
+            }
+            let catalog_id = entry
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+                .strip_suffix(".json")
+                .filter(|id| valid_id(id))
+                .ok_or(CatalogAccessError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Catalog storage index is invalid",
+                ))?
+                .to_owned();
+            let binding = PublicationBinding {
+                service_id: service_id.into(),
+                publisher_device_id: String::new(),
+                person_id: person_id.into(),
+                application_origin: application_origin.into(),
+                catalog_id: String::new(),
+                source_revision: 0,
+                recipient_device_id: manager_id.clone(),
+                recipient_public_key_id: manager_key_id.clone(),
+                recipient_public_key: manager_public_key.clone(),
+            };
+            let stored =
+                load_stored(&entry.path(), store, Some(&binding))?.ok_or(CatalogAccessError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Catalog storage entry disappeared",
+                ))?;
+            if stored.receipt.payload.catalog_id != catalog_id {
+                return reject(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Catalog storage path binding failure",
+                );
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) async fn publish(
     State(state): State<HttpState>,
     Json(request): Json<SignedEnvelope<Value>>,
@@ -1544,6 +1667,20 @@ pub(super) async fn request_list(
             "Catalog request unavailable",
         )
     })?
-    .map_err(|CatalogAccessError(status, message)| failure(status, message))?;
+    .map_err(catalog_list_failure)?;
     Ok(Json(json!({"envelopes": envelopes, "receipt": receipt})))
+}
+
+fn catalog_list_failure(CatalogAccessError(status, message): CatalogAccessError) -> ApiError {
+    if message == CATALOG_ACCESS_PENDING_MESSAGE {
+        (
+            status,
+            Json(json!({
+                "code": "catalog_access_pending",
+                "message": CATALOG_ACCESS_PENDING_MESSAGE,
+            })),
+        )
+    } else {
+        failure(status, message)
+    }
 }

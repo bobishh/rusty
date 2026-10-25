@@ -135,7 +135,13 @@ Rusty-signed receipt. Ciphertext remains opaque to Rusty.
 request signed by the recipient's current active manager device. Rusty returns
 the recipient's bounded catalog list, sorted by catalog ID, and a signed receipt
 binding the request and list hash. This read rechecks current Identity authority
-and writes no control-plane state. Repeating the same valid request is safe.
+and writes no control-plane state. If the recipient has no entries but another
+active manager has a valid publication for the same person and exact application
+origin, Rusty returns HTTP `503` with code `catalog_access_pending`. The client
+may retry that same signed request while it remains current and unexpired; it
+must treat exhaustion or expiry as unavailable. A signed empty list means no
+catalog publication exists for that person and application origin. Other
+application origins remain independent. Repeating the same valid request is safe.
 Publication retries with the identical signed envelope return the original
 receipt, including after restart. A changed envelope at the same or an older
 revision conflicts; a higher revision may replace only the same recipient,
