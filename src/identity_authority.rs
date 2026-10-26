@@ -852,11 +852,8 @@ impl ScopeAuthorityUpdateRequest {
         }
         let verified_identity = authority_view.verify()?;
         if !verified_identity.is_active_device(&payload.device_id)?
-            || !scope_authority_chain_matches(
-                &verified_identity,
-                &validated.controller,
-                &payload.device_id,
-            )?
+            || validated.controller.person_id != verified_identity.view.person_id
+            || validated.controller.public_key != verified_identity.view.identity_public_key
         {
             return Err("Scope authority controller device is revoked or mismatched".into());
         }
@@ -1961,6 +1958,155 @@ mod tests {
 
         assert_eq!(typed_hash, expected);
         assert_ne!(typed_hash, raw_hash);
+    }
+
+    #[test]
+    fn current_identity_device_can_update_scope_with_legacy_controller_certificate_chain() {
+        let root_seed = [181; 32];
+        let legacy_controller_seed = [182; 32];
+        let manager_seed = [183; 32];
+        let current_device_seed = [184; 32];
+        let (controller, _) = scope_identity(root_seed[0], &[(legacy_controller_seed[0], true)]);
+        let identity = PublicIdentity {
+            person_id: controller.person_id.clone(),
+            public_key: controller.public_key.clone(),
+            display_name: String::new(),
+        };
+        let current_view = test_authority_view_with_devices(
+            &identity,
+            &root_seed,
+            &[
+                (legacy_controller_seed[0], true),
+                (manager_seed[0], true),
+                (current_device_seed[0], false),
+            ],
+        );
+        let snapshot = scope_snapshot(
+            "legacy-controller-chain",
+            &controller,
+            &legacy_controller_seed,
+            Vec::new(),
+        );
+        let now = 1_800_000_000_000;
+        let request = signed_scope_update_request(
+            snapshot,
+            &current_device_seed,
+            "rusty-service",
+            "https://rusty.test",
+            now,
+        );
+
+        let accepted = request.verify(
+            "legacy-controller-chain",
+            Some(&controller.person_id),
+            "rusty-service",
+            "https://rusty.test",
+            &current_view,
+            now,
+        );
+        assert!(
+            accepted.is_ok(),
+            "active current device should not need to appear in genesis: {accepted:?}"
+        );
+
+        let current_device_id =
+            public_key_id(&public_key_from_seed(&current_device_seed).unwrap()).unwrap();
+        let revoked_view =
+            test_revoke_authority_device(current_view.clone(), &current_device_id, &manager_seed);
+        let revoked = request.verify(
+            "legacy-controller-chain",
+            Some(&controller.person_id),
+            "rusty-service",
+            "https://rusty.test",
+            &revoked_view,
+            now,
+        );
+        assert!(
+            revoked.is_err(),
+            "revoked current Identity device must remain denied"
+        );
+
+        let (_, foreign_view) =
+            scope_identity(root_seed[0] + 1, &[(current_device_seed[0], false)]);
+        let wrong_identity = request.verify(
+            "legacy-controller-chain",
+            Some(&controller.person_id),
+            "rusty-service",
+            "https://rusty.test",
+            &foreign_view,
+            now,
+        );
+        assert!(
+            wrong_identity.is_err(),
+            "another Identity root must not control this scope"
+        );
+
+        let mut forged = request;
+        forged.authorization.signature = "invalid-signature".into();
+        let bad_signature = forged.verify(
+            "legacy-controller-chain",
+            Some(&controller.person_id),
+            "rusty-service",
+            "https://rusty.test",
+            &current_view,
+            now,
+        );
+        assert!(
+            bad_signature.is_err(),
+            "current Identity membership does not replace request signature verification"
+        );
+    }
+
+    fn signed_scope_update_request(
+        scope_authority: ScopeAuthoritySnapshot,
+        device_seed: &[u8; 32],
+        service_id: &str,
+        origin: &str,
+        now: u64,
+    ) -> ScopeAuthorityUpdateRequest {
+        let device_id = public_key_id(&public_key_from_seed(device_seed).unwrap()).unwrap();
+        let mut request = ScopeAuthorityUpdateRequest {
+            version: 1,
+            scope_authority,
+            authorization: sign_json_envelope(
+                device_seed,
+                json!({"kind": "rusty-scope-authority-update", "version": 1}),
+                device_id.clone(),
+                SIGNATURE_DOMAIN,
+            )
+            .unwrap(),
+        };
+        let request_hash = request.request_hash().unwrap();
+        let scope_id = request.scope_authority.genesis.payload.scope_id.clone();
+        request.authorization = sign_json_envelope(
+            device_seed,
+            serde_json::to_value(ScopeAuthorityUpdateAuthorization {
+                kind: "rusty-scope-authority-update".into(),
+                version: 1,
+                service_id: service_id.into(),
+                origin: origin.into(),
+                scope_id: scope_id.clone(),
+                workspace_id: scope_id,
+                person_id: request
+                    .scope_authority
+                    .genesis
+                    .payload
+                    .creator
+                    .person_id
+                    .clone(),
+                device_id: device_id.clone(),
+                control_epoch: 1,
+                request_id: URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+                issued_at: now,
+                expires_at: now + 60_000,
+                request_hash,
+            })
+            .unwrap(),
+            device_id,
+            SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        request
     }
 
     fn scope_genesis(
