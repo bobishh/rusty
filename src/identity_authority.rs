@@ -1136,6 +1136,7 @@ impl ResourcePrincipalGrant {
             || self.resource_id != storage_scope_id
             || self.scope_id != storage_scope_id
             || self.owner_person_id != scope_authority.controller.person_id
+            || scope_authority.controller.public_key != owner.view.identity_public_key
             || self.owner_person_id != owner.view.person_id
             || workspace_id != scope_authority.scope_id
             || self.workspace_id != workspace_id
@@ -1157,13 +1158,6 @@ impl ResourcePrincipalGrant {
         }
         if require_active_issuer && !owner.is_active_device(&envelope.signer_key_id)? {
             return Err("Resource grant issuer is not an active Identity device".into());
-        }
-        if !scope_authority_chain_matches(
-            owner,
-            &scope_authority.controller,
-            &envelope.signer_key_id,
-        )? {
-            return Err("Resource grant controller certificate history mismatch".into());
         }
         let owner_identity = owner.view.identity();
         verify_workspace_grant_from_scope_history(
@@ -1230,15 +1224,9 @@ impl ResourcePrincipalRevocationAuthorization {
             return Err("Invalid Rusty resource principal revocation binding".into());
         }
         let verified = identity.verify()?;
-        if !verified.is_active_device(&envelope.signer_key_id)?
-            || !scope_authority_chain_matches(
-                &verified,
-                &authority.controller,
-                &envelope.signer_key_id,
-            )?
-        {
+        if !verified.is_active_device(&envelope.signer_key_id)? {
             return Err(
-                "Resource principal revocation signer is not an active scope controller".into(),
+                "Resource principal revocation signer is not an active Identity device".into(),
             );
         }
         let issuer_key = verify_device_certificate_chain(
@@ -2432,9 +2420,19 @@ mod tests {
     fn current_controller_can_reattest_grant_signed_by_historical_controller() {
         let old_root_seed = [61; 32];
         let old_device_seed = [62; 32];
-        let successor_device_seed = [64; 32];
+        let current_device_seed = [67; 32];
         let (old_controller, _) = scope_identity(61, &[(62, true)]);
-        let (successor, successor_view) = scope_identity(63, &[(62, false), (64, false)]);
+        let (successor, _) = scope_identity(63, &[(62, false), (64, false)]);
+        let successor_identity = PublicIdentity {
+            person_id: successor.person_id.clone(),
+            public_key: successor.public_key.clone(),
+            display_name: String::new(),
+        };
+        let current_view = test_authority_view_with_devices(
+            &successor_identity,
+            &[63; 32],
+            &[(62, false), (64, false), (66, true), (67, false)],
+        );
         let subject_key = public_key_from_seed(&[65; 32]).unwrap();
         let subject_person_id = public_key_id(&subject_key).unwrap();
         let scope_id = "history-bound-grant";
@@ -2473,8 +2471,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let successor_device_id =
-            public_key_id(&public_key_from_seed(&successor_device_seed).unwrap()).unwrap();
+        let current_device_id =
+            public_key_id(&public_key_from_seed(&current_device_seed).unwrap()).unwrap();
         let payload = ResourcePrincipalGrant {
             kind: "rusty-resource-principal-grant".into(),
             version: 1,
@@ -2498,9 +2496,9 @@ mod tests {
         let envelope: SignedEnvelope<ResourcePrincipalGrant> = serde_json::from_value(
             serde_json::to_value(
                 sign_json_envelope(
-                    &successor_device_seed,
+                    &current_device_seed,
                     serde_json::to_value(payload.clone()).unwrap(),
-                    successor_device_id,
+                    current_device_id.clone(),
                     SIGNATURE_DOMAIN,
                 )
                 .unwrap(),
@@ -2511,7 +2509,7 @@ mod tests {
 
         let result = payload.verify(
             &envelope,
-            &successor_view.verify().unwrap(),
+            &current_view.verify().unwrap(),
             "rusty-service",
             "https://rusty.test",
             scope_id,
@@ -2520,6 +2518,147 @@ mod tests {
             1_800_000_000_000,
         );
         assert!(result.is_ok(), "{result:?}");
+
+        let authority = validate_scope_authority_at(&payload.scope_authority, 1_800_000_000_000)
+            .expect("validated legacy workspace controller");
+        let mut revocation = ResourcePrincipalRevocationAuthorization {
+            kind: "rusty-resource-principal-revocation".into(),
+            version: 1,
+            service_id: "rusty-service".into(),
+            origin: "https://rusty.test".into(),
+            storage_scope_id: scope_id.into(),
+            workspace_id: scope_id.into(),
+            grant_id: payload.grant_id.clone(),
+            subject_person_id: payload.subject_person_id.clone(),
+            policy_epoch: payload.policy_epoch,
+            request_hash: String::new(),
+        };
+        revocation.request_hash = canonical_hash(&json!({
+            "kind": revocation.kind,
+            "version": revocation.version,
+            "serviceId": revocation.service_id,
+            "origin": revocation.origin,
+            "storageScopeId": revocation.storage_scope_id,
+            "workspaceId": revocation.workspace_id,
+            "grantId": revocation.grant_id,
+            "subjectPersonId": revocation.subject_person_id,
+            "policyEpoch": revocation.policy_epoch,
+        }))
+        .unwrap();
+        let mut revocation_envelope: SignedEnvelope<ResourcePrincipalRevocationAuthorization> =
+            serde_json::from_value(
+                serde_json::to_value(
+                    sign_json_envelope(
+                        &current_device_seed,
+                        serde_json::to_value(revocation.clone()).unwrap(),
+                        current_device_id.clone(),
+                        SIGNATURE_DOMAIN,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            revocation
+                .verify(
+                    &revocation_envelope,
+                    &current_view,
+                    &authority,
+                    "rusty-service",
+                    "https://rusty.test",
+                    scope_id,
+                )
+                .is_ok()
+        );
+
+        let revoked_view =
+            test_revoke_authority_device(current_view.clone(), &current_device_id, &[66; 32]);
+        assert!(
+            payload
+                .verify(
+                    &envelope,
+                    &revoked_view.verify().unwrap(),
+                    "rusty-service",
+                    "https://rusty.test",
+                    scope_id,
+                    scope_id,
+                    true,
+                    1_800_000_000_000,
+                )
+                .is_err()
+        );
+        assert!(
+            revocation
+                .verify(
+                    &revocation_envelope,
+                    &revoked_view,
+                    &authority,
+                    "rusty-service",
+                    "https://rusty.test",
+                    scope_id,
+                )
+                .is_err()
+        );
+
+        let (foreign, foreign_view) = scope_identity(68, &[(67, false)]);
+        assert_ne!(foreign.person_id, successor.person_id);
+        assert!(
+            payload
+                .verify(
+                    &envelope,
+                    &foreign_view.verify().unwrap(),
+                    "rusty-service",
+                    "https://rusty.test",
+                    scope_id,
+                    scope_id,
+                    true,
+                    1_800_000_000_000,
+                )
+                .is_err()
+        );
+        assert!(
+            revocation
+                .verify(
+                    &revocation_envelope,
+                    &foreign_view,
+                    &authority,
+                    "rusty-service",
+                    "https://rusty.test",
+                    scope_id,
+                )
+                .is_err()
+        );
+
+        let mut bad_grant_signature = envelope.clone();
+        bad_grant_signature.signature = "invalid-signature".into();
+        assert!(
+            payload
+                .verify(
+                    &bad_grant_signature,
+                    &current_view.verify().unwrap(),
+                    "rusty-service",
+                    "https://rusty.test",
+                    scope_id,
+                    scope_id,
+                    true,
+                    1_800_000_000_000,
+                )
+                .is_err()
+        );
+        revocation_envelope.signature = "invalid-signature".into();
+        assert!(
+            revocation
+                .verify(
+                    &revocation_envelope,
+                    &current_view,
+                    &authority,
+                    "rusty-service",
+                    "https://rusty.test",
+                    scope_id,
+                )
+                .is_err()
+        );
 
         let mut ambiguous = payload.clone();
         ambiguous.workspace_grant = serde_json::from_value(
@@ -2548,9 +2687,9 @@ mod tests {
         let ambiguous_envelope: SignedEnvelope<ResourcePrincipalGrant> = serde_json::from_value(
             serde_json::to_value(
                 sign_json_envelope(
-                    &successor_device_seed,
+                    &current_device_seed,
                     serde_json::to_value(ambiguous.clone()).unwrap(),
-                    public_key_id(&public_key_from_seed(&successor_device_seed).unwrap()).unwrap(),
+                    public_key_id(&public_key_from_seed(&current_device_seed).unwrap()).unwrap(),
                     SIGNATURE_DOMAIN,
                 )
                 .unwrap(),
@@ -2562,7 +2701,7 @@ mod tests {
             ambiguous
                 .verify(
                     &ambiguous_envelope,
-                    &successor_view.verify().unwrap(),
+                    &current_view.verify().unwrap(),
                     "rusty-service",
                     "https://rusty.test",
                     scope_id,
@@ -2603,9 +2742,9 @@ mod tests {
         let forged_envelope: SignedEnvelope<ResourcePrincipalGrant> = serde_json::from_value(
             serde_json::to_value(
                 sign_json_envelope(
-                    &successor_device_seed,
+                    &current_device_seed,
                     serde_json::to_value(forged.clone()).unwrap(),
-                    public_key_id(&public_key_from_seed(&successor_device_seed).unwrap()).unwrap(),
+                    public_key_id(&public_key_from_seed(&current_device_seed).unwrap()).unwrap(),
                     SIGNATURE_DOMAIN,
                 )
                 .unwrap(),
@@ -2617,7 +2756,7 @@ mod tests {
             forged
                 .verify(
                     &forged_envelope,
-                    &successor_view.verify().unwrap(),
+                    &current_view.verify().unwrap(),
                     "rusty-service",
                     "https://rusty.test",
                     scope_id,
