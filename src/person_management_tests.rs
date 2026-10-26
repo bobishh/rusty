@@ -504,3 +504,56 @@ async fn given_global_person_revocation_then_valid_resource_capabilities_cannot_
         "global revocation denies checkpoint despite a valid scope capability and storage token"
     );
 }
+
+#[tokio::test]
+async fn given_person_policy_when_unmanaged_publication_status_is_read_after_restart_then_only_active_devices_may_read_without_resource_creation()
+ {
+    let mut f = Fixture::new().await;
+    let (revoked_id, _) = device(33, &f.owner.identity);
+    person_policy(
+        &f,
+        vec![revoked_id],
+        vec!["management.update", "resource.create"],
+        None,
+    )
+    .await;
+    f.restart().await;
+    let board_id = "unmanaged-status-board";
+    for (seed, kind, id, operation, expected) in [
+        (32, "board", board_id, "publication.status", true),
+        (33, "board", board_id, "publication.status", false),
+        (99, "board", board_id, "publication.status", false),
+        (32, "board", board_id, "publication.publish", false),
+        (32, "board", board_id, "publication.update", false),
+        (32, "scope", RESOURCE, "scope.policy", false),
+    ] {
+        let (device_id, certificate) = device(seed, &f.owner.identity);
+        assert_eq!(
+            f.store()
+                .management_authorized(
+                    &f.owner,
+                    &f.owner.identity,
+                    &device_id,
+                    &[certificate],
+                    kind,
+                    id,
+                    operation,
+                    None,
+                    ORIGIN
+                )
+                .is_ok_and(|allowed| allowed),
+            expected,
+            "seed={seed}, resource={kind}, operation={operation}"
+        );
+    }
+    assert!(
+        f.store()
+            .management_revision_matches("board", board_id, None)
+            .unwrap()
+    );
+    assert!(
+        f.store()
+            .management_revision_matches("scope", RESOURCE, None)
+            .unwrap()
+    );
+}

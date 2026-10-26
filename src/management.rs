@@ -1221,6 +1221,11 @@ impl BlindStore {
             return Ok(false);
         }
         let Some(record) = self.management_record(kind, id)? else {
+            // Reading a publication does not create a resource policy. The
+            // identity and current person/device checks above still apply.
+            if kind == "board" && operation == "publication.status" {
+                return Ok(!self.management_pending(kind, id)? && presented.is_none());
+            }
             return Ok(!self.management_pending(kind, id)?
                 && presented.is_none()
                 && (kind == "person"

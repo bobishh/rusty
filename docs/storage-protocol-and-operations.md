@@ -222,7 +222,10 @@ positive revision, request ID and full authorization hash. Scope operations are
 `scope.policy` and `snapshot.checkpoint`; board operations are
 `publication.status`, `publication.publish`, `publication.update`,
 `publication.unpublish` and `publication.stage-file`. Each policy includes
-`management.update`. Device revocations are cumulative and cannot be undone by
+`management.update`. Before a board has its own policy, `publication.status`
+permits an authenticated current device without creating a policy. Identity,
+resource-owner and person-device checks still apply; publication mutations continue
+to require their own policy authority. Device revocations are cumulative and cannot be undone by
 a later policy. Migrated enrollment, publication, asset and checkpoint requests
 must include `managementCapability`; missing or stale evidence cannot fall back
 to pre-policy certificate authority. Management revocation is separate from rotating previously
