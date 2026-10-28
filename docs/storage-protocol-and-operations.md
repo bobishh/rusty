@@ -640,6 +640,12 @@ preflight after activation. A missing origin or proof header fails activation
 and restores the previous writer. Optional telemetry endpoint/project values are configuration, not
 deployment gates.
 
+Configuration fetch first uses the pinned Tangled repository URL. If that
+transport fails, it uses the same repository's official hosting knot at
+`https://knot1.tangled.sh/did:plc:tixq2h74rkvrthusdtkcbaqn`. Both paths must return
+the exact pinned commit before checkout; a different commit is rejected without
+trying another source. The fallback does not select a newer configuration.
+
 To roll back, run `Deploy Rusty` from `main` with the exact successful source run
 and attempt for the previously sealed artifact. The same digest verification,
 single-writer storage handoff and live receipt checks apply. Never rebuild an old

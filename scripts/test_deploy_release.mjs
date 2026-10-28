@@ -45,6 +45,65 @@ test('pinned deploy config adapter loads release spec parser', () => {
   assert.equal(typeof fetchRustyDeployConfig, 'function');
 });
 
+const configRepository = 'https://tangled.org/bobishh.bsky.social/hetzner_kamal';
+const configKnot = 'https://knot1.tangled.sh/did:plc:tixq2h74rkvrthusdtkcbaqn';
+
+function configFetchFixture({ failPrimary = false, failKnot = false, received = 'a'.repeat(40) } = {}) {
+  const calls = [];
+  const pin = { repository: configRepository, commit: 'a'.repeat(40) };
+  const spec = JSON.stringify({ kind: 'kamal', directory: '.release-config/hetzner_playground',
+    configFile: 'config/deploy.mesh-lighthouse.yml', configSha: pin.commit,
+    server: 'rusty.example', origin: 'https://rusty.example' });
+  const ports = { pin, workspace: '/release-test', exists: () => false,
+    run: (command, args, options) => {
+      assert.equal(command, 'git');
+      assert.deepEqual(args.slice(0, 4), ['-c', 'core.hooksPath=/dev/null', '-c', 'protocol.file.allow=never']);
+      assert.equal(options.env.GIT_CONFIG_NOSYSTEM, '1');
+      assert.equal(options.env.GIT_CONFIG_GLOBAL, '/dev/null');
+      assert.equal(options.env.GIT_TERMINAL_PROMPT, '0');
+      calls.push(args);
+      if (args.includes('fetch')) {
+        assert.deepEqual(args.slice(-5, -2), ['--depth=1', '--no-tags', '--']);
+        assert.equal(args.at(-1), pin.commit);
+        if (args.at(-2) === configRepository && failPrimary) throw new Error('Tangled unavailable');
+        if (args.at(-2) === configKnot && failKnot) throw new Error('Knot unavailable');
+      }
+      if (args.includes('rev-parse')) return `${received}\n`;
+      return '';
+    } };
+  return { calls, fetch: () => fetchRustyDeployConfig(spec, ports) };
+}
+
+test('Given Tangled transport failure, when fetching the pinned deployment config, then use its official knot and verify the identical commit before checkout', () => {
+  const fixture = configFetchFixture({ failPrimary: true });
+  assert.equal(fixture.fetch(), '/release-test/.release-config/hetzner_playground');
+  assert.deepEqual(fixture.calls.filter(args => args.includes('fetch')).map(args => args.at(-2)), [configRepository, configKnot]);
+  assert.equal(fixture.calls.filter(args => args.includes('checkout')).length, 1);
+  assert.ok(fixture.calls.findIndex(args => args.includes('rev-parse')) < fixture.calls.findIndex(args => args.includes('checkout')));
+});
+
+test('Given successful Tangled transport, when fetching the pinned deployment config, then keep the primary source without contacting its knot', () => {
+  const fixture = configFetchFixture();
+  fixture.fetch();
+  assert.deepEqual(fixture.calls.filter(args => args.includes('fetch')).map(args => args.at(-2)), [configRepository]);
+});
+
+test('Given a different received commit, when either transport returns it, then reject without checkout or another transport attempt', () => {
+  for (const failPrimary of [false, true]) {
+    const fixture = configFetchFixture({ failPrimary, received: 'b'.repeat(40) });
+    assert.throws(fixture.fetch, /differs from the captured commit/);
+    assert.equal(fixture.calls.filter(args => args.includes('fetch')).length, failPrimary ? 2 : 1);
+    assert.ok(!fixture.calls.some(args => args.includes('checkout')));
+  }
+});
+
+test('Given both official transports fail, when fetching deployment config, then report failure without checking out configuration', () => {
+  const fixture = configFetchFixture({ failPrimary: true, failKnot: true });
+  assert.throws(fixture.fetch, /Could not fetch the pinned Rusty configuration/);
+  assert.deepEqual(fixture.calls.filter(args => args.includes('fetch')).map(args => args.at(-2)), [configRepository, configKnot]);
+  assert.ok(!fixture.calls.some(args => args.includes('checkout') || args.includes('rev-parse')));
+});
+
 test('failed live reader-floor verification restores the previous writer', async () => {
   const configSha = 'a'.repeat(40);
   const digest = `sha256:${'c'.repeat(64)}`;
