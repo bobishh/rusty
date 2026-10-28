@@ -452,7 +452,6 @@ fn validate_public_board_delivery_policy(
             &evidence.owner_certificates,
         )?;
         if !matches!(role, WorkspaceRole::Editor | WorkspaceRole::Automation)
-            || grant_payload.effective_access_epoch() != payload.access_epoch
             || !grant_ids.insert(grant_payload.grant_id.as_str())
             || revoked_grants.contains(&grant_payload.grant_id)
             || grant_payload
@@ -526,7 +525,6 @@ fn authorize_public_delivery_writer(
     if !accepted
         || grant_payload.person_id != identity.person_id
         || !matches!(role, WorkspaceRole::Editor | WorkspaceRole::Automation)
-        || grant_payload.effective_access_epoch() != policy.access_epoch
         || policy
             .revoked_grant_ids
             .iter()

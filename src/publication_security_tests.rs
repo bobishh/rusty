@@ -970,6 +970,147 @@ fn given_revoked_or_out_of_scope_grant_when_validating_delivery_policy_then_reje
 }
 
 #[test]
+fn given_owner_approved_grants_at_distinct_generations_when_delivering_then_require_exact_approval_and_preserve_revocation()
+ {
+    let fixture = Fixture::new();
+    let mut writer = DeliveryWriter::editor(&fixture);
+    let mut older_payload = writer.grant.payload.clone();
+    older_payload.grant_id = "older-editor-grant".into();
+    older_payload.access_epoch = Some(1);
+    let older: WorkspaceGrant = serde_json::from_value(
+        serde_json::to_value(
+            sign_json_envelope(
+                &[61; 32],
+                serde_json::to_value(older_payload).unwrap(),
+                &fixture.owner.identity.person_id,
+                "MATCH/1",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let policy = &mut writer.policy.policy;
+    policy.payload.access_epoch = 1;
+    policy.payload.accepted_grants.push(older);
+    *policy = serde_json::from_value(
+        serde_json::to_value(
+            sign_json_envelope(
+                &[61; 32],
+                serde_json::to_value(&policy.payload).unwrap(),
+                &fixture.owner.identity.person_id,
+                "MATCH/1",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut publish = fixture.request("publish", Some(projection()), fixture.challenge());
+    attach_delivery_policy(&fixture, &mut publish, &writer.policy);
+    fixture.mutate(publish).unwrap();
+    let updated = fixture
+        .mutate(writer.request(&fixture, "update", Some(projection())))
+        .unwrap();
+    assert_eq!(updated.payload["revision"], 2);
+
+    let mut unapproved = writer.grant.payload.clone();
+    unapproved.grant_id = "not-in-owner-policy".into();
+    let unapproved = sign_json_envelope(
+        &[61; 32],
+        serde_json::to_value(unapproved).unwrap(),
+        &fixture.owner.identity.person_id,
+        "MATCH/1",
+    )
+    .unwrap();
+    let request = |grant: Value| {
+        serde_json::from_value(json!({
+            "version":1, "boardId":BOARD, "identity":writer.identity,
+            "deviceId":writer.device_id, "certificates":[writer.certificate],
+            "deliveryGrant":grant, "sourceHeads":writer.source_heads,
+        }))
+        .unwrap()
+    };
+    assert!(
+        fixture
+            .store
+            .create_public_delivery_challenge(
+                request(serde_json::to_value(unapproved).unwrap()),
+                &fixture.owner,
+                ORIGIN,
+            )
+            .is_err(),
+        "a valid owner signature does not replace explicit policy approval"
+    );
+    let mut changed_generation = serde_json::to_value(&writer.grant).unwrap();
+    changed_generation["payload"]["accessEpoch"] = json!(4);
+    let mut forged_signature = serde_json::to_value(&writer.grant).unwrap();
+    forged_signature["signature"] = json!("A".repeat(86));
+    for forged in [changed_generation, forged_signature] {
+        assert!(
+            fixture
+                .store
+                .create_public_delivery_challenge(request(forged), &fixture.owner, ORIGIN,)
+                .is_err(),
+            "changed grant bytes cannot inherit an approved grant's authorization"
+        );
+    }
+
+    let policy = &mut writer.policy.policy;
+    policy.payload.generation += 1;
+    policy
+        .payload
+        .accepted_grants
+        .retain(|grant| grant.payload.grant_id != writer.grant.payload.grant_id);
+    policy
+        .payload
+        .revoked_grant_ids
+        .push(writer.grant.payload.grant_id.clone());
+    *policy = serde_json::from_value(
+        serde_json::to_value(
+            sign_json_envelope(
+                &[61; 32],
+                serde_json::to_value(&policy.payload).unwrap(),
+                &fixture.owner.identity.person_id,
+                "MATCH/1",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let challenge = fixture
+        .store
+        .create_public_challenge_unlocked(
+            BOARD,
+            &fixture.owner.identity.person_id,
+            &fixture.device_id,
+            &fixture.device_id,
+            ORIGIN,
+            None,
+            Some(&writer.source_heads),
+        )
+        .unwrap();
+    let mut update = fixture.request("update", Some(projection()), challenge);
+    update["sourceHeads"] = json!(writer.source_heads);
+    update["authorization"]["payload"]["sourceHeadsHash"] =
+        json!(validate_source_heads(&writer.source_heads).unwrap());
+    attach_delivery_policy(&fixture, &mut update, &writer.policy);
+    fixture.mutate(update).unwrap();
+    assert!(
+        fixture
+            .store
+            .create_public_delivery_challenge(
+                request(serde_json::to_value(&writer.grant).unwrap()),
+                &fixture.owner,
+                ORIGIN,
+            )
+            .is_err(),
+        "revocation still denies the independently generated grant"
+    );
+}
+
+#[test]
 fn given_active_delivery_policy_when_editor_updates_then_allow_content_but_reject_withdrawal() {
     let fixture = Fixture::new();
     let writer = DeliveryWriter::editor(&fixture);

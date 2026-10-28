@@ -93,6 +93,13 @@ Clients compare it to detect changed permissions without assuming deterministic
 signature bytes. `deliveryPolicyHash` still binds the complete signed evidence in
 publication commands; signature verification and revision checks remain required.
 
+Public delivery requires the exact grant listed in the owner's signed
+`acceptedGrants` and rejects revoked grants and devices. Each grant retains its own
+issuance and revocation generation. It need not equal the policy's `accessEpoch`,
+which records the owner's workspace authority epoch; promotions and renewed
+access can advance a grant generation independently. Policy generations and
+publication revisions still advance monotonically.
+
 Scope enrollment advertises `capabilities.scopeEnrollmentRetry.version: 1`.
 The latest completed signed receipt and a hash of the exact normalized request
 commit atomically with the scope's token MACs. An identical request can recover
