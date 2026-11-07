@@ -6,6 +6,8 @@ const MAX_RECORD_BYTES: u64 = 512 * 1024;
 const MAX_INDEX_BYTES: u64 = 128 * 1024;
 const MAX_RESOURCES: usize = 256;
 const MAX_REVOKED_DEVICES: usize = 4096;
+const MAX_CONFIGURED_STATUS_NONCES: usize = 1024;
+const MAX_SETUP_STATUS_NONCES: usize = 128;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -148,6 +150,42 @@ pub(super) struct StatusRequest {
 struct StatusNonces {
     version: u8,
     used: BTreeMap<String, u64>,
+}
+
+impl StatusNonces {
+    fn load(path: &Path, now: u64, maximum: usize) -> Result<Self, String> {
+        let mut nonces: Self = if path.exists() {
+            if fs::metadata(path)
+                .map_err(|_| "Management status replay state unavailable")?
+                .len()
+                > 64 * 1024
+            {
+                return Err("Invalid management status replay state".into());
+            }
+            serde_json::from_slice(
+                &fs::read(path).map_err(|_| "Management status replay state unavailable")?,
+            )
+            .map_err(|_| "Invalid management status replay state")?
+        } else {
+            Self {
+                version: 1,
+                used: BTreeMap::new(),
+            }
+        };
+        if !matches!(nonces.version, 1 | 2)
+            || nonces.used.len() > maximum
+            || nonces.used.iter().any(|(nonce, expiry)| {
+                URL_SAFE_NO_PAD
+                    .decode(nonce)
+                    .map_or(true, |value| value.len() != 32)
+                    || *expiry > MAX_SAFE_INTEGER
+            })
+        {
+            return Err("Invalid management status replay state".into());
+        }
+        nonces.used.retain(|_, expiry| *expiry > now);
+        Ok(nonces)
+    }
 }
 
 fn resource(kind: &str, id: &str) -> Result<String, String> {
@@ -545,46 +583,46 @@ impl BlindStore {
                 return Err("Unauthorized or revoked management status device".into());
             }
         }
-        let nonce_path = self.directory.join("management/status-nonces.json");
-        let mut nonces = if nonce_path.exists() {
-            if fs::metadata(&nonce_path)
-                .map_err(|_| "Management status replay state unavailable")?
-                .len()
-                > 64 * 1024
-            {
-                return Err("Invalid management status replay state".into());
-            }
-            serde_json::from_slice::<StatusNonces>(
-                &fs::read(&nonce_path).map_err(|_| "Management status replay state unavailable")?,
-            )
-            .map_err(|_| "Invalid management status replay state")?
-        } else {
-            StatusNonces {
-                version: 1,
-                used: BTreeMap::new(),
-            }
-        };
-        if nonces.version != 1
-            || nonces.used.len() > 128
-            || nonces.used.iter().any(|(nonce, expiry)| {
-                URL_SAFE_NO_PAD
-                    .decode(nonce)
-                    .map_or(true, |value| value.len() != 32)
-                    || *expiry > MAX_SAFE_INTEGER
-            })
-        {
-            return Err("Invalid management status replay state".into());
-        }
-        nonces.used.retain(|_, expiry| *expiry > now);
+        let legacy_path = self.directory.join("management/status-nonces.json");
         let nonce = hash(&json!([
             payload.person_id,
             payload.device_id,
             payload.request_id
         ]))?;
+        let nonce_path = if record.is_some() {
+            let mut legacy = StatusNonces::load(&legacy_path, now, MAX_SETUP_STATUS_NONCES)?;
+            if legacy.used.contains_key(&nonce) {
+                return Err("Unauthorized management status replay".into());
+            }
+            // Older servers must fail closed rather than ignore accepted partitioned nonces.
+            if legacy.version == 1 {
+                legacy.version = 2;
+                atomic_write(
+                    &legacy_path,
+                    &serde_json::to_vec(&legacy)
+                        .map_err(|_| "Invalid management status replay state")?,
+                )?;
+            }
+            let context = hash(&json!([kind, id, payload.person_id, payload.device_id]))?;
+            self.directory
+                .join(format!("management/status-nonces-{context}.json"))
+        } else {
+            // Unknown resources share a fixed setup budget; arbitrary IDs cannot allocate journals.
+            legacy_path
+        };
+        let maximum = if record.is_some() {
+            MAX_CONFIGURED_STATUS_NONCES
+        } else {
+            MAX_SETUP_STATUS_NONCES
+        };
+        let mut nonces = StatusNonces::load(&nonce_path, now, maximum)?;
+        if record.is_some() && nonces.version != 1 {
+            return Err("Invalid management status replay state".into());
+        }
         if nonces.used.contains_key(&nonce) {
             return Err("Unauthorized management status replay".into());
         }
-        if nonces.used.len() >= 128 {
+        if nonces.used.len() >= maximum {
             return Err("Management status capacity exceeded".into());
         }
         nonces.used.insert(nonce, payload.expires_at);

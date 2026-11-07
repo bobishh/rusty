@@ -160,12 +160,21 @@ impl Fixture {
             .unwrap()
     }
     fn status_request(&self, certificate_seed: u8, signing_seed: u8) -> Value {
+        self.status_resource_request("scope", RESOURCE, certificate_seed, signing_seed)
+    }
+    fn status_resource_request(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        certificate_seed: u8,
+        signing_seed: u8,
+    ) -> Value {
         let (id, certificate) = device(certificate_seed, &self.owner.identity);
         let issued_at = now_ms().unwrap();
         let service_id = public_key_id(&self.store().public_key().unwrap()).unwrap();
         let authorization = sign_json_envelope(&[signing_seed; 32], json!({
             "kind":"rusty-management-policy-status", "version":1, "serviceId":service_id, "origin":ORIGIN,
-            "personId":self.owner.identity.person_id, "deviceId":id, "resourceKind":"scope", "resourceId":RESOURCE,
+            "personId":self.owner.identity.person_id, "deviceId":id, "resourceKind":kind, "resourceId":resource_id,
             "requestId":URL_SAFE_NO_PAD.encode(rand::random::<[u8;32]>()),
             "issuedAt":issued_at, "expiresAt":issued_at+60000,
         }), &id, "MATCH/1").unwrap();
@@ -1563,5 +1572,156 @@ async fn given_conflicting_signed_owner_records_when_resolving_publication_owner
             .err()
             .expect("conflicting signed ownership must fail")
             .contains("owner management evidence conflict")
+    );
+}
+
+#[tokio::test]
+async fn given_one_confirmed_status_context_at_capacity_when_other_devices_or_resources_read_then_their_budgets_remain_available()
+ {
+    let fixture = Fixture::new().await;
+    assert_eq!(
+        fixture
+            .put(&fixture.update(0, vec![], None, 32))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let second = "second-scope";
+    let update = fixture.update_resource(
+        "scope",
+        second,
+        0,
+        vec![],
+        None,
+        32,
+        vec!["management.update", "scope.policy", "snapshot.checkpoint"],
+    );
+    assert_eq!(
+        fixture
+            .put_resource("scope", second, &update)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    for _ in 0..1024 {
+        assert_eq!(
+            fixture.status_as(32).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        fixture.status_as(32).send().await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        fixture.status_as(33).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+    let body = fixture.status_resource_request("scope", second, 32, 32);
+    assert_eq!(
+        fixture
+            .client
+            .post(format!(
+                "{}/v2/management/scope/{second}/status",
+                fixture.url
+            ))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn given_legacy_status_nonce_before_upgrade_when_confirmed_resource_restarts_then_replay_stays_forbidden_and_fresh_status_succeeds()
+ {
+    let mut fixture = Fixture::new().await;
+    assert_eq!(
+        fixture
+            .put(&fixture.update(0, vec![], None, 32))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let body = fixture.status_request(33, 33);
+    let payload = &body["authorization"]["payload"];
+    let nonce = digest(
+        canonicalize_json(&json!([
+            payload["personId"],
+            payload["deviceId"],
+            payload["requestId"]
+        ]))
+        .unwrap()
+        .as_bytes(),
+    );
+    let expiry = payload["expiresAt"].as_u64().unwrap();
+    let mut used = std::collections::BTreeMap::from([(nonce, expiry)]);
+    for index in 0_u64..127 {
+        used.insert(digest(&index.to_be_bytes()), expiry);
+    }
+    atomic_write(
+        &fixture.directory.join("management/status-nonces.json"),
+        &serde_json::to_vec(&json!({"version":1,"used":used})).unwrap(),
+    )
+    .unwrap();
+    fixture.restart().await;
+    let replay = fixture
+        .client
+        .post(format!(
+            "{}/v2/management/scope/{RESOURCE}/status",
+            fixture.url
+        ))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        fixture.status_as(33).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+    let legacy: Value = serde_json::from_slice(
+        &std::fs::read(fixture.directory.join("management/status-nonces.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy["version"], 2,
+        "A pre-partition server must reject the upgraded journal instead of accepting replays"
+    );
+}
+
+#[tokio::test]
+async fn given_unconfigured_resources_when_status_reads_fill_the_shared_setup_budget_then_random_ids_cannot_create_unbounded_nonce_files()
+ {
+    let fixture = Fixture::new().await;
+    for index in 0..129 {
+        let id = format!("unconfigured-{index}");
+        let body = fixture.status_resource_request("scope", &id, 32, 32);
+        let response = fixture
+            .client
+            .post(format!("{}/v2/management/scope/{id}/status", fixture.url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if index < 128 {
+                StatusCode::OK
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+        );
+    }
+    assert!(
+        !std::fs::read_dir(fixture.directory.join("management"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("status-nonces-"))
     );
 }

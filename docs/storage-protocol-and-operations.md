@@ -208,12 +208,26 @@ owner device proof and a `MATCH/1` signature over `rusty-management-policy-statu
 version 1: exact service/origin/person/device/resource, nonce-like request ID,
 issuance and expiry. Current non-revoked owner devices may query without a server-side identity pin. Unsigned reads, invalid signatures, other identities and revoked
 devices receive no capability. Status nonces are single-use, persisted through
-restart and bounded to 128 live requests. A lost response requires a fresh signed
-status request. Status receipts bind request ID/full authorization hash,
+restart. Confirmed policies have a separate budget of 1,024 live requests per
+resource and authenticated device; unconfigured resources share a 128-request
+setup budget. Each journal remains bounded to 64 KiB. A lost response requires a
+fresh signed status request. Status receipts bind request ID/full authorization hash,
 capability hash, revision and pending state. Responses prohibit caching and never
 return storage tokens or content keys. `kind` is `scope`, `board` or `person`.
 For `person`, `id` must equal the requesting identity’s exact `personId`; scope and board IDs are
 exact opaque resources.
+
+The first confirmed-policy status read upgrades `management/status-nonces.json`
+to version 2 and keeps its unexpired legacy nonces. New resource/device journals
+remain separate; a full legacy setup journal does not block confirmed policies.
+An older server rejects version 2 rather than forgetting accepted nonces. To roll
+back to a server without partitioned journals, stop the service and preserve its
+data directory. Wait until every expiry in the legacy journal and
+`management/status-nonces-*.json` is past (at most 150 seconds after stopping a
+healthy server), then atomically replace only the legacy journal with
+`{"version":1,"used":{}}` before starting the old binary. Keep the partition files,
+resource policies, service keys and encrypted data intact. Never clear a journal
+while an accepted request remains valid.
 
 `PUT /v2/management/{kind}/{id}` takes `{version:1, identity, deviceId,
 certificates, managementCapability, authorization}`. Authorization is a `MATCH/1`
