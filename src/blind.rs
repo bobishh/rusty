@@ -4808,6 +4808,7 @@ pub fn router_with_telemetry(
                 "identityAuthorityEnforcement": state.store.identity_authority_enforcement(),
                 "readers": {"scopePolicy": 2, "managementPolicy": 2, "archiveStorage": 1, "publicBoardPublication": 1}})) }),
         )
+        .route("/.well-known/mesh-keeper", get(discovery))
         .route("/.well-known/mesh-lighthouse", get(discovery))
         .route(
             "/v2/enrollment/challenge",

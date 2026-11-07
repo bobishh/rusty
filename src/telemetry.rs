@@ -192,7 +192,7 @@ impl Telemetry {
                     ("x-tinsink-source".to_string(), "server".to_string()),
                 ]);
                 let resource = Resource::builder()
-                    .with_service_name("mesh-lighthouse")
+                    .with_service_name("mesh-keeper")
                     .with_attributes([
                         KeyValue::new(
                             "service.version",
@@ -302,7 +302,7 @@ impl Telemetry {
             span.set_attribute(KeyValue::new("operation", operation.to_owned()));
             span.set_attribute(KeyValue::new("operation.status", status.to_owned()));
             span.set_attribute(KeyValue::new("duration_ms", duration_ms));
-            span.set_attribute(KeyValue::new("service.name", "mesh-lighthouse"));
+            span.set_attribute(KeyValue::new("service.name", "mesh-keeper"));
             if !scope.is_empty() {
                 span.set_attribute(KeyValue::new("server.scope_id", scope.to_owned()));
             }
@@ -333,7 +333,7 @@ impl Telemetry {
             record.add_attribute("event.name", event.to_owned());
             record.add_attribute("operation", operation.to_owned());
             record.add_attribute("operation.status", status.to_owned());
-            record.add_attribute("service.name", "mesh-lighthouse");
+            record.add_attribute("service.name", "mesh-keeper");
             if !scope.is_empty() {
                 record.add_attribute("server.scope_id", scope.to_owned());
             }
@@ -345,7 +345,7 @@ impl Telemetry {
         }
         if self.0.logger.is_none() && self.0.tracer.is_none() {
             eprintln!(
-                "{{\"service\":\"mesh-lighthouse\",\"event\":{},\"operation\":{},\"status\":{},\"level\":{}}}",
+                "{{\"service\":\"mesh-keeper\",\"event\":{},\"operation\":{},\"status\":{},\"level\":{}}}",
                 serde_json::to_string(event).unwrap_or_default(),
                 serde_json::to_string(operation).unwrap_or_default(),
                 serde_json::to_string(status).unwrap_or_default(),
