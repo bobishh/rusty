@@ -1165,6 +1165,7 @@ impl ResourcePrincipalGrant {
             &self.workspace_id,
             &self.subject_person_id,
             &self.scope_authority,
+            owner,
             now,
         )?;
         let chain = certificate_chain(
@@ -1317,23 +1318,31 @@ fn verify_workspace_grant_from_scope_history(
     workspace_id: &str,
     member_person_id: &str,
     snapshot: &ScopeAuthoritySnapshot,
+    current_owner: &VerifiedIdentityAuthorityView,
     now: u64,
 ) -> Result<(), String> {
     let history = scope_controller_history(snapshot, now)?;
     let mut verified_principals = HashSet::new();
     for controller in history {
-        if verify_workspace_grant(
-            grant,
-            workspace_id,
-            member_person_id,
-            &PublicIdentity {
-                person_id: controller.person_id.clone(),
-                public_key: controller.public_key.clone(),
-                display_name: String::new(),
-            },
-            &controller.certificates,
-        )
-        .is_ok()
+        let identity = PublicIdentity {
+            person_id: controller.person_id.clone(),
+            public_key: controller.public_key.clone(),
+            display_name: String::new(),
+        };
+        let verifies = |certificates: &[DeviceCertificate]| {
+            verify_workspace_grant(
+                grant,
+                workspace_id,
+                member_person_id,
+                &identity,
+                certificates,
+            )
+            .is_ok()
+        };
+        let current_identity_matches = controller.person_id == current_owner.view.person_id
+            && controller.public_key == current_owner.view.identity_public_key;
+        if verifies(&controller.certificates)
+            || (current_identity_matches && verifies(&current_owner.view.certificates))
         {
             verified_principals.insert((controller.person_id, controller.public_key));
         }
@@ -2417,6 +2426,48 @@ mod tests {
     }
 
     #[test]
+    fn later_controller_device_membership_uses_only_same_identity_evidence() {
+        let (controller, _) = scope_identity(151, &[(152, true)]);
+        let (_, current_view) = scope_identity(151, &[(152, true), (153, false)]);
+        let (_, foreign_view) = scope_identity(155, &[(153, false)]);
+        let workspace_id = "later-device-membership";
+        let subject_key = public_key_from_seed(&[154; 32]).unwrap();
+        let subject_id = public_key_id(&subject_key).unwrap();
+        let snapshot = scope_snapshot(workspace_id, &controller, &[152; 32], Vec::new());
+        let grant = sign_json_envelope(
+            &[153; 32],
+            serde_json::to_value(WorkspaceGrantPayload {
+                kind: "workspace-grant".into(),
+                version: 1,
+                grant_id: "later-device-member".into(),
+                workspace_id: workspace_id.into(),
+                person_id: subject_id.clone(),
+                role: WorkspaceRole::Editor,
+                access_epoch: Some(1),
+                automation: None,
+            })
+            .unwrap(),
+            public_key_id(&public_key_from_seed(&[153; 32]).unwrap()).unwrap(),
+            SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let grant: WorkspaceGrant =
+            serde_json::from_value(serde_json::to_value(grant).unwrap()).unwrap();
+        let verify = |view: &IdentityAuthorityView| {
+            verify_workspace_grant_from_scope_history(
+                &grant,
+                workspace_id,
+                &subject_id,
+                &snapshot,
+                &view.verify().unwrap(),
+                1_800_000_000_000,
+            )
+        };
+        assert!(verify(&current_view).is_ok());
+        assert!(verify(&foreign_view).is_err());
+    }
+
+    #[test]
     fn current_controller_can_reattest_grant_signed_by_historical_controller() {
         let old_root_seed = [61; 32];
         let old_device_seed = [62; 32];
@@ -2713,8 +2764,9 @@ mod tests {
             "a reused app key cannot make historical grant ownership ambiguous"
         );
 
-        let rogue_root_seed = [66; 32];
-        let (rogue, _) = scope_identity(66, &[]);
+        // A foreign key must not also be certified as a current controller device.
+        let rogue_root_seed = [68; 32];
+        let (rogue, _) = scope_identity(68, &[]);
         let mut forged = payload.clone();
         forged.workspace_grant = serde_json::from_value(
             serde_json::to_value(
