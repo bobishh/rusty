@@ -490,6 +490,71 @@ fn owner_revocation_survives_restart_and_only_new_grant_id_can_restore_access() 
         .register_resource_principal_grant(storage_scope_id, old_grant_id, access.clone(), origin)
         .unwrap();
 
+    let replacement = resource_grant(
+        &[31; 32],
+        &[32; 32],
+        &owner,
+        &subject,
+        &service_id,
+        origin,
+        storage_scope_id,
+        workspace_id,
+        "editor-grant-replacement",
+        2,
+        &initial_snapshot,
+    );
+    let request_id = URL_SAFE_NO_PAD.encode([199; 32]);
+    let status = store
+        .register_resource_principal_grant_with_status(
+            storage_scope_id,
+            "editor-grant-replacement",
+            replacement.clone(),
+            origin,
+            Some(&request_id),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(verify_signed_envelope(&status, &store.public_key().unwrap(), DOMAIN).unwrap());
+    assert_eq!(status.payload["previousGrantId"], old_grant_id);
+    assert_eq!(status.payload["previousPolicyEpoch"], 1);
+    assert_eq!(status.payload["grantId"], "editor-grant-replacement");
+    assert_eq!(status.payload["requestId"], request_id);
+    assert_eq!(
+        status.payload["requestHash"],
+        crate::identity_authority::canonical_hash(&replacement).unwrap()
+    );
+    assert_eq!(
+        store
+            .read_resource_principal_grant(storage_scope_id, &subject.person_id, origin)
+            .unwrap()
+            .grant
+            .payload
+            .grant_id,
+        old_grant_id
+    );
+    assert!(
+        store
+            .register_resource_principal_grant_with_status(
+                storage_scope_id,
+                "editor-grant-replacement",
+                replacement.clone(),
+                "https://foreign.example",
+                Some(&request_id)
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .register_resource_principal_grant_with_status(
+                storage_scope_id,
+                "editor-grant-replacement",
+                replacement,
+                origin,
+                Some("invalid-nonce")
+            )
+            .is_err()
+    );
+
     let alternate_signer_id = public_key_id(&public_key_from_seed(&[33; 32]).unwrap()).unwrap();
     let semantically_identical_retry = ResourcePrincipalGrantRequest {
         version: 1,

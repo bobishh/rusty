@@ -10,8 +10,9 @@ use crate::identity_authority::{
     ScopeAuthorityUpdateAuthorization, ScopeAuthorityUpdateRequest, ScopePurposeReceiptPayload,
     ScopePurposeUpdateAuthorization, ScopePurposeUpdateRequest, StoredIdentityAuthority,
     StoredIdentityRootSuccession, StoredResourcePrincipalGrant, StoredResourcePrincipalRevocation,
-    StoredScopeAuthority, authority_view_hash, certificate_chain, scope_authority_snapshot_hash,
-    scope_authority_status_request_hash, status_request_hash, valid_nonce,
+    StoredScopeAuthority, authority_view_hash, canonical_hash, certificate_chain,
+    scope_authority_snapshot_hash, scope_authority_status_request_hash, status_request_hash,
+    valid_nonce,
 };
 use crate::telemetry::{Level, Telemetry};
 use axum::{
@@ -2999,7 +3000,22 @@ impl BlindStore {
         request: ResourcePrincipalGrantRequest,
         origin: &str,
     ) -> Result<(), String> {
-        if request.version != 1 || !valid_id(scope) || !valid_id(grant_id) {
+        self.register_resource_principal_grant_with_status(scope, grant_id, request, origin, None)?;
+        Ok(())
+    }
+    fn register_resource_principal_grant_with_status(
+        &self,
+        scope: &str,
+        grant_id: &str,
+        request: ResourcePrincipalGrantRequest,
+        origin: &str,
+        request_id: Option<&str>,
+    ) -> Result<Option<SignedEnvelope<Value>>, String> {
+        if request.version != 1
+            || !valid_id(scope)
+            || !valid_id(grant_id)
+            || request_id.is_some_and(|value| !valid_nonce(value))
+        {
             return Err("Invalid storage principal grant request".into());
         }
         let payload = &request.grant.payload;
@@ -3082,13 +3098,30 @@ impl BlindStore {
                         return Err("Storage principal grant epoch conflicts".into());
                     }
                     if previous.grant == request.grant {
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             } else if self
                 .read_resource_principal_revocation(scope, &previous_payload.grant_id, origin)?
                 .is_none()
             {
+                self.telemetry.emit(Level::Warn, "storage.principal.replacement.pending", "register", "pending", scope, 0.0,
+                    json!({ "previousPolicyEpoch": previous_payload.policy_epoch, "requestedPolicyEpoch": payload.policy_epoch }));
+                if let Some(request_id) = request_id {
+                    if payload.policy_epoch <= previous_payload.policy_epoch {
+                        return Err("Storage principal replacement epoch must advance".into());
+                    }
+                    let service_id = public_key_id(&self.public_key()?)?;
+                    return sign_json_envelope(&self.seed, json!({
+                        "kind": "rusty-resource-principal-replacement-required", "version": 1,
+                        "serviceId": service_id, "origin": origin, "storageScopeId": scope,
+                        "workspaceId": payload.workspace_id, "ownerPersonId": payload.owner_person_id,
+                        "subjectPersonId": payload.subject_person_id, "grantId": payload.grant_id,
+                        "policyEpoch": payload.policy_epoch, "previousGrantId": previous_payload.grant_id,
+                        "previousPolicyEpoch": previous_payload.policy_epoch, "requestId": request_id,
+                        "requestHash": canonical_hash(&request)?, "issuedAt": now_ms()?,
+                    }), service_id, DOMAIN).map(Some);
+                }
                 return Err("Storage principal grant replacement requires prior revocation".into());
             }
         }
@@ -3098,7 +3131,8 @@ impl BlindStore {
         atomic_write(
             &path,
             &serde_json::to_vec(&stored).map_err(|_| "Invalid storage principal grant")?,
-        )
+        )?;
+        Ok(None)
     }
     fn revoke_resource_principal(
         &self,
@@ -5975,13 +6009,34 @@ async fn scope_authority_update(
 async fn storage_principal_grant(
     State(state): State<HttpState>,
     RoutePath((scope, grant_id)): RoutePath<(String, String)>,
+    headers: HeaderMap,
     Json(request): Json<ResourcePrincipalGrantRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let origin = state.origin.clone();
-    tokio::task::spawn_blocking(move || {
-        state
-            .store
-            .register_resource_principal_grant(&scope, &grant_id, request, &origin)
+    let request_id = headers
+        .get("x-rusty-request-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid principal request ID"))
+        })
+        .transpose()?;
+    let replacement = tokio::task::spawn_blocking(move || {
+        if let Some(request_id) = request_id {
+            state.store.register_resource_principal_grant_with_status(
+                &scope,
+                &grant_id,
+                request,
+                &origin,
+                Some(&request_id),
+            )
+        } else {
+            state
+                .store
+                .register_resource_principal_grant(&scope, &grant_id, request, &origin)
+                .map(|()| None)
+        }
     })
     .await
     .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "Storage grant unavailable"))?
@@ -5997,7 +6052,10 @@ async fn storage_principal_grant(
         };
         failure(status, &message)
     })?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(match replacement {
+        Some(status) => Json(json!({ "replacement": status })).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
 }
 
 async fn storage_principal_revocation(
