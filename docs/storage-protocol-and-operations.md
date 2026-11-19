@@ -542,14 +542,17 @@ The container invokes the same blind binary. `RUSTY_STATE_DIR` defaults to `/dat
 Errors include quota exhaustion and failed requests; info records confirmed new
 objects and startup; debug adds immutable retries, inventory and downloads;
 trace adds routine service requests. Records always go to stderr at the selected
-level. Configure `RUSTY_TELEMETRY_URL`, `RUSTY_TELEMETRY_TOKEN` and optional
-`RUSTY_TELEMETRY_PROJECT` (default `rusty`) to send a copy to TinSink's v2 intake.
-The token is a server write key, stored only in private deployment configuration.
+level. Optional export uses the external OpenTelemetry SDK with standard OTLP
+HTTP/JSON logs and traces. Configure `OTEL_EXPORTER_OTLP_ENDPOINT` and
+`RUSTY_TELEMETRY_TOKEN` together in private deployment configuration.
+`RUSTY_TELEMETRY_PROJECT` (default `rusty`) supplies the standard
+`service.namespace` resource attribute. Collector-specific headers belong in
+`OTEL_EXPORTER_OTLP_HEADERS`, using the SDK's comma-separated `name=value` format.
+Without an endpoint and token, diagnostics remain local.
 
-Delivery uses a bounded 256-event queue and 25-event batches, a two-second
-request timeout and at most three attempts with stable event IDs. Sink failures
-never block storage; queue overflow and final delivery failure remain in stderr.
-Headers, tokens, ciphertext and decrypted board contents are excluded.
+The SDK owns batching and delivery, with a two-second request timeout. Export
+failures never block storage. Headers, tokens, ciphertext and decrypted board
+contents are excluded.
 `storage.object.stored` reports `stored_bytes_before`, `stored_bytes`,
 `object_count`, `scope_limit_bytes` and encoded object `bytes`.
 `storage.object.reused` identifies unchanged immutable retries;
@@ -576,10 +579,10 @@ offline participant. No backend login session or anonymous private-board listing
 is created. Allowed frontends come from `RUSTY_CORS_ORIGINS`; with none configured,
 inspection remains disabled with an operator configuration explanation.
 
-The root also retains connection instructions and a link to the protected logs.
+The root also retains connection instructions.
 Its robot, header and Fira Code/Caveat typography preserve the original Rusty UI.
 Styles, fonts and artwork are embedded in the service binary and served from
-`/assets/`; rendering does not depend on TinSink being available. The asset handler
+`/assets/`; rendering uses no external diagnostic service. The asset handler
 serves an explicit embedded allowlist, never files from the storage directory.
 
 `src/ui/design-system.css` contains the unmodified, flattened tincanban design
