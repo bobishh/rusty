@@ -90,6 +90,17 @@ jobs:
           run-id: ${{ steps.source.outputs.run_id }}
       - name: Verify release seal and executable bytes
         run: python3 scripts/verify_release.py .release/rusty
+      - name: Prepare read-only GitHub configuration access
+        env:
+          RUSTY_DEPLOY_CONFIG_SSH_KEY: ${{ secrets.RUSTY_DEPLOY_CONFIG_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$RUSTY_DEPLOY_CONFIG_SSH_KEY"
+          umask 077
+          printf '%s\n' "$RUSTY_DEPLOY_CONFIG_SSH_KEY" > "$RUNNER_TEMP/rusty-config-key"
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$RUNNER_TEMP/rusty-config-hosts"
+          echo "RUSTY_CONFIG_SSH_KEY_FILE=$RUNNER_TEMP/rusty-config-key" >> "$GITHUB_ENV"
+          echo "RUSTY_CONFIG_KNOWN_HOSTS_FILE=$RUNNER_TEMP/rusty-config-hosts" >> "$GITHUB_ENV"
       - name: Fetch the pinned existing Kamal configuration
         run: node scripts/fetch_deploy_config.mjs
       - name: Prepare trusted host access
@@ -131,3 +142,6 @@ jobs:
           path: .release/rusty/
           if-no-files-found: ignore
           retention-days: 90
+      - name: Remove temporary configuration credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/rusty-config-key" "$RUNNER_TEMP/rusty-config-hosts"

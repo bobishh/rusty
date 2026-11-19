@@ -649,17 +649,18 @@ approval. Deployment variables/secrets belong only to this repository:
 `RUSTY_DEPLOY_SPEC` (same pinned service/host JSON contract used before the
 release split), `RUSTY_DEPLOY_SSH_KEY`, `RUSTY_DEPLOY_KNOWN_HOSTS`,
 `RUSTY_TELEMETRY_TOKEN` and `CLICKHOUSE_PASSWORD`.
-`release/deployment-config.json` pins the public infrastructure repository and
+`release/deployment-config.json` pins the infrastructure repository and
 commit, plus the browser origins that must pass discovery and signed-request
 preflight after activation. A missing origin or proof header fails activation
 and restores the previous writer. Optional telemetry endpoint/project values are configuration, not
 deployment gates.
 
-Configuration fetch first uses the pinned Tangled repository URL. If that
-transport fails, it uses the same repository's official hosting knot at
-`https://knot1.tangled.sh/did:plc:tixq2h74rkvrthusdtkcbaqn`. Both paths must return
-the exact pinned commit before checkout; a different commit is rejected without
-trying another source. The fallback does not select a newer configuration.
+Configuration is fetched from the pinned `bobishh/hetzner_kamal` GitHub commit.
+A dedicated read-only repository deploy key is stored in
+`RUSTY_DEPLOY_CONFIG_SSH_KEY`. The workflow obtains GitHub's current public SSH
+host keys through its authenticated metadata API, verifies the exact fetched
+commit, and removes temporary credential files after deployment. It never
+switches configuration sources on a fetch failure.
 
 To roll back, run `Deploy Rusty` from `main` with the exact successful source run
 and attempt for the previously sealed artifact. The same digest verification,

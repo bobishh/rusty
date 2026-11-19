@@ -1,6 +1,6 @@
 {
-  "repository": "https://tangled.org/bobishh.bsky.social/hetzner_kamal",
-  "commit": "7bcb8e52244e111c064dd02ca5a90c10378fbbc0",
+  "repository": "https://github.com/bobishh/hetzner_kamal",
+  "commit": "6f3fd1717dda8a8c12a74c59e17fcff542a3e2dd",
   "browserOrigins": [
     "https://match.meta-uber-engineer.dev",
     "https://tincanban.meta-uber-engineer.dev",
