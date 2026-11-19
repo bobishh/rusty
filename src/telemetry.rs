@@ -186,11 +186,8 @@ impl Telemetry {
         };
         if let (Some(endpoint), Some(token)) = (config.endpoint, config.token) {
             if config.level != Level::Off {
-                let headers = HashMap::from([
-                    ("authorization".to_string(), format!("Bearer {token}")),
-                    ("x-tinsink-project".to_string(), config.project),
-                    ("x-tinsink-source".to_string(), "server".to_string()),
-                ]);
+                let headers =
+                    HashMap::from([("authorization".to_string(), format!("Bearer {token}"))]);
                 let resource = Resource::builder()
                     .with_service_name("mesh-keeper")
                     .with_attributes([
@@ -199,6 +196,7 @@ impl Telemetry {
                             option_env!("RUSTY_BUILD_SHA").unwrap_or("unknown"),
                         ),
                         KeyValue::new("deployment.environment.name", "production"),
+                        KeyValue::new("service.namespace", config.project),
                     ])
                     .build();
                 let logs_exporter = LogExporter::builder()

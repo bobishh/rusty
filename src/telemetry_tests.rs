@@ -77,8 +77,8 @@ async fn official_otlp_exporters_send_standard_logs_and_spans_with_gateway_auth(
     );
     for (_, headers, _) in requests.iter() {
         assert_eq!(headers["authorization"], "Bearer private-test-key");
-        assert_eq!(headers["x-tinsink-project"], "rusty-test");
-        assert_eq!(headers["x-tinsink-source"], "server");
+        assert!(!headers.contains_key("x-tinsink-project"));
+        assert!(!headers.contains_key("x-tinsink-source"));
     }
     assert!(
         !requests

@@ -46,7 +46,7 @@ def run_once(binary, directory):
                 page = response.read().decode("utf-8")
             assert 'class="topbar"' in page and 'class="rusty-mark"' in page, page
             assert 'href="/assets/design-system.css"' in page, page
-            assert "https://analytics.meta-uber-engineer.dev/admin.css" not in page
+            assert "View Rusty logs" not in page
             for asset, mime in (
                 ("design-system.css", "text/css"),
                 ("typography.css", "text/css"),

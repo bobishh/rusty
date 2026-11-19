@@ -28,9 +28,8 @@ try {
     await new Promise(done => setTimeout(done, 100));
   }
   browser = await chromium.launch({ headless: true });
-  for (const scenario of ['desktop', 'sink-offline', 'mobile']) {
+  for (const scenario of ['desktop', 'mobile']) {
     const context = await browser.newContext({ viewport: scenario === 'mobile' ? { width: 375, height: 812 } : { width: 1280, height: 800 } });
-    if (scenario === 'sink-offline') await context.route('https://analytics.meta-uber-engineer.dev/**', route => route.abort());
     const page = await context.newPage();
     const externalResources = [];
     const failures = [];
@@ -38,9 +37,9 @@ try {
     page.on('requestfailed', request => failures.push(request.url()));
     await page.goto(origin);
     await page.getByRole('heading', { name: 'RUSTY', exact: true }).waitFor();
-    await page.getByRole('heading', { name: 'Board storage is available' }).waitFor();
+    await page.locator('#service-availability').filter({ hasText: /^Storage available$/ }).waitFor();
     assert.equal(await page.getByRole('link', { name: 'Open tincanban' }).getAttribute('href'), 'https://match.meta-uber-engineer.dev');
-    assert.equal(await page.getByRole('link', { name: 'View Rusty logs' }).getAttribute('href'), 'https://analytics.meta-uber-engineer.dev/admin/logs/rusty');
+    assert.equal(await page.getByRole('link', { name: 'View Rusty logs' }).count(), 0);
     const appearance = await page.evaluate(async () => {
       await document.fonts.ready;
       const logo = document.querySelector('.rusty-mark');
@@ -63,15 +62,9 @@ try {
     assert.deepEqual(externalResources, [], 'Rusty must render independently of external services');
     assert.deepEqual(failures, [], 'Local fonts and paint must load');
     await page.screenshot({ path: `target/service-ui-${scenario}.png`, fullPage: true });
-    if (scenario === 'sink-offline') {
-      await page.getByRole('link', { name: 'View Rusty logs' }).click().catch(() => {});
-      assert(failures.some(url => url.startsWith('https://analytics.meta-uber-engineer.dev/')), 'Sink outage was exercised');
-      await page.goto(origin);
-      await page.getByRole('heading', { name: 'RUSTY', exact: true }).waitFor();
-    }
     await context.close();
   }
-  console.log('Original Rusty header, local fonts, mobile layout and Sink outage passed');
+  console.log('Original Rusty header, local fonts and mobile layout work without an external collector');
 } finally {
   await browser?.close();
   child.kill('SIGINT');
